@@ -5,6 +5,8 @@ Automatic [OpenInference](https://github.com/Arize-ai/openinference) tracing for
 ## Setup
 The installer prompts for your backend (Phoenix or Arize AX) and project name, writes credentials to `~/.arize/harness/config.yaml`, and registers the hooks in `~/.claude/settings.json`.
 
+Pass `--with-skills` to also symlink the `manage-claude-code-tracing` skill into the current directory's `.agents/skills/` so Claude can help you manage the configuration interactively.
+
 ### Claude Code marketplace
 
 The marketplace flow registers the hooks but skips the interactive wizard, so backend credentials and content-logging preferences must be set directly in `~/.claude/settings.json` under `env`:
@@ -26,12 +28,12 @@ For Phoenix, swap the Arize keys for `PHOENIX_ENDPOINT` (and optional `PHOENIX_A
 
 ```bash
 # Install
-claude plugin marketplace add Arize-ai/arize-harness-tracing
-claude plugin install claude-code-tracing@arize-harness-tracing
+claude plugin marketplace add Arize-ai/coding-harness-tracing
+claude plugin install claude-code-tracing@coding-harness-tracing
 
 # Uninstall
-claude plugin uninstall claude-code-tracing@arize-harness-tracing
-claude plugin marketplace remove Arize-ai/arize-harness-tracing
+claude plugin uninstall claude-code-tracing@coding-harness-tracing
+claude plugin marketplace remove Arize-ai/coding-harness-tracing
 ```
 
 ### Remote setup
@@ -40,29 +42,29 @@ macOS / Linux:
 
 ```bash
 # Install
-curl -sSL https://raw.githubusercontent.com/Arize-ai/arize-harness-tracing/main/install.sh | bash -s -- claude
+curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh | bash -s -- claude
 
 # Uninstall
-curl -sSL https://raw.githubusercontent.com/Arize-ai/arize-harness-tracing/main/install.sh | bash -s -- uninstall claude
+curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh | bash -s -- uninstall claude
 ```
 
 Windows (PowerShell):
 
 ```powershell
 # Install
-iwr -useb https://raw.githubusercontent.com/Arize-ai/arize-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
+iwr -useb https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
 & $env:TEMP\install.bat claude
 
 # Uninstall
-iwr -useb https://raw.githubusercontent.com/Arize-ai/arize-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
+iwr -useb https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
 & $env:TEMP\install.bat uninstall claude
 ```
 
 ### Local setup
 
 ```bash
-git clone https://github.com/Arize-ai/arize-harness-tracing.git
-cd arize-harness-tracing
+git clone https://github.com/Arize-ai/coding-harness-tracing.git
+cd coding-harness-tracing
 ```
 
 macOS / Linux:
@@ -94,6 +96,16 @@ install.bat uninstall claude
 | Phoenix endpoint | `http://localhost:6006` |
 | Arize AX endpoint | `otlp.arize.com:443` |
 | Hook config file | `~/.claude/settings.json` |
-| Hook events registered | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `Notification`, `PermissionRequest`, `SessionEnd` |
+| Hook events registered | `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `UserPromptExpansion`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`, `Notification`, `PermissionRequest`, `PermissionDenied`, `PreCompact`, `PostCompact` |
 | State directory | `~/.arize/harness/state/claude-code/` |
 | Log file | `~/.arize/harness/logs/claude-code.log` |
+
+## Verifying tracing
+
+Run any Claude Code session as you normally would (e.g. `claude` or `claude -p "hello"`). The installed hooks fire on every `SessionStart`, `UserPromptSubmit`, `PreToolUse`, etc.
+
+- Errors and `ARIZE_VERBOSE=true` activity land in `~/.arize/harness/logs/claude-code.log`. To see routine hook activity (`session_start fired`, `emitted LLM span`, etc.), add `"ARIZE_VERBOSE": "true"` under `env` in `~/.claude/settings.json` and re-run a session.
+- Confirm spans appear in your configured project in Arize AX or Phoenix.
+- Set `"ARIZE_TRACE_ENABLED": "false"` under `env` to temporarily disable tracing without uninstalling, or `"ARIZE_DRY_RUN": "true"` to build spans without sending them.
+
+See the [main README's Environment variables section](../../README.md#environment-variables) for the full list of runtime overrides.
