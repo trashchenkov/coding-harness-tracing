@@ -1,20 +1,23 @@
 {
-  "name": "arize-agent-kit",
-  "displayName": "Arize Agent Kit",
+  "name": "coding-harness-tracing",
+  "displayName": "Arize Coding Harness Tracing",
   "publisher": "arize",
   "version": "0.0.1",
-  "description": "Arize tracing for AI coding agents (Claude Code, Codex, Cursor, Copilot, Gemini).",
+  "description": "Arize tracing for AI coding agents (Claude Code, Codex, Cursor, Copilot, Gemini, Kiro).",
   "license": "MIT",
-  "homepage": "https://github.com/Arize-ai/arize-agent-kit#readme",
+  "homepage": "https://github.com/Arize-ai/coding-harness-tracing#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Arize-ai/arize-agent-kit.git",
+    "url": "https://github.com/Arize-ai/coding-harness-tracing.git",
     "directory": "vscode-extension"
   },
   "bugs": {
-    "url": "https://github.com/Arize-ai/arize-agent-kit/issues"
+    "url": "https://github.com/Arize-ai/coding-harness-tracing/issues"
   },
-  "categories": ["AI", "Other"],
+  "categories": [
+    "AI",
+    "Other"
+  ],
   "icon": "media/icon.png",
   "keywords": [
     "arize",
@@ -33,24 +36,59 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      { "command": "arize.setup", "title": "Arize: Set Up Tracing" },
-      { "command": "arize.reconfigure", "title": "Arize: Reconfigure Tracing" },
-      { "command": "arize.uninstall", "title": "Arize: Uninstall Harness" },
-      { "command": "arize.refreshStatus", "title": "Arize: Refresh Status" },
-      { "command": "arize.setUser", "title": "Arize: Set User ID" },
-      { "command": "arize.startCodexBuffer", "title": "Arize: Start Codex Buffer" },
-      { "command": "arize.stopCodexBuffer", "title": "Arize: Stop Codex Buffer" },
-      { "command": "arize.statusBarMenu", "title": "Arize: Status Menu" },
-      { "command": "arize.uninstallAll", "title": "Arize: Uninstall All Tracing" }
+      {
+        "command": "arize.setup",
+        "title": "Arize: Set Up Tracing"
+      },
+      {
+        "command": "arize.reconfigure",
+        "title": "Arize: Reconfigure Tracing"
+      },
+      {
+        "command": "arize.uninstall",
+        "title": "Arize: Uninstall Harness"
+      },
+      {
+        "command": "arize.refreshStatus",
+        "title": "Arize: Refresh Status"
+      },
+      {
+        "command": "arize.setUser",
+        "title": "Arize: Set User ID"
+      },
+      {
+        "command": "arize.startCodexBuffer",
+        "title": "Arize: Start Codex Buffer"
+      },
+      {
+        "command": "arize.stopCodexBuffer",
+        "title": "Arize: Stop Codex Buffer"
+      },
+      {
+        "command": "arize.statusBarMenu",
+        "title": "Arize: Status Menu"
+      },
+      {
+        "command": "arize.uninstallAll",
+        "title": "Arize: Uninstall All Tracing"
+      }
     ],
     "viewsContainers": {
       "activitybar": [
-        { "id": "arize", "title": "Arize Tracing", "icon": "media/icon.svg" }
+        {
+          "id": "arize",
+          "title": "Arize Tracing",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
       "arize": [
-        { "type": "webview", "id": "arize-sidebar", "name": "Arize Tracing" }
+        {
+          "type": "webview",
+          "id": "arize-sidebar",
+          "name": "Arize Tracing"
+        }
       ]
     }
   },

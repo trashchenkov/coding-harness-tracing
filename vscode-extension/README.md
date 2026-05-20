@@ -44,4 +44,4 @@ Wire up [Arize](https://arize.com) tracing for AI coding agents — Claude Code,
 
 ## Filing issues
 
-Please report bugs and feature requests on the [GitHub issue tracker](https://github.com/Arize-ai/arize-agent-kit/issues).
+Please report bugs and feature requests on the [GitHub issue tracker](https://github.com/Arize-ai/coding-harness-tracing/issues).
