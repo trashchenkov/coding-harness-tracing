@@ -119,6 +119,10 @@ func runUninstallAll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("wiping shared runtime: %w", err)
 	}
+	// Match install.sh's `set -e` behavior: if wipe fails (or the user
+	// declines its confirmation prompt), abort before deleting ax-trace's own
+	// state. This leaves breadcrumbs (bootstrap log, lock file) for debugging
+	// a partial uninstall.
 	if exitCode != 0 {
 		os.Exit(exitCode)
 	}

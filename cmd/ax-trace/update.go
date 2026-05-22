@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -30,8 +32,24 @@ func init() {
 }
 
 func runUpdate(ctx context.Context) error {
-	if _, err := bootstrap.Bootstrap(ctx, bootstrap.Options{Branch: updateBranch}); err != nil {
+	result, err := bootstrap.Bootstrap(ctx, bootstrap.Options{Branch: updateBranch})
+	if err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
+	}
+
+	installDir, err := paths.InstallDir()
+	if err != nil {
+		return fmt.Errorf("resolving install dir: %w", err)
+	}
+
+	// Bootstrap reuses a healthy venv (see internal/bootstrap/venv.go), so it
+	// only runs `uv pip install` on first creation. After EnsureRepo pulls the
+	// updated source, the venv's installed copy of `core` would still be the
+	// old one — list_installed_harnesses, the install.py wizards, and the
+	// prompt helpers would all run stale code. Refresh the package explicitly
+	// to mirror install.sh's `update` branch (install.sh:308-327).
+	if err := refreshVenvPackage(ctx, result.UvPath, result.VenvPython, installDir); err != nil {
+		return fmt.Errorf("refreshing venv package: %w", err)
 	}
 
 	harnesses, err := listInstalledHarnesses(ctx)
@@ -42,11 +60,6 @@ func runUpdate(ctx context.Context) error {
 		fmt.Fprintln(os.Stdout, "[ax-trace] no installed harnesses found to re-register")
 		fmt.Fprintln(os.Stdout, "[ax-trace] update complete.")
 		return nil
-	}
-
-	installDir, err := paths.InstallDir()
-	if err != nil {
-		return fmt.Errorf("resolving install dir: %w", err)
 	}
 
 	for _, key := range harnesses {
@@ -69,6 +82,25 @@ func runUpdate(ctx context.Context) error {
 	}
 
 	fmt.Fprintln(os.Stdout, "[ax-trace] update complete.")
+	return nil
+}
+
+// refreshVenvPackage runs `uv pip install --python <venvPython> -U <installDir>`
+// to upgrade the coding-harness-tracing package inside the venv. Necessary
+// because bootstrap.Bootstrap short-circuits when the venv is already healthy
+// and does not re-install on its own.
+func refreshVenvPackage(ctx context.Context, uvPath, venvPython, installDir string) error {
+	fmt.Fprintln(os.Stdout, "[ax-trace] reinstalling coding-harness-tracing in venv...")
+	cmd := exec.CommandContext(ctx, uvPath, "pip", "install", "--python", venvPython, "-U", installDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return fmt.Errorf("uv pip install exited with code %d", exitErr.ExitCode())
+		}
+		return fmt.Errorf("uv pip install: %w", err)
+	}
 	return nil
 }
 
