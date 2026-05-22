@@ -1,0 +1,54 @@
+version: 2
+
+project_name: ax-trace
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ax-trace
+    main: .
+    binary: ax-trace
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+
+archives:
+  - id: ax-trace
+    builds: [ax-trace]
+    name_template: "ax-trace_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    format: tar.gz
+    files:
+      - src: ../../LICENSE
+        dst: LICENSE
+      - src: ../../README.md
+        dst: README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: Arize-ai
+    name: coding-harness-tracing
+  prerelease: auto
+  draft: false
+  name_template: "ax-trace {{ .Version }}"
