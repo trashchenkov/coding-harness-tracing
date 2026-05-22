@@ -8,31 +8,51 @@ The installer prompts for your backend (Phoenix or Arize AX) and project name, w
 
 Pass `--with-skills` to also symlink the `manage-kiro-tracing` skill into the current directory's `.agents/skills/` so coding agents in this workspace can help manage Kiro tracing configuration.
 
-### Remote setup
+### Install with `ax-trace` (recommended)
+
+`ax-trace` is a small Go CLI that bootstraps the Python runtime for you and wires up the harness. It works the same on macOS, Linux, and Windows, and runs `ax-trace doctor` to diagnose problems without depending on the venv.
 
 macOS / Linux:
 
 ```bash
-# Install
-curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh | bash -s -- kiro
+# One-time: install the ax-trace binary
+curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install-ax-trace.sh | bash
+
+# Install Kiro tracing
+ax-trace kiro
 
 # Uninstall
-curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh | bash -s -- uninstall kiro
+ax-trace uninstall kiro
 ```
 
 Windows (PowerShell):
 
 ```powershell
-# Install
-iwr -useb https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
-& $env:TEMP\install.bat kiro
+# One-time: install the ax-trace binary
+irm https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install-ax-trace.ps1 | iex
+
+# Install Kiro tracing
+ax-trace kiro
 
 # Uninstall
-iwr -useb https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
-& $env:TEMP\install.bat uninstall kiro
+ax-trace uninstall kiro
 ```
 
-### Local setup
+#### Non-interactive install
+
+Pre-set every prompt with flags and env vars for unattended installs (CI, devcontainers, fleet provisioning). `ARIZE_API_KEY` (or `PHOENIX_API_KEY`) is read from the environment only — never pass it as a flag.
+
+```bash
+ARIZE_API_KEY="$ARIZE_API_KEY" ax-trace kiro \
+  --non-interactive \
+  --backend arize \
+  --space-id YOUR_SPACE_ID \
+  --project-name kiro
+```
+
+### Alternative: `install.sh` / `install.bat`
+
+The Python installer still works and remains supported. It targets the same `~/.arize/harness/` layout as `ax-trace`, so the two are interchangeable.
 
 ```bash
 git clone https://github.com/Arize-ai/coding-harness-tracing.git
@@ -57,6 +77,17 @@ install.bat kiro
 
 # Uninstall
 install.bat uninstall kiro
+```
+
+Or run the installer directly from GitHub:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh | bash -s -- kiro
+```
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat -OutFile $env:TEMP\install.bat
+& $env:TEMP\install.bat kiro
 ```
 
 ## Default Settings
