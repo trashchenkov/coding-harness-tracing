@@ -1,199 +1,127 @@
 ---
 name: manage-gemini-tracing
-description: Set up and configure Arize tracing for Gemini CLI sessions. Use when users want to set up tracing, configure Arize AX or Phoenix for Gemini, enable/disable tracing, or troubleshoot tracing issues. Triggers on "set up gemini tracing", "configure Arize for Gemini", "configure Phoenix for Gemini", "enable gemini tracing", "setup-gemini-tracing", or any request about connecting Gemini CLI to Arize or Phoenix for observability.
+description: Set up and manage Arize tracing for Gemini CLI sessions using the ax-trace CLI. Use when users want to set up Gemini tracing, configure Arize AX or Phoenix for Gemini, edit config, run diagnostics, enable/disable tracing, or troubleshoot Gemini tracing. Triggers on "set up gemini tracing", "configure Arize for Gemini", "ax-trace", "enable gemini tracing", "setup-gemini-tracing", or any request about connecting Gemini CLI to Arize or Phoenix for observability.
 ---
 
-# Setup Gemini Tracing
+# Manage Gemini Tracing
 
-Configure OpenInference tracing for **Gemini CLI** sessions to Arize AX (cloud) or Phoenix (self-hosted). Spans are sent directly to the backend from hooks -- no background process or backend-specific dependencies are needed in the user's environment.
+Configure OpenInference tracing for the **Gemini CLI** to Arize AX (cloud) or Phoenix (self-hosted). Spans are sent directly to the backend from hooks — no background process or backend-specific Python deps run in the user's environment.
 
-## How to Use This Skill
+The primary tool is the **`ax-trace`** CLI. It installs a managed Python runtime (via [uv](https://github.com/astral-sh/uv)), registers the Gemini hooks, and manages config. Reach for the repo only to inspect hook/handler internals: <https://github.com/Arize-ai/coding-harness-tracing> (Gemini code under `tracing/gemini/`).
 
-**This skill follows a decision tree workflow.** Start by asking the user where they are in the setup process:
+## How to use this skill
 
-1. **Is the harness already installed?**
-   - Check `~/.gemini/settings.json` for 8 hook entries with `name: arize-tracing`
-   - Check `~/.arize/harness/config.yaml` for the `harnesses.gemini` block
-   - If both are present -> Jump to [Validate](#validate) or [Troubleshoot](#troubleshoot)
+1. **Installing / adding tracing?** → [Install](#install)
+2. **Have credentials, changing a setting?** → [Configure via the CLI](#configure-via-the-cli)
+3. **Not working / debugging?** → [Diagnose with doctor](#diagnose-with-doctor) then [Troubleshoot](#troubleshoot)
+4. **No backend account yet?** → [Backends](#backends) first
 
-2. **Do they already have credentials?**
-   - Yes -> Jump to [Configure Settings](#configure-settings)
-   - No -> Continue to step 3
-
-3. **Which backend do they want to use?**
-   - Phoenix (self-hosted) -> Go to [Set Up Phoenix](#set-up-phoenix)
-   - Arize AX (cloud) -> Go to [Set Up Arize AX](#set-up-arize-ax)
-
-4. **Are they troubleshooting?**
-   - Yes -> Jump to [Troubleshoot](#troubleshoot)
-
-**Important:** Only follow the relevant path for the user's needs. Don't go through all sections.
-
-## Set Up Phoenix
-
-Phoenix is self-hosted. No Python dependencies are needed for tracing -- spans are sent directly via `send_span()` using stdlib `urllib`.
-
-### Install Phoenix
-
-Ask if they already have Phoenix running. If not, walk through:
+## Install
 
 ```bash
-# Option A: pip
-pip install arize-phoenix && phoenix serve
-
-# Option B: Docker
-docker run -p 6006:6006 arizephoenix/phoenix:latest
+go install github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace@latest
+ax-trace add gemini
 ```
 
-Phoenix UI will be available at `http://localhost:6006`. Confirm it's running:
+`ax-trace add gemini` bootstraps the runtime, registers hooks in `~/.gemini/settings.json`, and runs the wizard. Fields collected:
+
+| Field | Notes |
+|-------|-------|
+| Backend | `arize` or `phoenix` |
+| API key | `ARIZE_API_KEY` / `PHOENIX_API_KEY` — env var or masked prompt, never a flag |
+| Space ID | Arize only |
+| OTLP / Phoenix endpoint | Arize defaults to `otlp.arize.com:443`; Phoenix to `http://localhost:6006` |
+| Project name | Defaults to `gemini` |
+| User ID | Optional; added to every span as `user.id` |
+| Content logging | Three prompts (prompts / tool details / tool content), default **on** |
+| Verbose | Terminal trace summaries, default **off** |
+
+The Gemini events (`SessionStart`, `SessionEnd`, `BeforeAgent`, `AfterAgent`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`) each map to a dedicated `arize-hook-gemini-*` entry point. Restart the Gemini CLI after install.
+
+**Non-interactive:**
 
 ```bash
-curl -sf http://localhost:6006/v1/traces >/dev/null && echo "Phoenix is running" || echo "Phoenix not reachable"
+export ARIZE_API_KEY=...
+ax-trace add gemini --backend arize --space-id SPACE_ID --project-name gemini --non-interactive
 ```
 
-Then proceed to [Configure Settings](#configure-settings) with the Phoenix endpoint.
+## Backends
 
-## Set Up Arize AX
+### Arize AX (cloud)
 
-Arize AX is available as a SaaS platform or as an on-prem deployment. Users need an account, a space, and an API key.
+SaaS uses `otlp.arize.com:443`; on-prem needs a custom OTLP endpoint. Get credentials: log in (https://app.arize.com), **Settings** → **Space ID** on Space Settings; **API Keys** tab to create/copy a key. Both `api_key` and `space_id` required.
 
-**First, ask the user: "Are you using the Arize SaaS platform or an on-prem instance?"**
+### Phoenix (self-hosted)
 
-- **SaaS** -> Uses the default endpoint (`otlp.arize.com:443`). Continue below.
-- **On-prem** -> The user will need to provide their custom OTLP endpoint (e.g., `otlp.mycompany.arize.com:443`). Ask for it and note it for the [Configure Settings](#configure-settings) step.
+```bash
+pip install arize-phoenix && phoenix serve   # or: docker run -p 6006:6006 arizephoenix/phoenix:latest
+```
 
-### 1. Create an account
+UI at `http://localhost:6006`. Verify: `curl -sf http://localhost:6006/v1/traces >/dev/null && echo ok`.
 
-If the user doesn't have an Arize account:
-- **SaaS**: Sign up at https://app.arize.com/auth/join
-- **On-prem**: Contact their administrator for access to the on-prem instance
+## Configure via the CLI
 
-### 2. Get Space ID and API key
+Backend credentials live in `~/.arize/harness/config.yaml`. The hook wiring lives in `~/.gemini/settings.json` (written by `ax-trace add gemini`). Edit backend settings with `ax-trace config`:
 
-Walk the user through finding their credentials:
-1. Log in to their Arize instance (https://app.arize.com for SaaS, or their on-prem URL)
-2. Click **Settings** (gear icon) in the left sidebar
-3. The **Space ID** is shown on the Space Settings page
-4. Go to the **API Keys** tab
-5. Click **Create API Key** or copy an existing one
+```bash
+ax-trace config show                              # api_key masked
+ax-trace config set harnesses.gemini.project_name gemini
+ax-trace config set verbose true
+ax-trace config edit
+```
 
-Both `api_key` and `space_id` are required for the shared config.
+Schema:
 
-**No Python dependencies are needed.** Both Phoenix and Arize AX use HTTP/JSON -- no additional Python dependencies are needed.
-
-Then proceed to [Configure Settings](#configure-settings). If the user is on an on-prem instance, remind them to provide their custom endpoint.
-
-## Configure Settings
-
-**Important:** Users must run this setup before tracing will work. The `send_span()` function requires `~/.arize/harness/config.yaml` to exist for backend credential resolution.
-
-### Ask the user for:
-
-1. **Backend choice**: Phoenix or Arize AX
-2. **Credentials** (only if no existing config):
-   - Phoenix: endpoint URL (default: `http://localhost:6006`), optional API key
-   - Arize AX: API key and Space ID
-3. **OTLP Endpoint** (Arize AX only, optional): For hosted Arize instances using a custom endpoint. Defaults to `otlp.arize.com:443`.
-4. **Project name** (optional): defaults to `"gemini"`, stored under `harnesses.gemini.project_name`
-5. **User ID** (optional): Set `ARIZE_USER_ID` env var to identify spans by user (useful for teams)
-
-### Write the config
-
-The config file at `~/.arize/harness/config.yaml` is the single source of truth for backend credentials and per-harness settings. Create the directory structure if needed: `mkdir -p ~/.arize/harness/{bin,run,logs,state/gemini}`
-
-**Important: read-merge-write.** If `~/.arize/harness/config.yaml` already exists, read it first, then merge in the new or updated fields (e.g., add/update the `harnesses.gemini` entry) while preserving existing backend credentials. Only prompt for backend credentials if no existing config is found.
-
-**Phoenix:**
 ```yaml
 harnesses:
   gemini:
     project_name: gemini
-    target: phoenix
-    endpoint: <endpoint>
-    api_key: ""
-```
-
-**Arize AX:**
-```yaml
-harnesses:
-  gemini:
-    project_name: gemini
-    target: arize
-    endpoint: otlp.arize.com:443
+    target: arize                   # arize | phoenix
+    endpoint: otlp.arize.com:443    # OTLP (arize) or Phoenix URL
     api_key: <key>
-    space_id: <id>
+    space_id: <id>                  # arize only
+logging:
+  prompts: true
+  tool_details: true
+  tool_content: true
+user_id: ""
+verbose: false                      # ARIZE_VERBOSE env wins over this
 ```
 
-If the user has a custom OTLP endpoint, set it in `harnesses.gemini.endpoint`.
-
-### Activate Gemini hooks
-
-Gemini CLI uses `~/.gemini/settings.json` for hook registration. Hooks are configured under `hooks.<EventName>` as an array of matcher/hook objects.
-
-Install or reinstall via the installer:
+## Diagnose with doctor
 
 ```bash
-./install.sh gemini
+ax-trace doctor
 ```
 
-To uninstall:
+Pure-Go health check (works even when the venv is broken). `✓`/`✗` per check with remediation; non-zero exit on failure.
+
+| Verdict | Meaning / fix |
+|---------|---------------|
+| `✗ venv` | Runtime missing/broken → `ax-trace add gemini` or `ax-trace update` |
+| `✗ settings:gemini` | `~/.gemini/settings.json` missing or unparseable → re-run `ax-trace add gemini`, or fix JSON |
+| `✗ env:gemini` | No creds in env or config → `ax-trace config set harnesses.gemini.api_key ...` |
+| `✗ otlp_endpoint` | Endpoint unreachable → check network/endpoint |
+| all `✓` but no traces | Restart the Gemini CLI; see [Troubleshoot](#troubleshoot) |
+
+## Uninstall
 
 ```bash
-./install.sh uninstall gemini
+ax-trace uninstall --gemini   # remove Gemini tracing, keep the shared runtime
+ax-trace uninstall            # remove all harnesses + the shared runtime
 ```
 
-The installer registers all 8 hook events (`SessionStart`, `SessionEnd`, `BeforeAgent`, `AfterAgent`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`) in `~/.gemini/settings.json` with `name: arize-tracing` on each entry.
-
-### Validate
-
-1. **Config exists**: Run `cat ~/.arize/harness/config.yaml` to verify the config file exists and has correct backend credentials under `harnesses.gemini`.
-2. **Phoenix** (if applicable): Run `curl -sf <endpoint>/v1/traces >/dev/null` to check connectivity.
-3. **Hooks active**: Verify `~/.gemini/settings.json` contains 8 hook entries with `name: arize-tracing`.
-4. **Quick dry-run test** (optional):
-   ```bash
-   echo '{"event":"BeforeModel"}' | ARIZE_DRY_RUN=true arize-hook-gemini-before-model
-   ```
-
-### Confirm
-
-Tell the user:
-- Config saved to `~/.arize/harness/config.yaml`
-- Gemini CLI hooks activated via `~/.gemini/settings.json`
-- Spans are sent directly to the backend from hooks -- no background process needed
-- After saving, open a new Gemini CLI session and traces will appear in their Phoenix UI or Arize AX dashboard under the project name
-- Mention `ARIZE_DRY_RUN=true` to test without sending data (set as env var before launching Gemini CLI)
-- Mention `ARIZE_VERBOSE=true` for debug output
-- Errors are always written to `~/.arize/harness/logs/gemini.log`; set `ARIZE_VERBOSE=true` in the shell before launching Gemini CLI to also capture routine hook activity
-- Toggle tracing on/off via `ARIZE_TRACE_ENABLED` env var (must be exported in the user's shell -- Gemini hooks read host env vars)
-- Tail the log file at `~/.arize/harness/logs/gemini.log` for real-time debugging
-
-## Hook Events
-
-Gemini CLI fires 8 hook events. Each event is registered in `~/.gemini/settings.json` and maps to a dedicated CLI entry point.
-
-| Event | Span Name | Kind | Description |
-|-------|-----------|------|-------------|
-| `SessionStart` | Session Start | CHAIN | Session initialization |
-| `SessionEnd` | Session End | CHAIN | Session termination |
-| `BeforeAgent` | Agent Turn | CHAIN | User prompt to agent |
-| `AfterAgent` | Agent Turn | CHAIN | Agent completion |
-| `BeforeModel` | LLM Call | LLM | Model invocation start with prompt |
-| `AfterModel` | LLM Call | LLM | Model response with tokens |
-| `BeforeTool` | Tool: {name} | TOOL | Tool invocation start |
-| `AfterTool` | Tool: {name} | TOOL | Tool result |
+Removes the Arize hook entries from `~/.gemini/settings.json` and the `harnesses.gemini` config entry.
 
 ## Troubleshoot
 
-Common issues and fixes for Gemini CLI:
+Run `ax-trace doctor` first. Then:
 
 | Problem | Fix |
 |---------|-----|
-| Traces not appearing | Verify config exists: `cat ~/.arize/harness/config.yaml`. Check hook log: `tail -20 ~/.arize/harness/logs/gemini.log` |
-| Hooks not firing | Verify `~/.gemini/settings.json` contains the 8 hook entries with `name: arize-tracing` for all events |
-| Config missing | Run `./install.sh gemini` or create `~/.arize/harness/config.yaml` manually (include `harnesses.gemini` section) |
-| Phoenix unreachable | Verify Phoenix is running: `curl -sf <endpoint>/v1/traces` |
-| Want to test without sending | Set `ARIZE_DRY_RUN=true` env var before launching Gemini CLI |
-| Want verbose logging | Set `ARIZE_VERBOSE=true` env var before launching Gemini CLI |
-| Wrong project name | Set `harnesses.gemini.project_name` in `~/.arize/harness/config.yaml` (default: `"gemini"`) |
-| Spans missing user attribution | Set `ARIZE_USER_ID` env var before launching Gemini CLI |
-| Tracing not toggling | Ensure `ARIZE_TRACE_ENABLED` is exported in your shell, not just set |
+| No traces | Verify `~/.gemini/settings.json` has the `arize-hook-gemini-*` entries; restart the Gemini CLI |
+| Phoenix unreachable | `curl -sf <endpoint>/v1/traces` |
+| Test without sending | `ARIZE_DRY_RUN=true` before launching Gemini |
+| Verbose logging | `ax-trace config set verbose true` (or `ARIZE_VERBOSE=true`); errors always go to `~/.arize/harness/logs/gemini.log` |
+| Wrong project name | `ax-trace config set harnesses.gemini.project_name <name>` |
+| Spans missing user attribution | `ax-trace config set user_id <id>` (or `ARIZE_USER_ID` env) |

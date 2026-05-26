@@ -1,315 +1,141 @@
 ---
 name: manage-codex-tracing
-description: Set up and configure Arize tracing for OpenAI Codex CLI sessions. Use when users want to set up Codex tracing, configure Arize AX or Phoenix for Codex, enable/disable tracing, or troubleshoot Codex tracing issues. Triggers on "set up codex tracing", "configure Arize for Codex", "configure Phoenix for Codex", "enable codex tracing", "setup-codex-tracing", or any request about connecting Codex to Arize or Phoenix for observability.
+description: Set up and manage Arize tracing for OpenAI Codex CLI sessions using the ax-trace CLI. Use when users want to set up Codex tracing, configure Arize AX or Phoenix for Codex, edit config, run diagnostics, enable/disable tracing, or troubleshoot Codex tracing. Triggers on "set up codex tracing", "configure Arize for Codex", "configure Phoenix for Codex", "ax-trace", "enable codex tracing", "setup-codex-tracing", or any request about connecting Codex to Arize or Phoenix for observability.
 ---
 
-# Setup Codex Tracing
+# Manage Codex Tracing
 
-Configure OpenInference tracing for OpenAI Codex CLI sessions to Arize AX (cloud) or Phoenix (self-hosted).
+Configure OpenInference tracing for the OpenAI Codex CLI to Arize AX (cloud) or Phoenix (self-hosted). Spans are sent directly to the backend from Codex's native lifecycle hooks — no OTEL collector or background process runs in the user's environment.
 
-## Architecture Overview
+The primary tool is the **`ax-trace`** CLI. It installs a managed Python runtime (via [uv](https://github.com/astral-sh/uv)), writes the Codex hook config, and manages settings. Reach for the repo only to inspect hook/handler internals: <https://github.com/Arize-ai/coding-harness-tracing> (Codex code under `tracing/codex/`).
 
-Codex tracing uses real Codex CLI lifecycle hooks plus the legacy `notify` hook as a token-usage backstop. Spans are sent directly to the backend from the `Stop` hook:
+## Codex architecture (read this first)
 
-1. **Direct send** (`core/common.py`) — spans are sent directly to Phoenix (REST) or Arize AX (gRPC) from the hook handlers via `send_span()`. Per-harness backend credentials are read from `harnesses.codex.*` in config.
+Codex tracing is more involved than the other harnesses. It uses **native Codex CLI hooks** plus the legacy `notify` hook as a token-usage backstop:
 
-2. **Real Codex hooks** — `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, and `Stop` events are dispatched to three entry points:
-   - `arize-hook-codex-session` (`SessionStart`, `UserPromptSubmit`) — mutates per-thread state file at `~/.arize/harness/state/codex/state_<thread_id>.yaml`.
-   - `arize-hook-codex-tool` (`PreToolUse`, `PostToolUse`, `PermissionRequest`) — appends rows to `~/.arize/harness/state/codex/spans_<thread_id>.jsonl`.
-   - `arize-hook-codex-stop` (`Stop`) — reads state + JSONL, builds the parent LLM span plus TOOL child spans, sends the multi-span payload, then clears turn-scoped state and deletes the JSONL.
+- `SessionStart` / `UserPromptSubmit` → `arize-hook-codex-session` (updates per-thread state at `~/.arize/harness/state/codex/state_<thread_id>.yaml`)
+- `PreToolUse` / `PostToolUse` / `PermissionRequest` → `arize-hook-codex-tool` (appends rows to `spans_<thread_id>.jsonl`)
+- `Stop` → `arize-hook-codex-stop` (builds the parent LLM span + TOOL child spans, sends, clears state)
+- `agent-turn-complete` (`notify`) → `arize-hook-codex-notify` (writes token counts into state; Codex hook payloads don't carry exact token usage)
 
-3. **Notify hook** (`arize-hook-codex-notify`) — Fires on `agent-turn-complete`. Real Codex hook payloads don't carry exact token counts, so `notify` is kept purely as a token-usage backstop: it extracts `token_usage` and `last-assistant-message` from the notify payload and writes them into the state file. If the state file doesn't exist (hooks not yet trusted, first run), notify falls back to its legacy behavior of emitting a single flat Turn span.
+There is **no OTEL exporter / collector** anymore — spans go straight to Phoenix (REST) or Arize AX (gRPC) via `send_span()`.
 
-```
-Codex CLI
-  |
-  |-- SessionStart / UserPromptSubmit --> arize-hook-codex-session
-  |     |--> updates state_<thread_id>.yaml
-  |
-  |-- PreToolUse / PostToolUse / PermissionRequest --> arize-hook-codex-tool
-  |     |--> appends row to spans_<thread_id>.jsonl
-  |
-  |-- agent-turn-complete (notify) --> arize-hook-codex-notify
-  |     |--> writes token_usage into state_<thread_id>.yaml
-  |
-  |-- Stop --> arize-hook-codex-stop
-        |--> reads state + spans JSONL
-        |--> builds parent LLM span + TOOL child spans
-        |--> send_span() --> Phoenix/Arize AX
-        |--> clears turn-scoped state, deletes spans JSONL
-```
+**Trust prompt:** Codex requires explicit approval before non-managed hooks fire. After install the user must start `codex`, run `/hooks`, and approve each `arize-hook-codex-*` entry. Until then tracing falls back to `notify`-only (a single flat Turn span per turn, no tool spans).
 
-**Graceful degradation**: If hooks aren't trusted yet (Codex requires explicit `/hooks` approval), the `notify` hook still produces a single flat Turn span.
+## How to use this skill
 
-## Trust prompt
+1. **Installing / adding tracing?** → [Install](#install)
+2. **Have credentials, changing a setting?** → [Configure via the CLI](#configure-via-the-cli)
+3. **Not working / debugging?** → [Diagnose with doctor](#diagnose-with-doctor) then [Troubleshoot](#troubleshoot)
+4. **No backend account yet?** → [Backends](#backends) first
 
-Codex requires explicit user trust for non-managed hooks before they fire. After install, the user must:
-
-1. Start a Codex session: `codex`
-2. Type `/hooks` and approve each `arize-hook-codex-*` entry.
-
-Without this one-time approval, the real hooks never fire and tracing falls back to `notify`-only (single LLM span per turn, no tool spans).
-
-## How to Use This Skill
-
-**This skill follows a decision tree workflow.** Start by asking the user where they are in the setup process:
-
-1. **Do they already have credentials?**
-   - Yes → Jump to [Configure Codex](#configure-codex)
-   - No → Continue to step 2
-
-2. **Which backend do they want to use?**
-   - Phoenix (self-hosted) → Go to [Set Up Phoenix](#set-up-phoenix)
-   - Arize AX (cloud) → Go to [Set Up Arize AX](#set-up-arize-ax)
-
-3. **Are they troubleshooting?**
-   - Yes → Jump to [Troubleshoot](#troubleshoot)
-
-**Important:** Only follow the relevant path for the user's needs. Don't go through all sections.
-
-## Set Up Phoenix
-
-Phoenix is self-hosted and requires no Python dependencies for tracing (spans are sent directly via `send_span()` using stdlib `urllib`).
-
-### Install Phoenix
-
-Ask if they already have Phoenix running. If not, walk through:
+## Install
 
 ```bash
-# Option A: pip
-pip install arize-phoenix && phoenix serve
-
-# Option B: Docker
-docker run -p 6006:6006 arizephoenix/phoenix:latest
+go install github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace@latest
+ax-trace add codex
 ```
 
-Phoenix UI will be available at `http://localhost:6006`. Confirm it's running:
+`ax-trace add codex` bootstraps the runtime, writes the managed hook block into `~/.codex/config.toml`, and runs the wizard. Fields collected:
+
+| Field | Notes |
+|-------|-------|
+| Backend | `arize` or `phoenix` |
+| API key | `ARIZE_API_KEY` / `PHOENIX_API_KEY` — env var or masked prompt, never a flag |
+| Space ID | Arize only |
+| OTLP / Phoenix endpoint | Arize defaults to `otlp.arize.com:443`; Phoenix to `http://localhost:6006` |
+| Project name | Defaults to `codex` |
+| User ID | Optional; added to every span as `user.id` |
+| Content logging | Three prompts (prompts / tool details / tool content), default **on** |
+| Verbose | Terminal trace summaries, default **off** |
+
+**After install, remind the user to trust the hooks**: start `codex`, run `/hooks`, approve the `arize-hook-codex-*` entries.
+
+**Non-interactive:**
 
 ```bash
-curl -sf http://localhost:6006/v1/traces >/dev/null && echo "Phoenix is running" || echo "Phoenix not reachable"
+export ARIZE_API_KEY=...
+ax-trace add codex --backend arize --space-id SPACE_ID --project-name codex --non-interactive
 ```
 
-Then proceed to [Configure Codex](#configure-codex) with `PHOENIX_ENDPOINT=http://localhost:6006`.
+## Backends
 
-## Set Up Arize AX
+### Arize AX (cloud)
 
-Arize AX is available as a SaaS platform or as an on-prem deployment. Users need an account, a space, and an API key.
+SaaS uses `otlp.arize.com:443`; on-prem needs a custom OTLP endpoint. Get credentials: log in (https://app.arize.com), **Settings** → **Space ID** on Space Settings; **API Keys** tab to create/copy a key. Both `api_key` and `space_id` required.
 
-**First, ask the user: "Are you using the Arize SaaS platform or an on-prem instance?"**
+### Phoenix (self-hosted)
 
-- **SaaS** → Uses the default endpoint (`otlp.arize.com:443`). Continue below.
-- **On-prem** → The user will need to provide their custom OTLP endpoint (e.g., `otlp.mycompany.arize.com:443`). Ask for it and note it for the configure step where it will be set as `ARIZE_OTLP_ENDPOINT`.
-
-### 1. Create an account
-
-If the user doesn't have an Arize account:
-- **SaaS**: Sign up at https://app.arize.com/auth/join
-- **On-prem**: Contact their administrator for access
-
-### 2. Get Space ID and API key
-
-Walk the user through finding their credentials:
-1. Log in to their Arize instance (https://app.arize.com for SaaS, or their on-prem URL)
-2. Click **Settings** (gear icon) in the left sidebar
-3. The **Space ID** is shown on the Space Settings page
-4. Go to the **API Keys** tab
-5. Click **Create API Key** or copy an existing one
-
-Both `ARIZE_API_KEY` and `ARIZE_SPACE_ID` are required.
-
-### 3. Python dependencies (bundled with the package)
-
-Arize AX uses gRPC for export, but the gRPC dependencies are bundled with the package — they are **not** required in the user's Python environment.  No `pip install` step is needed for basic tracing.
-
-Then proceed to [Configure Codex](#configure-codex).
-
-## Configure Codex
-
-This section configures:
-1. **Backend config** at `~/.arize/harness/config.yaml`
-2. **Environment variables** in `~/.codex/arize-env.sh`
-3. **Hook entries** in `~/.codex/config.toml` (real Codex hooks + `notify` token-usage backstop)
-4. **Trust prompt** inside Codex (`/hooks`) — required before non-managed hooks fire
-
-### Determine the integration path
-
-Ask the user: **"Where is the Codex tracing directory located?"**
-
-Common locations:
-- If cloned: `./coding-harness-tracing/tracing/codex`
-- If installed via the curl installer: `~/.arize/harness/tracing/codex`
-
-Store this as `INTEGRATION_PATH` for the hook config.
-
-### Step 1: Write the backend config
-
-Write `~/.arize/harness/config.yaml` with the backend credentials. The config file is the single source of truth for backend and harness settings.
-
-**Important: read-merge-write.** If `~/.arize/harness/config.yaml` already exists, read it first, add or update the `harnesses.codex` entry, and preserve existing backend credentials. Only prompt the user for backend credentials if there is no existing config.
-
-**Phoenix:**
 ```bash
-mkdir -p ~/.arize/harness/{logs,state/codex}
-# Merge: add/update harnesses.codex, preserve existing backend settings
+pip install arize-phoenix && phoenix serve   # or: docker run -p 6006:6006 arizephoenix/phoenix:latest
+```
+
+UI at `http://localhost:6006`. Verify: `curl -sf http://localhost:6006/v1/traces >/dev/null && echo ok`.
+
+## Configure via the CLI
+
+Backend credentials live in `~/.arize/harness/config.yaml`. The Codex hook wiring lives in `~/.codex/config.toml` (managed block, written by `ax-trace add codex` — don't hand-edit it). Edit backend settings with `ax-trace config`:
+
+```bash
+ax-trace config show                              # api_key masked
 ax-trace config set harnesses.codex.project_name codex
+ax-trace config set verbose true
+ax-trace config edit
 ```
 
-If no config exists yet, create it:
+Schema:
+
 ```yaml
 harnesses:
   codex:
     project_name: codex
-    target: phoenix
-    endpoint: http://localhost:6006
-    api_key: ""
-```
-
-**Arize AX:**
-```bash
-mkdir -p ~/.arize/harness/{logs,state/codex}
-ax-trace config set harnesses.codex.project_name codex
-```
-
-If no config exists yet, create it:
-```yaml
-harnesses:
-  codex:
-    project_name: codex
-    target: arize
-    endpoint: otlp.arize.com:443
+    target: arize                   # arize | phoenix
+    endpoint: otlp.arize.com:443    # OTLP (arize) or Phoenix URL
     api_key: <key>
-    space_id: <space-id>
+    space_id: <id>                  # arize only
+logging:
+  prompts: true
+  tool_details: true
+  tool_content: true
+user_id: ""
+verbose: false                      # ARIZE_VERBOSE env wins over this
 ```
 
-### Step 2: Write the environment file (optional)
-
-Environment variables are optional overrides — all backend credentials are in `~/.arize/harness/config.yaml`. If the user needs env-var overrides, create `~/.codex/arize-env.sh`:
+## Diagnose with doctor
 
 ```bash
-cat > ~/.codex/arize-env.sh << 'EOF'
-export ARIZE_TRACE_ENABLED=true
-EOF
-chmod 600 ~/.codex/arize-env.sh
+ax-trace doctor
 ```
 
-If the user wants to associate spans with a user ID, add `export ARIZE_USER_ID="<user-id>"`.
+Pure-Go health check (works even when the venv is broken). `✓`/`✗` per check with remediation; non-zero exit on failure.
 
-### Step 3: Add the hook entries to config.toml
+| Verdict | Meaning / fix |
+|---------|---------------|
+| `✗ venv` | Runtime missing/broken → `ax-trace add codex` or `ax-trace update` |
+| `✗ settings:codex` | `~/.codex/config.toml` missing → re-run `ax-trace add codex` (doctor checks existence; TOML isn't parsed at v1) |
+| `✗ env:codex` | No creds in env or config → `ax-trace config set harnesses.codex.api_key ...` |
+| `✗ otlp_endpoint` | Endpoint unreachable → check network/endpoint |
+| all `✓` but only single flat spans (no tool spans) | Hooks not trusted yet → run `codex`, `/hooks`, approve `arize-hook-codex-*` |
 
-Read `~/.codex/config.toml`. Add the `notify` line at the top level (NOT inside any `[section]`) — this is the token-usage backstop:
+## Uninstall
 
-```toml
-notify = ["~/.arize/harness/venv/bin/arize-hook-codex-notify"]
-```
-
-Then add one `[[hooks.<Event>]]` entry per real Codex lifecycle event:
-
-```toml
-[[hooks.SessionStart]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-session"]
-
-[[hooks.UserPromptSubmit]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-session"]
-
-[[hooks.PreToolUse]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-tool"]
-
-[[hooks.PostToolUse]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-tool"]
-
-[[hooks.PermissionRequest]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-tool"]
-
-[[hooks.Stop]]
-command = ["~/.arize/harness/venv/bin/arize-hook-codex-stop"]
-```
-
-**Important:** If `notify` already exists in the config, update the existing line. If `[[hooks.<Event>]]` entries already exist that match our handlers (managed block), leave them alone — the installer manages the block idempotently.
-
-### Step 4: Approve the hooks inside Codex
-
-Codex requires explicit user trust for non-managed hooks before they fire. The user must:
-
-1. Start a Codex session: `codex`
-2. Type `/hooks` and approve each `arize-hook-codex-*` entry.
-
-Until this is done, only the `notify` token-usage backstop will run (flat single-span tracing). The real hooks will not fire.
-
-**Note:** The installer handles Steps 1-3 automatically. Step 4 (the `/hooks` trust prompt) is a one-time user action — the installer cannot automate it.
-
-### Validate
-
-After writing the config, validate:
-
-1. **Check config.toml is valid:**
 ```bash
-cat ~/.codex/config.toml
-```
-Visually confirm the `notify` line is at the top level and the `[[hooks.SessionStart]]`, `[[hooks.UserPromptSubmit]]`, `[[hooks.PreToolUse]]`, `[[hooks.PostToolUse]]`, `[[hooks.PermissionRequest]]`, and `[[hooks.Stop]]` entries are present.
-
-2. **Check env file:**
-```bash
-source ~/.codex/arize-env.sh && echo "ARIZE_TRACE_ENABLED=$ARIZE_TRACE_ENABLED"
+ax-trace uninstall --codex     # remove Codex tracing, keep the shared runtime
+ax-trace uninstall             # remove all harnesses + the shared runtime
 ```
 
-3. **Check the hooks are trusted inside Codex:**
-   Start `codex`, run `/hooks`, and confirm each `arize-hook-codex-*` entry is listed and approved.
-
-4. **Phoenix connectivity** (if using Phoenix):
-```bash
-curl -sf ${PHOENIX_ENDPOINT}/v1/traces >/dev/null && echo "Phoenix reachable" || echo "Phoenix not reachable"
-```
-
-5. **Dry run test:**
-```bash
-ARIZE_DRY_RUN=true arize-hook-codex-notify '{"type":"agent-turn-complete","thread-id":"test-123","turn-id":"turn-1","cwd":"/tmp","input-messages":"hello","last-assistant-message":"hi there"}'
-```
-Should print: `[arize] DRY RUN:` followed by the span name.
-
-### Confirm
-
-Tell the user:
-- Configuration saved to `~/.codex/config.toml`, `~/.codex/arize-env.sh`, and `~/.arize/harness/config.yaml`
-- Spans are sent directly to the backend from the `Stop` hook
-- The real Codex hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Stop`) build rich span trees with TOOL children per tool call
-- The `notify` hook is now a token-usage backstop — it writes exact token counts into the per-thread state file so they appear on the parent LLM span
-- Until the user approves the hooks via `/hooks` inside Codex, only the `notify`-based fallback runs (single flat LLM span per turn)
-- Mention `ARIZE_DRY_RUN=true` to test without sending data
-- Mention `ARIZE_VERBOSE=true` and `ARIZE_TRACE_DEBUG=true` for debug output
-- Logs: `~/.arize/harness/logs/codex.log` (errors always; routine activity requires `ARIZE_VERBOSE=true` in `~/.codex/arize-env.sh` or the shell)
-
-### Environment Variables Reference
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `ARIZE_API_KEY` | For AX | - | Arize AX API key |
-| `ARIZE_SPACE_ID` | For AX | - | Arize AX space ID |
-| `ARIZE_OTLP_ENDPOINT` | No | `otlp.arize.com:443` | OTLP gRPC endpoint (on-prem Arize) |
-| `PHOENIX_ENDPOINT` | For Phoenix | `http://localhost:6006` | Phoenix collector URL |
-| `PHOENIX_API_KEY` | No | - | Phoenix API key for auth |
-| `ARIZE_PROJECT_NAME` | No | `codex` | Project name in Arize/Phoenix |
-| `ARIZE_USER_ID` | No | - | User ID to attach to all spans as `user.id` attribute |
-| `ARIZE_TRACE_ENABLED` | No | `true` | Enable/disable tracing |
-| `ARIZE_DRY_RUN` | No | `false` | Print spans instead of sending |
-| `ARIZE_VERBOSE` | No | `false` | Enable verbose logging |
-| `ARIZE_TRACE_DEBUG` | No | `false` | Write debug JSON to `~/.arize/harness/state/codex/debug/` |
-| `ARIZE_LOG_FILE` | No | `~/.arize/harness/logs/codex.log` | Log file path |
+Removes the managed block from `~/.codex/config.toml` and the `harnesses.codex` config entry; clears per-thread state under `~/.arize/harness/state/codex/`.
 
 ## Troubleshoot
 
-Common issues and fixes:
+Run `ax-trace doctor` first. Then:
 
 | Problem | Fix |
 |---------|-----|
-| Traces not appearing | Check `ARIZE_TRACE_ENABLED` is `true` in `~/.codex/arize-env.sh` |
-| Hooks not firing | Run `codex` → `/hooks` and confirm each `arize-hook-codex-*` entry is trusted. If they aren't listed at all, re-run the installer. |
-| `notify` hook not firing | Verify `notify` line in `~/.codex/config.toml` points to correct path |
-| Phoenix unreachable | Verify Phoenix is running: `curl -sf <endpoint>/v1/traces` |
-| No output in terminal | Hooks run in background; check `~/.arize/harness/logs/codex.log` |
-| Want to test without sending | Set `ARIZE_DRY_RUN=true` in env or `export ARIZE_DRY_RUN=true` |
-| Want verbose logging | Set `ARIZE_VERBOSE=true` in env or `export ARIZE_VERBOSE=true` |
-| Wrong project name | Set `ARIZE_PROJECT_NAME` in `~/.codex/arize-env.sh` (default: `codex`) |
-| Existing `notify` hook | Codex supports only one `notify` — create a wrapper script that calls both |
-| Stale state files | Run: `rm -rf ~/.arize/harness/state/codex/state_*.yaml ~/.arize/harness/state/codex/spans_*.jsonl` |
-| Flat spans only (no children) | The real hooks haven't been trusted yet. Run `codex` → `/hooks` and approve each `arize-hook-codex-*` entry. |
-| User ID not appearing on spans | Set `ARIZE_USER_ID` in `~/.codex/arize-env.sh` or export before running Codex |
+| Only one flat span per turn, no tool spans | Hooks not trusted → `codex` → `/hooks` → approve `arize-hook-codex-*` |
+| No traces at all | Verify creds (`ax-trace config show`); confirm the managed block is in `~/.codex/config.toml` |
+| Phoenix unreachable | `curl -sf <endpoint>/v1/traces` |
+| Missing token counts | Expected if `notify` didn't fire; native hooks still produce the span tree |
+| Test without sending | `ARIZE_DRY_RUN=true` |
+| Verbose logging | `ax-trace config set verbose true` (or `ARIZE_VERBOSE=true`); errors always go to `~/.arize/harness/logs/codex.log` |
+| Wrong project name | `ax-trace config set harnesses.codex.project_name <name>` |
