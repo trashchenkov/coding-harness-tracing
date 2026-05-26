@@ -2,8 +2,9 @@
 """
 Config helper for Arize Coding Harness Tracing.
 
-Reads and writes ~/.arize/harness/config.yaml.
-Used by shell scripts (via CLI subcommands) and Python modules (via import).
+Reads and writes ~/.arize/harness/config.yaml. Imported by other Python
+modules. The user-facing CLI for editing this file is `ax-trace config`
+(see cmd/ax-trace/config.go) — there is no Python CLI entry point.
 
 Top-level keys:
   harnesses: dict of per-harness entries (target/endpoint/api_key/project_name/...)
@@ -11,17 +12,8 @@ Top-level keys:
   user_id:   optional string identifying the user across harnesses
   verbose:   bool — when true, hook handlers print trace summaries to stderr.
              ARIZE_VERBOSE env var takes precedence over this key.
-
-CLI usage:
-    python3 core/config.py get <dotted.key>
-    python3 core/config.py set <dotted.key> <value>
-    python3 core/config.py delete <dotted.key>
-    python3 core/config.py write          # reads YAML from stdin
-    python3 core/config.py dump
-    python3 core/config.py exists
 """
 
-import json
 import os
 import sys
 
@@ -113,122 +105,3 @@ def save_config(config, config_path=None):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
-
-
-# --- CLI helpers ---
-
-
-def _parse_value(raw):
-    """Auto-detect type for CLI set values.
-
-    Integers become ints, true/false become bools, everything else stays a string.
-    """
-    if raw.lower() == "true":
-        return True
-    if raw.lower() == "false":
-        return False
-    try:
-        return int(raw)
-    except ValueError:
-        pass
-    return raw
-
-
-def _format_output(value):
-    """Format a value for stdout.
-
-    Scalars are printed raw; dicts and lists are JSON-encoded.
-    """
-    if value is None:
-        return ""
-    if isinstance(value, (dict, list)):
-        return json.dumps(value)
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-# --- CLI entrypoint ---
-
-
-def main():
-    if len(sys.argv) < 2:
-        sys.stderr.write("usage: config.py <get|set|delete|write|dump|exists> [args...]\n")
-        sys.exit(1)
-
-    command = sys.argv[1]
-
-    if command == "exists":
-        sys.exit(0 if os.path.isfile(CONFIG_FILE) else 1)
-
-    if command == "get":
-        if len(sys.argv) < 3:
-            sys.stderr.write("usage: config.py get <dotted.key>\n")
-            sys.exit(1)
-        try:
-            config = load_config()
-        except ValueError as e:
-            sys.stderr.write(f"error: {e}\n")
-            sys.exit(1)
-        value = get_value(config, sys.argv[2])
-        output = _format_output(value)
-        if output:
-            print(output)
-        sys.exit(0)
-
-    if command == "set":
-        if len(sys.argv) < 4:
-            sys.stderr.write("usage: config.py set <dotted.key> <value>\n")
-            sys.exit(1)
-        try:
-            config = load_config()
-        except ValueError as e:
-            sys.stderr.write(f"error: {e}\n")
-            sys.exit(1)
-        value = _parse_value(sys.argv[3])
-        set_value(config, sys.argv[2], value)
-        save_config(config)
-        sys.exit(0)
-
-    if command == "delete":
-        if len(sys.argv) < 3:
-            sys.stderr.write("usage: config.py delete <dotted.key>\n")
-            sys.exit(1)
-        try:
-            config = load_config()
-        except ValueError as e:
-            sys.stderr.write(f"error: {e}\n")
-            sys.exit(1)
-        delete_value(config, sys.argv[2])
-        save_config(config)
-        sys.exit(0)
-
-    if command == "write":
-        try:
-            data = yaml.safe_load(sys.stdin)
-        except yaml.YAMLError as e:
-            sys.stderr.write(f"error: invalid YAML on stdin: {e}\n")
-            sys.exit(1)
-        if data is None:
-            data = {}
-        if not isinstance(data, dict):
-            sys.stderr.write("error: stdin YAML must be a mapping\n")
-            sys.exit(1)
-        save_config(data)
-        sys.exit(0)
-
-    if command == "dump":
-        try:
-            config = load_config()
-        except ValueError as e:
-            sys.stderr.write(f"error: {e}\n")
-            sys.exit(1)
-        print(yaml.safe_dump(config, default_flow_style=False, sort_keys=False), end="")
-        sys.exit(0)
-
-    sys.stderr.write(f"error: unknown command '{command}'\n")
-    sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

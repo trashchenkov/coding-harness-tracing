@@ -21,7 +21,6 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 HARNESS_DIRS = ["tracing/claude_code", "tracing/codex", "tracing/cursor"]
 
 EXPECTED_ENTRY_POINTS = {
-    "arize-config": "core.config:main",
     "arize-hook-session-start": "tracing.claude_code.hooks.handlers:session_start",
     "arize-hook-pre-tool-use": "tracing.claude_code.hooks.handlers:pre_tool_use",
     "arize-hook-post-tool-use": "tracing.claude_code.hooks.handlers:post_tool_use",

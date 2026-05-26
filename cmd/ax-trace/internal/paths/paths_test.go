@@ -76,17 +76,17 @@ func TestVenvPython(t *testing.T) {
 func TestVenvBin(t *testing.T) {
 	tmp := t.TempDir()
 	setHome(t, tmp)
-	got, err := VenvBin("arize-config")
+	got, err := VenvBin("arize-setup-claude")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if runtime.GOOS == "windows" {
-		if !strings.HasSuffix(got, filepath.Join("Scripts", "arize-config.exe")) {
-			t.Errorf("VenvBin = %q, want Scripts/arize-config.exe suffix", got)
+		if !strings.HasSuffix(got, filepath.Join("Scripts", "arize-setup-claude.exe")) {
+			t.Errorf("VenvBin = %q, want Scripts/arize-setup-claude.exe suffix", got)
 		}
 	} else {
-		if !strings.HasSuffix(got, filepath.Join("bin", "arize-config")) {
-			t.Errorf("VenvBin = %q, want bin/arize-config suffix", got)
+		if !strings.HasSuffix(got, filepath.Join("bin", "arize-setup-claude")) {
+			t.Errorf("VenvBin = %q, want bin/arize-setup-claude suffix", got)
 		}
 	}
 }

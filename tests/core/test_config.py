@@ -1,14 +1,12 @@
-"""Tests for core/config.py — pure functions and CLI main()."""
+"""Tests for core/config.py — pure module functions for reading/writing config.yaml."""
 
-import io
 import os
 import stat
-from pathlib import Path
 
 import pytest
 import yaml
 
-from core.config import _format_output, _parse_value, delete_value, get_value, load_config, main, save_config, set_value
+from core.config import delete_value, get_value, load_config, save_config, set_value
 
 
 @pytest.fixture(autouse=True)
@@ -19,57 +17,8 @@ def _mock_sleep(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Pure function tests
+# Module API tests
 # ---------------------------------------------------------------------------
-
-
-class TestParseValue:
-    def test_true(self):
-        assert _parse_value("true") is True
-
-    def test_true_mixed_case(self):
-        assert _parse_value("True") is True
-
-    def test_false(self):
-        assert _parse_value("false") is False
-
-    def test_false_mixed_case(self):
-        assert _parse_value("FALSE") is False
-
-    def test_integer(self):
-        assert _parse_value("42") == 42
-
-    def test_negative_integer(self):
-        assert _parse_value("-7") == -7
-
-    def test_string(self):
-        assert _parse_value("hello") == "hello"
-
-    def test_float_stays_string(self):
-        assert _parse_value("3.14") == "3.14"
-
-
-class TestFormatOutput:
-    def test_none(self):
-        assert _format_output(None) == ""
-
-    def test_dict(self):
-        assert _format_output({"a": 1}) == '{"a": 1}'
-
-    def test_list(self):
-        assert _format_output([1, 2]) == "[1, 2]"
-
-    def test_bool_true(self):
-        assert _format_output(True) == "true"
-
-    def test_bool_false(self):
-        assert _format_output(False) == "false"
-
-    def test_int(self):
-        assert _format_output(42) == "42"
-
-    def test_string(self):
-        assert _format_output("hello") == "hello"
 
 
 class TestGetValue:
@@ -188,139 +137,3 @@ class TestLoadConfig:
         path.write_text(":::bad\n  yaml: [")
         with pytest.raises(ValueError, match="Malformed YAML"):
             load_config(str(path))
-
-
-# ---------------------------------------------------------------------------
-# CLI main() tests
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cli_config(tmp_harness_dir, sample_config, monkeypatch):
-    """Patch core.config.CONFIG_FILE to the tmp harness config path."""
-    config_path = str(tmp_harness_dir / "config.yaml")
-    monkeypatch.setattr("core.config.CONFIG_FILE", config_path)
-    return config_path
-
-
-class TestMainGet:
-    def test_get_existing_key(self, cli_config, monkeypatch, capsys):
-        monkeypatch.setattr("sys.argv", ["config.py", "get", "harnesses.claude-code.target"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        assert capsys.readouterr().out.strip() == "phoenix"
-
-    def test_get_nonexistent_key(self, cli_config, monkeypatch, capsys):
-        monkeypatch.setattr("sys.argv", ["config.py", "get", "nonexistent.key"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        assert capsys.readouterr().out.strip() == ""
-
-    def test_get_missing_arg(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "get"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-
-class TestMainSet:
-    def test_set_value(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "set", "harnesses.codex.collector.port", "9999"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        data = yaml.safe_load(Path(cli_config).read_text())
-        assert data["harnesses"]["codex"]["collector"]["port"] == 9999
-
-    def test_set_missing_args(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "set", "key"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-
-class TestMainDelete:
-    def test_delete_key(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "delete", "harnesses.codex"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        data = yaml.safe_load(Path(cli_config).read_text())
-        assert "codex" not in data["harnesses"]
-
-    def test_delete_missing_arg(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "delete"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-
-class TestMainDump:
-    def test_dump_prints_yaml(self, cli_config, monkeypatch, capsys):
-        monkeypatch.setattr("sys.argv", ["config.py", "dump"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        output = capsys.readouterr().out
-        data = yaml.safe_load(output)
-        assert data["harnesses"]["claude-code"]["target"] == "phoenix"
-
-
-class TestMainExists:
-    def test_exists_when_present(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "exists"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-
-    def test_exists_when_missing(self, tmp_harness_dir, monkeypatch):
-        missing = str(tmp_harness_dir / "no_such_config.yaml")
-        monkeypatch.setattr("core.config.CONFIG_FILE", missing)
-        monkeypatch.setattr("sys.argv", ["config.py", "exists"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-
-class TestMainWrite:
-    def test_write_from_stdin(self, cli_config, monkeypatch):
-        input_yaml = yaml.safe_dump({"new_key": "new_value"})
-        monkeypatch.setattr("sys.stdin", io.StringIO(input_yaml))
-        monkeypatch.setattr("sys.argv", ["config.py", "write"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        data = yaml.safe_load(Path(cli_config).read_text())
-        assert data == {"new_key": "new_value"}
-
-    def test_write_empty_stdin(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.stdin", io.StringIO(""))
-        monkeypatch.setattr("sys.argv", ["config.py", "write"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 0
-        data = yaml.safe_load(Path(cli_config).read_text())
-        assert data == {}
-
-    def test_write_non_mapping_fails(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.stdin", io.StringIO("- item"))
-        monkeypatch.setattr("sys.argv", ["config.py", "write"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-
-class TestMainEdgeCases:
-    def test_no_args(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1
-
-    def test_unknown_command(self, cli_config, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["config.py", "bogus"])
-        with pytest.raises(SystemExit) as exc:
-            main()
-        assert exc.value.code == 1

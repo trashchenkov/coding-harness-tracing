@@ -125,10 +125,8 @@ class TestPyprojectEntryPointsUpdated:
         assert "core.hooks" not in self.pyproject_text
 
     def test_total_entry_point_count(self):
-        """Entry point count should match expected harness + setup + arize-config."""
-        expected_count = (
-            len(EXPECTED_HARNESS_ENTRY_POINTS) + len(EXPECTED_SETUP_ENTRY_POINTS) + 1
-        )  # +1 for arize-config
+        """Entry point count should match expected harness + setup."""
+        expected_count = len(EXPECTED_HARNESS_ENTRY_POINTS) + len(EXPECTED_SETUP_ENTRY_POINTS)
         assert (
             len(self.scripts) == expected_count
         ), f"Expected {expected_count} entry points, got {len(self.scripts)}: {sorted(self.scripts.keys())}"

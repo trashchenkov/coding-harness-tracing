@@ -151,7 +151,7 @@ Write `~/.arize/harness/config.yaml` with the backend credentials. The config fi
 ```bash
 mkdir -p ~/.arize/harness/{logs,state/codex}
 # Merge: add/update harnesses.codex, preserve existing backend settings
-arize-config set harnesses.codex.project_name codex
+ax-trace config set harnesses.codex.project_name codex
 ```
 
 If no config exists yet, create it:
@@ -167,7 +167,7 @@ harnesses:
 **Arize AX:**
 ```bash
 mkdir -p ~/.arize/harness/{logs,state/codex}
-arize-config set harnesses.codex.project_name codex
+ax-trace config set harnesses.codex.project_name codex
 ```
 
 If no config exists yet, create it:

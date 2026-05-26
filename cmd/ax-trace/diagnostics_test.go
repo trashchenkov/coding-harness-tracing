@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestDiagnosticCommandsRegistered(t *testing.T) {
-	want := []string{"doctor", "version", "config [args...]"}
+	want := []string{"doctor", "version", "config"}
 	got := map[string]bool{}
 	for _, cmd := range rootCmd.Commands() {
 		got[cmd.Use] = true
