@@ -4,33 +4,25 @@ Trace AI coding sessions to [Arize AX](https://arize.com) or [Phoenix](https://g
 
 ## Supported Harnesses
 
-| Harness Integration | Install | Name |
-|---------------------|---------|------|
-| [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `install.sh` / `install.bat` | `claude` |
-| [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `Claude Plugin (see below)`| `claude-code-tracing` |
-| [OpenAI Codex CLI](tracing/codex/README.md) | `install.sh` / `install.bat` | `codex` |
-| [Cursor IDE / CLI](tracing/cursor/README.md) | `install.sh` / `install.bat` | `cursor` |
-| [GitHub Copilot (VS Code + CLI)](tracing/copilot/README.md) | `install.sh` / `install.bat` | `copilot` |
-| [Gemini CLI](tracing/gemini/README.md) | `install.sh` / `install.bat` | `gemini` |
-| [Kiro CLI](tracing/kiro/README.md) | `install.sh` / `install.bat` | `kiro` |
+| Harness | Install command |
+|---------|-----------------|
+| [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `ax-trace add claude` |
+| [Claude Code via Claude Plugin marketplace](tracing/claude_code/README.md#claude-code-marketplace) | `claude plugin install claude-code-tracing@coding-harness-tracing` |
+| [OpenAI Codex CLI](tracing/codex/README.md) | `ax-trace add codex` |
+| [Cursor IDE / CLI](tracing/cursor/README.md) | `ax-trace add cursor` |
+| [GitHub Copilot (VS Code + CLI)](tracing/copilot/README.md) | `ax-trace add copilot` |
+| [Gemini CLI](tracing/gemini/README.md) | `ax-trace add gemini` |
+| [Kiro CLI](tracing/kiro/README.md) | `ax-trace add kiro` |
 
 Claude Code CLI and the Claude Agent SDK share the same plugin, hooks, and configuration — one install covers both.
 
 ## Install
-
-> Installing Claude Code tracing via the Claude marketplace? See [Claude Code Tracing](tracing/claude_code/README.md#claude-code-marketplace) for the marketplace-specific flow — backend credentials must be set directly in `~/.claude/settings.json` since the install wizard is skipped.
-
-### ax-trace (recommended)
 
 `ax-trace` is a single-binary CLI that installs and manages tracing for every supported harness. It bootstraps its own Python toolchain via [uv](https://github.com/astral-sh/uv), so no system Python is required.
 
 ```bash
 go install github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace@latest
 ```
-
-Alternative install paths:
-- **Claude Code marketplace plugin** — installs ax-trace automatically as part of the Claude Code tracing plugin. See [Claude Code Tracing](tracing/claude_code/README.md#claude-code-marketplace).
-- **curl / irm installer** (for scripts or environments without Go): `curl -sSL https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install-ax-trace.sh | bash` (Unix) or `irm https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install-ax-trace.ps1 | iex` (Windows).
 
 Then configure a harness:
 
@@ -44,99 +36,17 @@ ax-trace add codex --backend arize --space-id SPACE_ID --non-interactive
 # diagnostics, update, removal
 ax-trace doctor
 ax-trace update
-ax-trace uninstall
+ax-trace uninstall --claude    # uninstall a single harness
+ax-trace uninstall             # wipe all harnesses + the shared runtime
 ```
 
-`ARIZE_API_KEY` and `PHOENIX_API_KEY` are accepted as environment variables only — never as CLI flags. In interactive mode, ax-trace prompts for the key with masked input when it is not already set.
+`ARIZE_API_KEY` and `PHOENIX_API_KEY` are read from environment variables only — never CLI flags. In interactive mode, ax-trace prompts for the key with masked input when it is not already set.
 
-The `install.sh` / `install.bat` scripts below remain fully supported and produce identical state on disk to `ax-trace`.
-
-### Quickstart (install.sh / install.bat)
-
-Access and run the install script remotely to setup coding harness tracing in your local environment.
-
-**macOS / Linux:**
-
-```bash
-INSTALL_URL="https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh"
-
-# claude | codex | gemini | cursor | copilot | kiro
-HARNESS="claude"
-
-# setup tracing for a harness
-curl -sSL "$INSTALL_URL" | bash -s -- "$HARNESS"
-
-# remove tracing for a harness
-curl -sSL "$INSTALL_URL" | bash -s -- uninstall "$HARNESS"
-
-# remove tracing for all harnesses
-curl -sSL "$INSTALL_URL" | bash -s -- uninstall
-```
-
-**Windows:**
-
-```powershell
-$INSTALL_URL = "https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat"
-
-# claude | codex | gemini | cursor | copilot | kiro
-$HARNESS = "claude"
-
-iwr -useb $INSTALL_URL -OutFile $env:TEMP\install.bat
-
-# setup tracing for a harness
-& $env:TEMP\install.bat $HARNESS
-
-# remove tracing for a harness
-& $env:TEMP\install.bat uninstall $HARNESS
-
-# remove tracing for all harnesses
-& $env:TEMP\install.bat uninstall
-```
-
-### Local Copy
-
-Clone the repo and then run install on your own machine.
-
-```bash
-git clone https://github.com/Arize-ai/coding-harness-tracing.git
-cd coding-harness-tracing
-```
-
-**macOS / Linux**
-```bash
-# claude | codex | gemini | cursor | copilot | kiro
-HARNESS="claude"
-
-# setup tracing for a harness
-./install.sh "$HARNESS"
-
-# remove tracing for a harness
-./install.sh uninstall "$HARNESS"
-
-# remove tracing for all harnesses
-./install.sh uninstall
-```
-
-**Windows**
-```powershell
-# claude | codex | gemini | cursor | copilot | kiro
-$HARNESS = "claude"
-
-# setup tracing for a harness
-install.bat $HARNESS
-
-# remove tracing for a harness
-install.bat uninstall $HARNESS
-
-# remove tracing for all harnesses
-install.bat uninstall
-```
-
-Uninstall removes the harness configuration and cleans up runtime files. For Codex, the buffer service is stopped. You will be prompted before any user-owned config (credentials, state files) is deleted.
+**Claude Code via the Claude Plugin marketplace:** as an alternative for Claude Code users, you can install tracing through the marketplace plugin. The plugin registers hooks but skips the interactive wizard, so backend credentials must be set directly in `~/.claude/settings.json`. See [Claude Code Tracing](tracing/claude_code/README.md#claude-code-marketplace) for details.
 
 ### Setup walkthrough
 
-After running `install.sh` / `install.bat` for a harness, the installer drops you into an interactive setup. The steps below run in order:
+When you run `ax-trace add <harness>` interactively (no `--non-interactive` flag and stdin is a terminal), the wizard walks through the steps below in order. Any field you pass as a flag or set as an env var is skipped.
 
 #### 1. Harness detection
 
