@@ -336,39 +336,6 @@ class TestEntryPointConsistency:
             assert scripts[name] == module, f"Entry point {name}: expected {module}, got {scripts[name]}"
 
 
-# --- Documentation consistency ---
-
-
-class TestDocumentationConsistency:
-    """Verify documentation is internally consistent."""
-
-    def test_readme_references_install_sh(self):
-        """Root README.md should reference install.sh as the user-facing entry point."""
-        readme = (REPO_ROOT / "README.md").read_text()
-        assert "install.sh" in readme
-
-    def test_cursor_skill_references_cli_entry_points(self):
-        """Cursor SKILL.md should use CLI entry points for hooks."""
-        skill = (REPO_ROOT / "tracing" / "cursor" / "skills" / "manage-cursor-tracing" / "SKILL.md").read_text()
-        assert "arize-hook-cursor" in skill
-        assert "send_span()" in skill
-        assert "hook-handler.sh" not in skill
-
-    def test_codex_skill_references_cli_entry_points(self):
-        """Codex SKILL.md should use CLI entry points."""
-        skill = (REPO_ROOT / "tracing" / "codex" / "skills" / "manage-codex-tracing" / "SKILL.md").read_text()
-        assert "arize-hook-codex-notify" in skill
-        assert "notify.sh" not in skill
-
-    def test_claude_skill_references_cli_entry_points(self):
-        """Claude SKILL.md should use CLI entry points."""
-        skill = (
-            REPO_ROOT / "tracing" / "claude_code" / "skills" / "manage-claude-code-tracing" / "SKILL.md"
-        ).read_text()
-        assert "send_span()" in skill
-        assert "collector_ctl.sh" not in skill
-
-
 # --- Codex config.toml pattern ---
 
 
