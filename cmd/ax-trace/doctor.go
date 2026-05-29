@@ -14,14 +14,14 @@ func init() {
 		Use:   "doctor",
 		Short: "Run health checks against the install",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDoctor(cmd.Context())
+			return runDoctor(cmd.Context(), doctor.Options{})
 		},
 	}
 	rootCmd.AddCommand(cmd)
 }
 
-func runDoctor(ctx context.Context) error {
-	verdicts, err := doctor.Run(ctx, doctor.Options{})
+func runDoctor(ctx context.Context, opts doctor.Options) error {
+	verdicts, err := doctor.Run(ctx, opts)
 	if err != nil {
 		return err
 	}
