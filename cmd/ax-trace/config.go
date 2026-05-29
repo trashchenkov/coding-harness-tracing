@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -267,7 +268,7 @@ func saveConfig(path string, cfg map[string]any) error {
 
 // writeYAML emits a value as YAML to the writer, with a trailing newline.
 // Scalars are printed bare (no surrounding `key: ` wrapper).
-func writeYAML(w *os.File, val any) error {
+func writeYAML(w io.Writer, val any) error {
 	switch v := val.(type) {
 	case string:
 		fmt.Fprintln(w, v)

@@ -24,8 +24,10 @@ var (
 
 // AcquireLock takes a flock-style mutex on ~/.arize/ax-trace/bootstrap.lock.
 // Times out after 60 seconds with a clear "another ax-trace is bootstrapping"
-// message. The mutex is process-scoped — concurrent calls within one process
-// serialize via lockMu so callers cannot accidentally double-acquire.
+// message. lockMu only guards the lockHandle pointer and provides a
+// best-effort in-process re-entrancy check; mutual exclusion between
+// concurrent acquirers (in this or any other process) is enforced at the OS
+// flock level, not by lockMu.
 func AcquireLock(ctx context.Context) error {
 	if _, err := paths.EnsureAxTraceHome(); err != nil {
 		return fmt.Errorf("ensuring ax-trace home: %w", err)

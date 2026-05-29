@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace/internal/manifest"
 )
 
@@ -233,14 +235,14 @@ func CheckHarnessEnv(name string, entry manifest.HarnessEntry, opts Options) Ver
 	}
 }
 
-// configKeysPresent reads cfgPath as YAML and returns the subset of env keys
-// that appear as YAML mapping keys (case-sensitive). A missing file is not
-// an error — it returns an empty result.
+// configKeysPresent parses cfgPath as YAML and returns the subset of keys that
+// appear as mapping keys anywhere in the document (case-sensitive). A missing
+// file is not an error — it returns an empty result.
 //
-// To avoid a yaml dependency, we scan line by line for a key that, after
-// trimming leading whitespace, is followed by ":". This avoids substring
-// false positives like "MY_ARIZE_API_KEY" matching a search for
-// "ARIZE_API_KEY", while still tolerating arbitrary nesting depth.
+// Parsing (rather than line-scanning) means we match real mapping keys only:
+// a key appearing inside a string value or comment can never produce a false
+// positive, and exact-match lookup avoids substrings like "MY_ARIZE_API_KEY"
+// matching "ARIZE_API_KEY".
 func configKeysPresent(cfgPath string, keys []string) ([]string, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -249,19 +251,42 @@ func configKeysPresent(cfgPath string, keys []string) ([]string, error) {
 		}
 		return nil, err
 	}
-	lines := strings.Split(string(data), "\n")
+	var root any
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", cfgPath, err)
+	}
+	present := map[string]bool{}
+	collectMapKeys(root, present)
 	hits := []string{}
 	for _, key := range keys {
-		prefix := key + ":"
-		for _, line := range lines {
-			trimmed := strings.TrimLeft(line, " \t")
-			if strings.HasPrefix(trimmed, prefix) {
-				hits = append(hits, key)
-				break
-			}
+		if present[key] {
+			hits = append(hits, key)
 		}
 	}
 	return hits, nil
+}
+
+// collectMapKeys walks a yaml.Unmarshal'd value and records every mapping key
+// (string keys only) into seen, recursing through nested maps and sequences.
+func collectMapKeys(node any, seen map[string]bool) {
+	switch v := node.(type) {
+	case map[string]any:
+		for k, child := range v {
+			seen[k] = true
+			collectMapKeys(child, seen)
+		}
+	case map[any]any:
+		for k, child := range v {
+			if ks, ok := k.(string); ok {
+				seen[ks] = true
+			}
+			collectMapKeys(child, seen)
+		}
+	case []any:
+		for _, child := range v {
+			collectMapKeys(child, seen)
+		}
+	}
 }
 
 // CheckOTLPEndpoint probes the configured OTLP endpoint with a HEAD request.
