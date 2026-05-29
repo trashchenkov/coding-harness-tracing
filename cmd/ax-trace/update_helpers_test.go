@@ -200,7 +200,7 @@ func TestUninstallCommand_HasHarnessFlags(t *testing.T) {
 	if uninstallCmd == nil {
 		t.Fatal("uninstall command not registered")
 	}
-	want := []string{"claude", "codex", "copilot", "cursor", "gemini", "kiro"}
+	want := []string{"claude-code", "codex", "copilot", "cursor", "gemini", "kiro"}
 	for _, name := range want {
 		if uninstallCmd.Flag(name) == nil {
 			t.Errorf("uninstall command missing --%s flag", name)

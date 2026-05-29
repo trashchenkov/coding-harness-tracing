@@ -44,12 +44,15 @@ func init() {
 	addCmd := &cobra.Command{
 		Use:   "add <harness>",
 		Short: "Install and configure tracing for a harness",
-		Long:  "Install and configure tracing for a supported coding harness. Pass a harness name as the subcommand (claude, codex, copilot, cursor, gemini, kiro).",
+		Long:  "Install and configure tracing for a supported coding harness. Pass a harness name as the subcommand (claude-code, codex, copilot, cursor, gemini, kiro).",
 	}
 
 	for _, name := range harnessNames {
 		harnessName := name
-		userFacingName := strings.TrimSuffix(harnessName, "_code")
+		// User-facing subcommand uses the config.yaml alias (hyphenated),
+		// e.g. claude_code -> claude-code. The internal harnessName (the
+		// manifest/package key) stays underscored for dispatch below.
+		userFacingName := strings.ReplaceAll(harnessName, "_", "-")
 		f := &installFlags{}
 
 		cmd := &cobra.Command{

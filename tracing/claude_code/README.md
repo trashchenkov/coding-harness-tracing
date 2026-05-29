@@ -9,14 +9,14 @@ Pass `--with-skills` to also symlink the `manage-claude-code-tracing` skill into
 
 ### Quick install
 
-**Recommended:** `ax-trace add claude` (after installing ax-trace — see the [top-level README](../../README.md)).
+**Recommended:** `ax-trace add claude-code` (after installing ax-trace — see the [top-level README](../../README.md)).
 **Alternative:** `./install.sh claude` (from the repo root).
 
 Non-interactive install with ax-trace:
 
 ```bash
 export ARIZE_API_KEY=...   # required; secrets never become CLI flags
-ax-trace add claude \
+ax-trace add claude-code \
     --backend arize \
     --space-id SPACE_ID \
     --project-name my-project \

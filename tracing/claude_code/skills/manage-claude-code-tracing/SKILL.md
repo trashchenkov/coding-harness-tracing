@@ -26,10 +26,10 @@ Figure out which path the user needs — don't walk through every section:
 go install github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace@latest
 
 # configure Claude Code tracing (interactive)
-ax-trace add claude
+ax-trace add claude-code
 ```
 
-`ax-trace add claude` bootstraps the runtime, registers hooks in `~/.claude/settings.json`, and runs an interactive wizard. The wizard collects:
+`ax-trace add claude-code` bootstraps the runtime, registers hooks in `~/.claude/settings.json`, and runs an interactive wizard. The wizard collects:
 
 | Field | Notes |
 |-------|-------|
@@ -46,7 +46,7 @@ ax-trace add claude
 
 ```bash
 export ARIZE_API_KEY=...
-ax-trace add claude \
+ax-trace add claude-code \
   --backend arize --space-id SPACE_ID \
   --project-name my-project --non-interactive
 ```
@@ -122,9 +122,9 @@ Pure-Go health check — works even when the venv is broken. Reads `~/.arize/har
 
 | Verdict | Meaning / fix |
 |---------|---------------|
-| `✗ venv` | Runtime missing/broken → `ax-trace add claude` (or `ax-trace update`) to rebuild |
-| `✗ settings:claude_code` | `~/.claude/settings.json` missing or unparseable → re-run `ax-trace add claude`, or fix JSON |
-| `✗ env:claude_code` | No `ARIZE_*`/`PHOENIX_*` creds in env or config → `ax-trace config set harnesses.claude-code.api_key ...` (or set the env var for marketplace installs) |
+| `✗ venv` | Runtime missing/broken → `ax-trace add claude-code` (or `ax-trace update`) to rebuild |
+| `✗ settings:claude-code` | `~/.claude/settings.json` missing or unparseable → re-run `ax-trace add claude-code`, or fix JSON |
+| `✗ env:claude-code` | No `ARIZE_*`/`PHOENIX_*` creds in env or config → `ax-trace config set harnesses.claude-code.api_key ...` (or set the env var for marketplace installs) |
 | `✗ otlp_endpoint` | Endpoint unreachable (5xx/timeout) → check network/endpoint; retry |
 | all `✓` but no traces | Confirm `ARIZE_TRACE_ENABLED=true` and restart the session; see [Troubleshoot](#troubleshoot) |
 
@@ -132,7 +132,7 @@ Pure-Go health check — works even when the venv is broken. Reads `~/.arize/har
 
 For apps built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview). **Provide the snippets for the developer to add to their code — the agent can't wire this up at runtime** since plugin paths/settings must be set before the SDK session starts. The user must use `ClaudeSDKClient`; the standalone `query()` does not support hooks.
 
-1. Pick a backend and ensure `~/.arize/harness/config.yaml` has credentials (run `ax-trace add claude` once, or [Backends](#backends)).
+1. Pick a backend and ensure `~/.arize/harness/config.yaml` has credentials (run `ax-trace add claude-code` once, or [Backends](#backends)).
 2. Get the plugin path: installed via ax-trace/install.sh → `~/.arize/harness/tracing/claude_code`; via marketplace → check `~/.claude/plugins/installed_plugins.json`; not installed → `git clone https://github.com/Arize-ai/coding-harness-tracing.git` and use `./coding-harness-tracing/tracing/claude_code`.
 3. The SDK subprocess doesn't inherit shell env, so pass tracing env via a settings file:
 
@@ -188,7 +188,7 @@ Run `ax-trace doctor` first. Then:
 | Problem | Fix |
 |---------|-----|
 | Traces not appearing | `ARIZE_TRACE_ENABLED` must be `"true"` in `~/.claude/settings.json`; restart the session |
-| Config missing (ax-trace install) | `ax-trace add claude`, or `ax-trace config set harnesses.claude-code.api_key ...` |
+| Config missing (ax-trace install) | `ax-trace add claude-code`, or `ax-trace config set harnesses.claude-code.api_key ...` |
 | Config missing (marketplace install) | Set `ARIZE_*`/`PHOENIX_*` in `~/.claude/settings.json` `env` block — there is no config.yaml |
 | Phoenix unreachable | `curl -sf <endpoint>/v1/traces` |
 | No output in terminal | Hook stderr is discarded by Claude Code; read `~/.arize/harness/logs/claude-code.log` |

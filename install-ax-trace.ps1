@@ -68,4 +68,4 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[ax-trace] Run 'ax-trace claude' to get started"
+Write-Host "[ax-trace] Run 'ax-trace claude-code' to get started"

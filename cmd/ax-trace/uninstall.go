@@ -17,19 +17,19 @@ import (
 // set, only those harnesses are uninstalled and the shared runtime is left
 // in place.
 type uninstallSelections struct {
-	claude  bool
-	codex   bool
-	copilot bool
-	cursor  bool
-	gemini  bool
-	kiro    bool
+	claudeCode bool
+	codex      bool
+	copilot    bool
+	cursor     bool
+	gemini     bool
+	kiro       bool
 }
 
 // selected returns the harness keys (as they appear in config.yaml) that
 // the user opted into via --<harness> flags, in a deterministic order.
 func (s *uninstallSelections) selected() []string {
 	var keys []string
-	if s.claude {
+	if s.claudeCode {
 		keys = append(keys, "claude-code")
 	}
 	if s.codex {
@@ -71,7 +71,7 @@ and leaves the shared runtime in place.`,
 			return runUninstallSelected(cmd.Context(), keys)
 		},
 	}
-	cmd.Flags().BoolVar(&s.claude, "claude", false, "Uninstall Claude Code tracing")
+	cmd.Flags().BoolVar(&s.claudeCode, "claude-code", false, "Uninstall Claude Code tracing")
 	cmd.Flags().BoolVar(&s.codex, "codex", false, "Uninstall Codex CLI tracing")
 	cmd.Flags().BoolVar(&s.copilot, "copilot", false, "Uninstall GitHub Copilot tracing")
 	cmd.Flags().BoolVar(&s.cursor, "cursor", false, "Uninstall Cursor tracing")

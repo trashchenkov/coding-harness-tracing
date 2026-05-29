@@ -119,7 +119,7 @@ main() {
     binary="$(download_release "$version" "$platform")"
     install_binary "$binary"
     echo ""
-    echo "[ax-trace] Run 'ax-trace add claude' to get started"
+    echo "[ax-trace] Run 'ax-trace add claude-code' to get started"
 }
 
 main "$@"

@@ -22,7 +22,7 @@ func TestInstallCommandsRegistered(t *testing.T) {
 		t.Fatalf("expected `add` command registered on root, available: %v", strings.Join(commandNames(rootCmd), ","))
 	}
 
-	want := []string{"claude", "codex", "copilot", "cursor", "gemini", "kiro"}
+	want := []string{"claude-code", "codex", "copilot", "cursor", "gemini", "kiro"}
 	got := map[string]bool{}
 	for _, sub := range addCmd.Commands() {
 		got[sub.Use] = true

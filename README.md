@@ -6,7 +6,7 @@ Trace AI coding sessions to [Arize AX](https://arize.com) or [Phoenix](https://g
 
 | Harness | Install command |
 |---------|-----------------|
-| [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `ax-trace add claude` |
+| [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `ax-trace add claude-code` |
 | [Claude Code via Claude Plugin marketplace](tracing/claude_code/README.md#claude-code-marketplace) | `claude plugin install claude-code-tracing@coding-harness-tracing` |
 | [OpenAI Codex CLI](tracing/codex/README.md) | `ax-trace add codex` |
 | [Cursor IDE / CLI](tracing/cursor/README.md) | `ax-trace add cursor` |
@@ -28,7 +28,7 @@ Then configure a harness:
 
 ```bash
 # interactive — prompts for backend, credentials, project
-ax-trace add claude
+ax-trace add claude-code
 
 # scripted / CI — pass flags to skip prompts
 ax-trace add codex --backend arize --space-id SPACE_ID --non-interactive
@@ -36,7 +36,7 @@ ax-trace add codex --backend arize --space-id SPACE_ID --non-interactive
 # diagnostics, update, removal
 ax-trace doctor
 ax-trace update
-ax-trace uninstall --claude    # uninstall a single harness
+ax-trace uninstall --claude-code    # uninstall a single harness
 ax-trace uninstall             # wipe all harnesses + the shared runtime
 ```
 

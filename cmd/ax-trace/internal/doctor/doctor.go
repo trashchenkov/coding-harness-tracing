@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Arize-ai/coding-harness-tracing/cmd/ax-trace/internal/manifest"
@@ -49,8 +50,12 @@ func Run(ctx context.Context, opts Options) ([]Verdict, error) {
 	verdicts = append(verdicts, CheckVenv(opts))
 	for _, name := range m.HarnessNames() {
 		entry := m.Harnesses[name]
-		verdicts = append(verdicts, CheckHarnessSettings(name, entry, opts))
-		verdicts = append(verdicts, CheckHarnessEnv(name, entry, opts))
+		// Present the user-facing config.yaml alias (hyphenated, e.g.
+		// claude-code) in verdict labels rather than the manifest's package
+		// key (claude_code). name is display-only in these checks.
+		display := strings.ReplaceAll(name, "_", "-")
+		verdicts = append(verdicts, CheckHarnessSettings(display, entry, opts))
+		verdicts = append(verdicts, CheckHarnessEnv(display, entry, opts))
 	}
 	endpoint := opts.OTLPEndpoint
 	if endpoint == "" {
