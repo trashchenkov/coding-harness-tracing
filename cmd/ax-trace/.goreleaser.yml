@@ -35,9 +35,10 @@ archives:
       - goos: windows
         formats: [zip]
     formats: [tar.gz]
-    files:
-      - LICENSE
-      - README.md
+    # Binary-only archives: LICENSE/README live at the repo root, outside this
+    # subproject's build dir, and GoReleaser can't glob across `..`. The
+    # install script only extracts the binary; LICENSE ships in the repo.
+    files: []
 
 checksum:
   name_template: "checksums.txt"

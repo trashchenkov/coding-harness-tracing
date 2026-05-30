@@ -17,10 +17,19 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.22'
+      # Tags are namespaced (cmd/ax-trace/vX.Y.Z). GoReleaser OSS can't strip a
+      # tag prefix (monorepo support is Pro-only), so hand it the bare semver
+      # via GORELEASER_CURRENT_TAG.
+      - name: Resolve version from tag
+        run: echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME#cmd/ax-trace/}" >> "$GITHUB_ENV"
       - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           version: "~> v2" # pin to the v2 line (matches .goreleaser.yml version: 2)
-          args: release --clean
+          # --skip=validate: the version comes from GORELEASER_CURRENT_TAG, but
+          # validate would reject it because no git tag literally named
+          # "vX.Y.Z" exists on the commit (ours is the prefixed cmd/ax-trace/
+          # tag). Safe to skip on a clean CI checkout.
+          args: release --clean --skip=validate
           workdir: cmd/ax-trace
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
