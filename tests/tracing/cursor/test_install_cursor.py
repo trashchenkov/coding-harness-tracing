@@ -26,9 +26,12 @@ def fake_home(tmp_path, monkeypatch):
     """Redirect Path.home() to tmp_path so all file writes land in a temp dir.
 
     Also patches the module-level constants in install.py and core.setup that
-    derive from Path.home() so they point at the temp tree.
+    derive from Path.home() so they point at the temp tree. Cursor project-hook
+    paths are intentionally relative, so run each test from tmp_path to keep
+    install/uninstall helpers from touching the repository's real .cursor files.
     """
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.chdir(tmp_path)
 
     # Patch INSTALL_DIR / VENV_DIR / CONFIG_FILE in core.setup
     import core.setup as setup_mod
@@ -393,15 +396,24 @@ class TestCloudAgentInstall:
         setup_script = repo / ".cursor" / "hooks" / "arize-cursor-cloud-setup.sh"
         assert setup_script.is_file()
         assert setup_script.stat().st_mode & 0o111
-        assert "ARIZE_API_KEY" in setup_script.read_text()
+        setup_text = setup_script.read_text()
+        assert "ARIZE_API_KEY" in setup_text
+        assert "ensure_python_venv_support" in setup_text
+        assert "python3-venv" in setup_text
+        assert "remove_incomplete_harness_venv" in setup_text
         env_example = repo / ".cursor" / "hooks" / "arize-cloud-env.example"
         assert env_example.is_file()
-        assert "ARIZE_API_KEY=" in env_example.read_text()
+        env_example_text = env_example.read_text()
+        assert "ARIZE_API_KEY=" in env_example_text
+        assert "ARIZE_INSTALL_BRANCH=main" in env_example_text
+        assert "ARIZE_INSTALL_URL=" in env_example_text
 
         environment = json.loads((repo / ".cursor" / "environment.json").read_text())
         assert environment["install"] == cursor_install.CLOUD_SETUP_COMMAND
         assert "ARIZE_SPACE_ID" in environment["install"]
         assert "PHOENIX_ENDPOINT" in environment["install"]
+        assert "ARIZE_INSTALL_BRANCH" in environment["install"]
+        assert "ARIZE_INSTALL_URL" in environment["install"]
         assert not (fake_home / ".arize" / "harness" / "config.yaml").exists()
 
     def test_existing_environment_install_is_prefixed(self, fake_home, monkeypatch):
