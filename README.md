@@ -6,18 +6,16 @@ Trace AI coding sessions to [Arize AX](https://arize.com) or [Phoenix](https://g
 
 | Harness Integration | Install | Name |
 |---------------------|---------|------|
-| [Google Antigravity CLI/IDE](tracing/antigravity/README.md) | `install.sh` / `install.bat` | `antigravity` |
 | [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `install.sh` / `install.bat` | `claude` |
 | [Claude Code CLI / Agent SDK](tracing/claude_code/README.md) | `Claude Plugin (see below)`| `claude-code-tracing` |
 | [OpenAI Codex CLI](tracing/codex/README.md) | `install.sh` / `install.bat` | `codex` |
 | [Cursor IDE / CLI](tracing/cursor/README.md) | `install.sh` / `install.bat` | `cursor` |
 | [GitHub Copilot (VS Code + CLI)](tracing/copilot/README.md) | `install.sh` / `install.bat` | `copilot` |
+| [Antigravity IDE / CLI](tracing/antigravity/README.md) | `install.sh` / `install.bat` | `antigravity` |
 | [Gemini CLI](tracing/gemini/README.md) | `install.sh` / `install.bat` | `gemini` |
 | [Kiro CLI](tracing/kiro/README.md) | `install.sh` / `install.bat` | `kiro` |
 
 Claude Code CLI and the Claude Agent SDK share the same plugin, hooks, and configuration — one install covers both.
-
-Antigravity is transcript-driven (hooks are control-plane triggers; the per-turn transcript is the source of truth). Token counts are not captured — Antigravity does not expose per-turn token usage on any local surface, so `llm.token_count.*` attributes are intentionally absent on its spans.
 
 ## Install
 
@@ -32,7 +30,7 @@ Access and run the install script remotely to setup coding harness tracing in yo
 ```bash
 INSTALL_URL="https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.sh"
 
-# antigravity | claude | codex | gemini | cursor | copilot | kiro
+# claude | codex | antigravity | gemini | cursor | copilot | kiro
 HARNESS="claude"
 
 # setup tracing for a harness
@@ -50,7 +48,7 @@ curl -sSL "$INSTALL_URL" | bash -s -- uninstall
 ```powershell
 $INSTALL_URL = "https://raw.githubusercontent.com/Arize-ai/coding-harness-tracing/main/install.bat"
 
-# antigravity | claude | codex | gemini | cursor | copilot | kiro
+# claude | codex | antigravity | gemini | cursor | copilot | kiro
 $HARNESS = "claude"
 
 iwr -useb $INSTALL_URL -OutFile $env:TEMP\install.bat
@@ -76,7 +74,7 @@ cd coding-harness-tracing
 
 **macOS / Linux**
 ```bash
-# antigravity | claude | codex | gemini | cursor | copilot | kiro
+# claude | codex | antigravity | gemini | cursor | copilot | kiro
 HARNESS="claude"
 
 # setup tracing for a harness
@@ -91,7 +89,7 @@ HARNESS="claude"
 
 **Windows**
 ```powershell
-# antigravity | claude | codex | gemini | cursor | copilot | kiro
+# claude | codex | antigravity | gemini | cursor | copilot | kiro
 $HARNESS = "claude"
 
 # setup tracing for a harness
