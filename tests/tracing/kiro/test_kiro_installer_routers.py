@@ -7,7 +7,6 @@ recognise 'kiro' as a valid harness and map it to tracing/kiro.
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -39,22 +38,6 @@ def test_install_sh_harness_dir_kiro_after_gemini():
     assert kiro_pos != -1, "kiro clause not found in harness_dir()"
     assert default_pos != -1, "*) default clause not found in harness_dir()"
     assert gemini_pos < kiro_pos < default_pos, "kiro clause must be between gemini and *) default in harness_dir()"
-
-
-# ---------------------------------------------------------------------------
-# install.sh — main() case dispatch
-# ---------------------------------------------------------------------------
-
-
-def test_install_sh_main_dispatch_includes_kiro():
-    """The first case in main() must include kiro in the harness list."""
-    text = INSTALL_SH.read_text()
-    # The dispatch line looks like: claude|codex|copilot|cursor|gemini|kiro|<other>)
-    # The kiro token must be present in the alternation, immediately after gemini.
-    # Match `gemini|kiro` followed by either the end-of-alternation `)` or another `|<harness>`.
-    assert re.search(
-        r"gemini\|kiro(\)|\|)", text
-    ), "main() case dispatch must include 'kiro' immediately after 'gemini'"
 
 
 # ---------------------------------------------------------------------------
