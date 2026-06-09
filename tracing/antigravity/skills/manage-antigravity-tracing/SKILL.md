@@ -141,7 +141,7 @@ Install or reinstall via the installer:
 To uninstall:
 
 ```bash
-./install.sh antigravity uninstall
+./install.sh uninstall antigravity
 ```
 
 The installer registers a top-level `"arize-tracing"` block in `~/.gemini/config/hooks.json` with handlers for the `PreInvocation` and `Stop` events, each pointing at the absolute venv binary path (e.g., `~/.arize/harness/venv/bin/arize-hook-antigravity-stop`).
