@@ -13,6 +13,9 @@ on:
       - 'cmd/ax-trace/.goreleaser.yml'
       - '.github/workflows/test-ax-trace.yml'
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
