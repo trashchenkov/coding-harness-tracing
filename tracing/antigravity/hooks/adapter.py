@@ -95,8 +95,8 @@ def gc_stale_state_files() -> None:
 
             try:
                 f.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"Failed to remove stale state file {f}: {e}")
 
             lock_path = STATE_DIR / f".lock_{key}"
             if lock_path.is_dir():
