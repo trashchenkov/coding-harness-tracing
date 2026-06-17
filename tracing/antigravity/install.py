@@ -66,7 +66,7 @@ def _read_settings() -> dict:
         from core.setup import err as _err
 
         _err(f"Cannot read {path}: {exc}")
-        sys.exit(1)
+        raise SystemExit(1)
     if not text.strip():
         info("hooks.json is empty, treating as {}")
         return {}
@@ -76,7 +76,7 @@ def _read_settings() -> dict:
         from core.setup import err as _err
 
         _err(f"{path} contains invalid JSON; aborting. Please fix the file and retry.\n  {exc}")
-        sys.exit(1)
+        raise SystemExit(1)
 
 
 def _write_settings(data: dict) -> None:
