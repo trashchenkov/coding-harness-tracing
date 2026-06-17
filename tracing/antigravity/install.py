@@ -34,7 +34,7 @@ from core.setup import (
     write_config,
     write_logging_config,
 )
-import tracing.antigravity.constants as _c
+from tracing.antigravity import constants as _c
 
 # ---------------------------------------------------------------------------
 # JSON helpers
@@ -129,7 +129,7 @@ def _uninstall_hooks() -> None:
         return
 
     data = _read_settings()
-    data.pop(HOOK_NAME, None)
+    data.pop(_c.HOOK_NAME, None)
 
     if not data:
         path.unlink()
@@ -147,20 +147,20 @@ def install() -> None:
     ensure_shared_runtime()
 
     config = load_config()
-    existing_entry = get_value(config, f"harnesses.{HARNESS_NAME}")
+    existing_entry = get_value(config, f"harnesses.{_c.HARNESS_NAME}")
 
     if not existing_entry or not isinstance(existing_entry, dict) or "target" not in existing_entry:
         existing_harnesses = config.get("harnesses") if config else None
         target, credentials = prompt_backend(existing_harnesses)
-        project_name = prompt_project_name(HARNESS_NAME)
+        project_name = prompt_project_name(_c.HARNESS_NAME)
         user_id = prompt_user_id()
         if not dry_run():
-            write_config(target, credentials, HARNESS_NAME, project_name, user_id=user_id)
+            write_config(target, credentials, _c.HARNESS_NAME, project_name, user_id=user_id)
         else:
             info("would write config.yaml with backend credentials")
     else:
-        project_name = prompt_project_name(existing_entry.get("project_name") or HARNESS_NAME)
-        merge_harness_entry(HARNESS_NAME, project_name)
+        project_name = prompt_project_name(existing_entry.get("project_name") or _c.HARNESS_NAME)
+        merge_harness_entry(_c.HARNESS_NAME, project_name)
 
     # Logging settings are global. Prompt only if no `logging:` block exists yet.
     if (config.get("logging") if config else None) is None:
@@ -178,8 +178,8 @@ def uninstall() -> None:
     """Remove Antigravity tracing hooks and deregister from config.yaml."""
     _uninstall_hooks()
 
-    remove_harness_entry(HARNESS_NAME)
-    unlink_skills(HARNESS_NAME)
+    remove_harness_entry(_c.HARNESS_NAME)
+    unlink_skills(_c.HARNESS_NAME)
     info("Antigravity tracing uninstalled")
 
 
