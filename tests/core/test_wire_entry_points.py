@@ -68,6 +68,8 @@ EXPECTED_HARNESS_ENTRY_POINTS = {
     # Antigravity hooks
     "arize-hook-antigravity-pre-invocation": "tracing.antigravity.hooks.handlers:pre_invocation",
     "arize-hook-antigravity-stop": "tracing.antigravity.hooks.handlers:stop",
+    # opencode hook
+    "arize-hook-opencode": "tracing.opencode.hooks.handlers:main",
 }
 
 # Setup wizards stay on core.setup.*
@@ -78,6 +80,7 @@ EXPECTED_SETUP_ENTRY_POINTS = {
     "arize-setup-cursor": "core.setup.cursor:main",
     "arize-setup-gemini": "core.setup.gemini:main",
     "arize-setup-kiro": "core.setup.kiro:main",
+    "arize-setup-opencode": "core.setup.opencode:main",
 }
 
 
@@ -235,6 +238,7 @@ class TestHooksDirsInHarnessPackages:
             ("tracing/cursor", ["__init__.py", "adapter.py", "handlers.py"]),
             ("tracing/gemini", ["__init__.py", "adapter.py", "handlers.py"]),
             ("tracing/kiro", ["__init__.py", "adapter.py", "handlers.py"]),
+            ("tracing/opencode", ["__init__.py", "adapter.py", "handlers.py"]),
         ],
     )
     def test_hooks_dir_has_expected_files(self, pkg, expected_files):

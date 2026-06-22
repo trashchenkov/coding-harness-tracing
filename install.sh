@@ -204,6 +204,7 @@ harness_dir() {
         gemini)  echo "tracing/gemini" ;;
         kiro)    echo "tracing/kiro" ;;
         antigravity) echo "tracing/antigravity" ;;
+        opencode) echo "tracing/opencode" ;;
         *)       return 1 ;;
     esac
 }
@@ -242,6 +243,7 @@ Commands:
   gemini      Install and configure tracing for Gemini CLI
   kiro        Install and configure tracing for Kiro CLI
   antigravity Install and configure tracing for Google Antigravity CLI/IDE
+  opencode    Install and configure tracing for opencode
   update      Update the installed coding-harness-tracing and re-register all harnesses
   uninstall <harness>   Tear down one harness
   uninstall             Full wipe: venv + repo + shared config
@@ -272,7 +274,7 @@ main() {
     done
 
     case "$cmd" in
-        claude|codex|copilot|cursor|gemini|kiro|antigravity)
+        claude|codex|copilot|cursor|gemini|kiro|antigravity|opencode)
             install_harness "$cmd" "$with_skills"
             ;;
         uninstall)

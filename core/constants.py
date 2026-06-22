@@ -75,4 +75,11 @@ HARNESSES: dict[str, HarnessMetadata] = {
         "state_subdir": "antigravity",
         "default_log_file": LOG_DIR / "antigravity.log",
     },
+    "opencode": {
+        "service_name": "opencode",
+        "scope_name": "arize-opencode-plugin",
+        "default_project_name": "opencode",
+        "state_subdir": "opencode",
+        "default_log_file": LOG_DIR / "opencode.log",
+    },
 }
