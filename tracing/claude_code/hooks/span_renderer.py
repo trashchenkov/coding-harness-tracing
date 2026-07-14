@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -30,26 +31,41 @@ def render_event_graph(
 
     overrides = span_id_overrides or {}
     extras = extra_attributes or {}
-    span_ids = {event.event_id: overrides.get(event.event_id) or span_id_factory() for event in graph.events}
+    event_span_ids: list[str] = []
+    first_span_by_event_id: dict[str, str] = {}
+    used_span_ids: set[str] = set()
+    for event in graph.events:
+        span_id = overrides.get(event.event_id) if event.event_id not in first_span_by_event_id else None
+        span_id = span_id or span_id_factory()
+        attempts = 0
+        while span_id in used_span_ids:
+            span_id = span_id_factory() if attempts < 100 else generate_span_id()
+            attempts += 1
+        used_span_ids.add(span_id)
+        event_span_ids.append(span_id)
+        first_span_by_event_id.setdefault(event.event_id, span_id)
+    safe_parent_ids = _safe_parent_event_ids(graph.events)
     model_call_number = 0
     payloads: list[dict] = []
     graph_start = _first_timestamp(graph.events, "started_at_ms")
     graph_end = _last_timestamp(graph.events, "ended_at_ms") or graph_start
 
-    for event in graph.events:
+    for index, event in enumerate(graph.events):
         if isinstance(event, ModelCallEvent):
             model_call_number += 1
         name, kind, attrs = _span_fields(event, model_call_number)
         attrs.update(extras.get(event.event_id, {}))
-        parent_span_id = span_ids.get(event.parent_event_id or "", "")
-        start_ms = event.started_at_ms if event.started_at_ms is not None else graph_start
-        end_ms = event.ended_at_ms if event.ended_at_ms is not None else (start_ms or graph_end)
+        parent_span_id = first_span_by_event_id.get(safe_parent_ids[index] or "", "")
+        start_ms = _safe_timestamp(event.started_at_ms, graph_start)
+        end_ms = _safe_timestamp(event.ended_at_ms, start_ms or graph_end)
+        if end_ms < start_ms:
+            end_ms = start_ms
         status_code, status_message = _status(event)
         payloads.append(
             build_span(
                 name=name,
                 kind=kind,
-                span_id=span_ids[event.event_id],
+                span_id=event_span_ids[index],
                 trace_id=trace_id,
                 parent_span_id=parent_span_id,
                 start_ms=start_ms or 0,
@@ -98,9 +114,7 @@ def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, di
         if event.agent_id:
             attrs["subagent.id"] = event.agent_id
         if event.usage is not None:
-            prompt_tokens = (
-                event.usage.input_tokens + event.usage.cache_read_tokens + event.usage.cache_write_tokens
-            )
+            prompt_tokens = event.usage.input_tokens + event.usage.cache_read_tokens + event.usage.cache_write_tokens
             completion_tokens = event.usage.output_tokens
             attrs.update(
                 {
@@ -178,21 +192,73 @@ def _content_string(value: Any) -> str:
 
 
 def _status(event: BaseEvent) -> tuple[int, str]:
+    allowed = env.log_tool_content if isinstance(event, (AgentEvent, ToolEvent)) else env.log_prompts
+    message = redact_content(allowed, event.error) if event.error else ""
     if event.status is EventStatus.FAILED:
-        return 2, event.error or "Event failed"
+        return 2, message or "Event failed"
     if event.status in {EventStatus.PENDING, EventStatus.RUNNING, EventStatus.UNKNOWN}:
-        return 0, event.error or ""
-    return 1, event.error or ""
+        return 0, message
+    return 1, message
 
 
 def _first_timestamp(events: list[BaseEvent], attribute: str) -> int:
-    values = [value for event in events if (value := getattr(event, attribute)) is not None]
+    values = [value for event in events if (value := _valid_timestamp(getattr(event, attribute))) is not None]
     return min(values) if values else 0
 
 
 def _last_timestamp(events: list[BaseEvent], attribute: str) -> int:
-    values = [value for event in events if (value := getattr(event, attribute)) is not None]
+    values = [value for event in events if (value := _valid_timestamp(getattr(event, attribute))) is not None]
     return max(values) if values else 0
+
+
+def _valid_timestamp(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return int(value)
+
+
+def _safe_timestamp(value: Any, fallback: int) -> int:
+    valid = _valid_timestamp(value)
+    return valid if valid is not None else fallback
+
+
+def _safe_parent_event_ids(events: list[BaseEvent]) -> list[str | None]:
+    """Resolve parents first-wins and break one edge in every parent cycle."""
+
+    first_by_id: dict[str, BaseEvent] = {}
+    order: dict[str, int] = {}
+    for index, event in enumerate(events):
+        if event.event_id not in first_by_id:
+            first_by_id[event.event_id] = event
+            order[event.event_id] = index
+
+    parent_by_id = {
+        event_id: event.parent_event_id
+        for event_id, event in first_by_id.items()
+        if event.parent_event_id in first_by_id
+    }
+    break_ids: set[str] = set()
+    for start in first_by_id:
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current: str | None = start
+        while current in parent_by_id:
+            if current in positions:
+                cycle = path[positions[current] :]
+                break_ids.add(min(cycle, key=order.__getitem__))
+                break
+            positions[current] = len(path)
+            path.append(current)
+            current = parent_by_id[current]
+
+    return [
+        (
+            None
+            if event.event_id in break_ids and first_by_id[event.event_id] is event
+            else event.parent_event_id if event.parent_event_id in first_by_id else None
+        )
+        for event in events
+    ]
 
 
 __all__ = ["render_event_graph"]

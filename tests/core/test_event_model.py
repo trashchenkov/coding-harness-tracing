@@ -6,6 +6,7 @@ from core.event_model import (
     AgentEvent,
     EventGraph,
     EventStatus,
+    GraphDiagnostic,
     ModelCallEvent,
     ToolEvent,
     TurnEvent,
@@ -114,6 +115,24 @@ def test_graph_reports_duplicate_ids_without_dropping_events():
     assert graph.diagnostics == diagnostics
 
 
+def test_revalidation_preserves_equal_external_diagnostic_by_identity():
+    graph = EventGraph([_turn("duplicate"), _turn("duplicate", sequence=2)])
+    external = GraphDiagnostic(
+        code="duplicate_event_id",
+        message="event_id is used by more than one event",
+        event_id="duplicate",
+        related_event_id="duplicate",
+    )
+    graph.diagnostics.append(external)
+
+    graph.validate()
+    graph.validate()
+
+    matching = [item for item in graph.diagnostics if item == external]
+    assert len(matching) == 2
+    assert matching[0] is external
+
+
 def test_graph_reports_missing_parents():
     child = _turn("child", parent_event_id="absent")
 
@@ -123,6 +142,17 @@ def test_graph_reports_missing_parents():
         item.code == "missing_parent" and item.event_id == "child" and item.related_event_id == "absent"
         for item in diagnostics
     )
+
+
+def test_graph_reports_self_parent_and_multi_event_cycles():
+    self_parent = _turn("self", parent_event_id="self")
+    first = _turn("first", parent_event_id="second")
+    second = _turn("second", parent_event_id="first")
+
+    diagnostics = EventGraph([self_parent, first, second]).validate()
+
+    cyclic_ids = {item.event_id for item in diagnostics if item.code == "parent_cycle"}
+    assert cyclic_ids == {"self", "first", "second"}
 
 
 def test_graph_reports_tool_call_ids_reused_by_different_tools():
@@ -141,6 +171,33 @@ def test_graph_reports_tool_call_ids_reused_by_different_tools():
 
     assert any(
         item.code == "duplicate_tool_call_id" and item.event_id == "editor" and item.related_event_id == "shell"
+        for item in diagnostics
+    )
+
+
+def test_graph_reports_tool_call_id_reuse_for_same_tool_name():
+    common = {
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+        "tool_call_id": "call-shared",
+        "tool_name": "Read",
+        "started_at_ms": 100,
+        "ended_at_ms": 110,
+        "status": EventStatus.COMPLETED,
+    }
+    first = ToolEvent(event_id="first", sequence=1, parent_event_id="model-1", **common)
+    second = ToolEvent(event_id="second", sequence=2, parent_event_id="model-2", **common)
+
+    diagnostics = EventGraph([first, second]).validate()
+
+    assert any(item.code == "duplicate_tool_call_id" and item.event_id == "second" for item in diagnostics)
+
+
+def test_graph_reports_multiple_roots():
+    diagnostics = EventGraph([_turn("first"), _turn("second", sequence=2)]).validate()
+
+    assert any(
+        item.code == "multiple_roots" and item.event_id == "second" and item.related_event_id == "first"
         for item in diagnostics
     )
 

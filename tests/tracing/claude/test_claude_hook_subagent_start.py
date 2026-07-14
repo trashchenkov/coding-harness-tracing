@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Tests for SubagentStart handler and its interaction with SubagentStop."""
 
+import json
 from pathlib import Path
 from unittest import mock
-import json
-
-
-HOOKS_JSON = Path(__file__).parents[3] / "tracing" / "claude_code" / "hooks" / "hooks.json"
 
 import pytest
 
 from core.common import StateManager
 from tracing.claude_code.hooks.handlers import _handle_subagent_start, _handle_subagent_stop
+
+HOOKS_JSON = Path(__file__).parents[3] / "tracing" / "claude_code" / "hooks" / "hooks.json"
 
 # ---------------------------------------------------------------------------
 # Fixtures

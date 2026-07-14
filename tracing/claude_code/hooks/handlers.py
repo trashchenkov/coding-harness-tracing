@@ -4,7 +4,9 @@
 Replaces 9 bash scripts in tracing/claude_code/hooks/. Each function is a CLI
 entry point registered in pyproject.toml [project.scripts].
 """
+
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,8 +22,9 @@ from core.common import (
     redact_content,
     send_span,
 )
-from core.event_model import AgentEvent, EventStatus, ModelCallEvent, ToolEvent, TurnEvent
-from tracing.claude_code.hooks.adapter import (
+from core.event_model import AgentEvent, EventStatus, GraphDiagnostic, ModelCallEvent, ToolEvent, TurnEvent
+
+from .adapter import (
     SCOPE_NAME,
     SERVICE_NAME,
     check_requirements,
@@ -30,9 +33,9 @@ from tracing.claude_code.hooks.adapter import (
     resolve_session,
     resolve_transcript_path,
 )
-from tracing.claude_code.hooks.span_renderer import render_event_graph
-from tracing.claude_code.hooks.tool_buffer import ToolBuffer
-from tracing.claude_code.hooks.transcript import parse_claude_transcript
+from .span_renderer import render_event_graph
+from .tool_buffer import ToolBuffer, ToolObservation
+from .transcript import parse_claude_transcript
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -360,42 +363,22 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
     """Handle user_prompt_submit: set up a new trace (close orphaned turn first)."""
     state = resolve_session(input_json)
     ensure_session_initialized(state, input_json)
-    session_id = state.get("session_id")
 
-    # Fail-safe: close any orphaned Turn span
+    # Retry a retained turn before starting a new one.  A failed export keeps the
+    # old state intact so observations and stable span IDs can be retried later.
     prev_trace_id = state.get("current_trace_id")
-    prev_span_id = state.get("current_trace_span_id")
-    if prev_trace_id and prev_span_id:
-        prev_start = state.get("current_trace_start_time") or str(get_timestamp_ms())
-        prev_prompt = state.get("current_trace_prompt") or ""
-        prev_count = state.get("trace_count") or "?"
-        failsafe_attrs = {
-            "session.id": session_id,
-            "openinference.span.kind": "LLM",
-            "input.value": redact_content(env.log_prompts, prev_prompt),
-            "output.value": "(Turn closed by fail-safe: Stop hook did not fire)",
-        }
-        user_id = state.get("user_id") or ""
-        if user_id:
-            failsafe_attrs["user.id"] = user_id
-        failsafe_span = build_span(
-            f"Turn {prev_count}",
-            "LLM",
-            prev_span_id,
-            prev_trace_id,
-            "",
-            prev_start,
-            str(get_timestamp_ms()),
-            failsafe_attrs,
-            SERVICE_NAME,
-            SCOPE_NAME,
-        )
-        send_span(failsafe_span)
-        state.delete("current_trace_id")
-        state.delete("current_trace_span_id")
-        state.delete("current_trace_start_time")
-        state.delete("current_trace_prompt")
-        log(f"Fail-safe: closed orphaned Turn {prev_count}")
+    if prev_trace_id:
+        retry_input = dict(input_json)
+        retry_input.setdefault("last_assistant_message", "(Turn closed by fail-safe: Stop hook did not fire)")
+        _handle_stop(retry_input)
+        current_trace_id = state.get("current_trace_id")
+        if current_trace_id == prev_trace_id:
+            log("Fail-safe: retained orphaned turn after failed export")
+            return
+        if current_trace_id is not None:
+            log("Fail-safe: a concurrent newer turn owns the session state")
+            return
+        log("Fail-safe: exported and closed orphaned turn")
 
     # Set up new trace
     state.increment("trace_count")
@@ -524,15 +507,19 @@ def _has_stable_model_ids(graph) -> bool:
     return bool(models) and all(not event.event_id.startswith("assistant-line-") for event in models)
 
 
-def _merge_tool_observations(graph, observations) -> None:
-    """Overlay hook timing/results onto transcript-correlated tool events."""
+def _merge_tool_observations(graph, observations) -> list:
+    """Overlay each hook observation onto the first correlated tool event."""
     by_call_id = {observation.tool_use_id: observation for observation in observations}
+    matched = []
+    seen_call_ids: set[str] = set()
     for event in graph.events:
-        if not isinstance(event, ToolEvent) or not event.tool_call_id:
+        if not isinstance(event, ToolEvent) or not event.tool_call_id or event.tool_call_id in seen_call_ids:
             continue
+        seen_call_ids.add(event.tool_call_id)
         observation = by_call_id.get(event.tool_call_id)
         if observation is None:
             continue
+        matched.append(observation)
         if observation.tool_name:
             event.tool_name = observation.tool_name
         if observation.tool_input is not None:
@@ -545,20 +532,35 @@ def _merge_tool_observations(graph, observations) -> None:
                 }
             else:
                 event.output = observation.tool_response
-        if observation.started_at_ms is not None:
-            event.started_at_ms = observation.started_at_ms
-        if observation.ended_at_ms is not None:
-            event.ended_at_ms = observation.ended_at_ms
+        _overlay_timestamp(graph, event, "started_at_ms", observation.started_at_ms)
+        _overlay_timestamp(graph, event, "ended_at_ms", observation.ended_at_ms)
         if observation.status == "error":
             event.status = EventStatus.FAILED
             event.error = str(observation.error or observation.tool_response or "Tool call failed")
         elif observation.status == "success":
             event.status = EventStatus.COMPLETED
+    return matched
 
 
-def _pending_subagents(state) -> dict[str, dict]:
-    raw = state.get("pending_subagents") or ""
-    if not raw:
+def _overlay_timestamp(graph, event, attribute: str, value: object) -> None:
+    """Apply one persisted timestamp without letting corrupt state break export."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        graph.diagnostics.append(
+            GraphDiagnostic(
+                code="invalid_timestamp",
+                message=f"tool observation {attribute} is invalid",
+                event_id=event.event_id,
+                severity="warning",
+            )
+        )
+        return
+    setattr(event, attribute, int(value))
+
+
+def _decode_pending_subagents(raw: object) -> dict[str, dict]:
+    if not isinstance(raw, str) or not raw:
         return {}
     try:
         decoded = json.loads(raw)
@@ -567,6 +569,10 @@ def _pending_subagents(state) -> dict[str, dict]:
     if not isinstance(decoded, dict):
         return {}
     return {str(agent_id): descriptor for agent_id, descriptor in decoded.items() if isinstance(descriptor, dict)}
+
+
+def _pending_subagents(state) -> dict[str, dict]:
+    return _decode_pending_subagents(state.get("pending_subagents") or "")
 
 
 def _transcript_has_stable_assistant_uuid(path_value: object) -> bool:
@@ -605,17 +611,28 @@ def _buffer_subagent(state, input_json: dict, ended_at_ms: int) -> bool:
     except OSError:
         return False
 
-    descriptors = _pending_subagents(state)
-    stored_start = state.get(f"subagent_{agent_id}_start_time") or ""
-    descriptors[agent_id] = {
+    descriptor = {
         "agent_id": agent_id,
         "agent_type": input_json.get("agent_type") or "unknown",
         "transcript_path": transcript_path,
-        "started_at_ms": int(stored_start) if stored_start.isdigit() else None,
+        "started_at_ms": None,
         "ended_at_ms": ended_at_ms,
         "output": input_json.get("last_assistant_message") or "",
     }
-    state.set("pending_subagents", json.dumps(descriptors, sort_keys=True))
+    if state.state_file is None:
+        return False
+    try:
+        with state._lock():
+            data = state._read_safe()
+            descriptors = _decode_pending_subagents(data.get("pending_subagents", ""))
+            stored_start = str(data.get(f"subagent_{agent_id}_start_time", ""))
+            descriptor["started_at_ms"] = int(stored_start) if stored_start.isdigit() else None
+            descriptors[agent_id] = descriptor
+            data["pending_subagents"] = json.dumps(descriptors, sort_keys=True)
+            state._write(data)
+    except Exception as exc:
+        error(f"Failed to buffer subagent {agent_id}: {exc}")
+        return False
     return True
 
 
@@ -629,11 +646,11 @@ def _agent_id_from_tool(event: ToolEvent) -> str:
     return agent_id if isinstance(agent_id, str) else ""
 
 
-def _merge_pending_subagents(graph, state) -> None:
-    """Insert buffered foreground agent graphs beneath their invoking Agent tools."""
-    descriptors = _pending_subagents(state)
+def _merge_pending_subagents(graph, descriptors: dict[str, dict]) -> dict[str, dict]:
+    """Insert correlated foreground agent graphs and return exported descriptors."""
+    matched: dict[str, dict] = {}
     if not descriptors or not graph.events:
-        return
+        return matched
     root = graph.events[0]
     for agent_id, descriptor in descriptors.items():
         parent_tool = next(
@@ -644,7 +661,16 @@ def _merge_pending_subagents(graph, state) -> None:
             ),
             None,
         )
-        parent_event_id = parent_tool.event_id if parent_tool is not None else root.event_id
+        if parent_tool is None:
+            graph.diagnostics.append(
+                GraphDiagnostic(
+                    code="unmatched_subagent",
+                    message="Subagent descriptor had no correlated Agent tool",
+                    event_id=f"agent:{agent_id}",
+                )
+            )
+            continue
+        parent_event_id = parent_tool.event_id
         agent_type = str(descriptor.get("agent_type") or "unknown")
         agent_input = None
         if parent_tool is not None and isinstance(parent_tool.input, dict):
@@ -668,29 +694,88 @@ def _merge_pending_subagents(graph, state) -> None:
         insertion_index = graph.events.index(parent_tool) + 1 if parent_tool is not None else len(graph.events)
         graph.events[insertion_index:insertion_index] = subgraph.events
         graph.diagnostics.extend(subgraph.diagnostics)
-    graph.diagnostics.extend(graph.validate())
+        matched[agent_id] = descriptor
+    graph.validate()
+    return matched
 
 
-def _cleanup_pending_subagents(state) -> None:
-    for agent_id in _pending_subagents(state):
-        state.delete(f"subagent_{agent_id}_start_time")
-        state.delete(f"subagent_{agent_id}_prompt")
-    state.delete("pending_subagents")
+def _cleanup_pending_subagents(state, exported: dict[str, dict]) -> set[str]:
+    """Acknowledge only descriptors unchanged since the export snapshot."""
+    if state.state_file is None:
+        return set()
+    removed: set[str] = set()
+    try:
+        with state._lock():
+            data = state._read_safe()
+            current = _decode_pending_subagents(data.get("pending_subagents", ""))
+            for agent_id, descriptor in exported.items():
+                if current.get(agent_id) != descriptor:
+                    continue
+                current.pop(agent_id, None)
+                data.pop(f"subagent_{agent_id}_start_time", None)
+                data.pop(f"subagent_{agent_id}_prompt", None)
+                removed.add(agent_id)
+            if current:
+                data["pending_subagents"] = json.dumps(current, sort_keys=True)
+            else:
+                data.pop("pending_subagents", None)
+            state._write(data)
+    except Exception as exc:
+        error(f"Failed to clean up exported subagents: {exc}")
+    return removed
 
 
-def _cleanup_turn_state(state) -> None:
-    for key in (
-        "current_trace_id",
-        "current_trace_span_id",
-        "current_trace_start_time",
-        "current_trace_prompt",
-        "trace_start_line",
-        "pending_expansion_type",
-        "pending_command_name",
-        "pending_command_args",
-        "pending_command_source",
-    ):
-        state.delete(key)
+def _acknowledge_exported_turn(
+    state,
+    expected_trace_id: str,
+    observations: list[ToolObservation],
+    subagents: dict[str, dict],
+) -> bool:
+    """Atomically acknowledge one exported turn without touching a newer turn."""
+    if state.state_file is None:
+        return False
+    try:
+        with state._lock():
+            data = state._read_safe()
+            if data.get("current_trace_id") != expected_trace_id:
+                return False
+
+            current_observations = ToolBuffer._decode(data.get(ToolBuffer.STATE_KEY, ""))
+            for observation in observations:
+                if current_observations.get(observation.tool_use_id) == observation:
+                    current_observations.pop(observation.tool_use_id, None)
+            data[ToolBuffer.STATE_KEY] = ToolBuffer._encode(current_observations)
+
+            current_subagents = _decode_pending_subagents(data.get("pending_subagents", ""))
+            for agent_id, descriptor in subagents.items():
+                if current_subagents.get(agent_id) != descriptor:
+                    continue
+                current_subagents.pop(agent_id, None)
+                data.pop(f"subagent_{agent_id}_start_time", None)
+                data.pop(f"subagent_{agent_id}_prompt", None)
+            if current_subagents:
+                data["pending_subagents"] = json.dumps(current_subagents, sort_keys=True)
+            else:
+                data.pop("pending_subagents", None)
+
+            for key in (
+                "current_trace_id",
+                "current_trace_span_id",
+                "current_trace_start_time",
+                "current_trace_prompt",
+                "trace_start_line",
+                "pending_expansion_type",
+                "pending_command_name",
+                "pending_command_args",
+                "pending_command_source",
+                "high_fidelity_span_ids",
+            ):
+                data.pop(key, None)
+            state._write(data)
+        return True
+    except Exception as exc:
+        error(f"Failed to acknowledge exported turn: {exc}")
+        return False
 
 
 def _periodic_gc(trace_count: str) -> None:
@@ -755,10 +840,18 @@ def _handle_stop(input_json: dict) -> None:
         )
         if _has_stable_model_ids(graph):
             buffer = ToolBuffer(state)
-            _merge_tool_observations(graph, buffer.all())
-            _merge_pending_subagents(graph, state)
+            observations = buffer.all()
+            pending_subagents = _pending_subagents(state)
+            matched_observations = _merge_tool_observations(graph, observations)
+            matched_subagents = _merge_pending_subagents(graph, pending_subagents)
+            graph.validate()
             timestamp_candidates = [
-                event.ended_at_ms for event in graph.events if event.ended_at_ms is not None
+                int(event.ended_at_ms)
+                for event in graph.events
+                if isinstance(event.ended_at_ms, (int, float))
+                and not isinstance(event.ended_at_ms, bool)
+                and math.isfinite(event.ended_at_ms)
+                and event.ended_at_ms >= 0
             ]
             if timestamp_candidates:
                 root_event.ended_at_ms = max(root_event.ended_at_ms or 0, *timestamp_candidates)
@@ -809,12 +902,9 @@ def _handle_stop(input_json: dict) -> None:
                 span_id_overrides=span_id_overrides,
                 extra_attributes={root_event.event_id: root_attrs},
             )
-            if not send_span(payload):
+            if send_span(payload) is False:
                 return
-            buffer.clear()
-            state.delete("high_fidelity_span_ids")
-            _cleanup_pending_subagents(state)
-            _cleanup_turn_state(state)
+            _acknowledge_exported_turn(state, trace_id, matched_observations, matched_subagents)
             _periodic_gc(trace_count)
             return
 
@@ -863,26 +953,13 @@ def _handle_stop(input_json: dict) -> None:
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    if send_span(span) is False:
+        return
 
-    # Clean up state
-    state.delete("current_trace_id")
-    state.delete("current_trace_span_id")
-    state.delete("current_trace_start_time")
-    state.delete("current_trace_prompt")
-    state.delete("trace_start_line")
-    state.delete("pending_expansion_type")
-    state.delete("pending_command_name")
-    state.delete("pending_command_args")
-    state.delete("pending_command_source")
-
-    # Periodic GC
-    try:
-        tc = int(trace_count or "0")
-    except (ValueError, TypeError):
-        tc = 0
-    if tc % 5 == 0:
-        gc_stale_state_files()
+    # The legacy payload contains only the Turn span. Preserve unmatched durable
+    # observations/descriptors rather than acknowledging data that was not sent.
+    _acknowledge_exported_turn(state, trace_id, [], {})
+    _periodic_gc(trace_count)
 
 
 def _handle_subagent_start(input_json: dict) -> None:
@@ -1024,7 +1101,7 @@ def _handle_stop_failure(input_json: dict) -> None:
         "output.value": redacted_output,
         "llm.output_messages": json.dumps(output_messages),
         "error.type": error_type,
-        "error.message": error_details,
+        "error.message": redact_content(env.log_prompts, error_details),
     }
     if user_id:
         attrs["user.id"] = user_id
@@ -1041,17 +1118,12 @@ def _handle_stop_failure(input_json: dict) -> None:
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    if send_span(span) is False:
+        return
 
-    state.delete("current_trace_id")
-    state.delete("current_trace_span_id")
-    state.delete("current_trace_start_time")
-    state.delete("current_trace_prompt")
-    state.delete("trace_start_line")
-    state.delete("pending_expansion_type")
-    state.delete("pending_command_name")
-    state.delete("pending_command_args")
-    state.delete("pending_command_source")
+    # The failure payload contains only the Turn span; buffered child snapshots
+    # were not exported and must remain available for diagnosis/retry.
+    _acknowledge_exported_turn(state, trace_id, [], {})
 
 
 def _handle_notification(input_json: dict) -> None:

@@ -49,8 +49,7 @@ class ToolObservation:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ToolObservation":
         """Build an observation from persisted JSON data."""
-        tool_use_id = value.get("tool_use_id")
-        _validate_tool_use_id(tool_use_id)
+        tool_use_id = _validate_tool_use_id(value.get("tool_use_id"))
         status = value.get("status", "pending")
         if status not in _VALID_STATUSES:
             raise ValueError("invalid tool observation status")
@@ -70,9 +69,10 @@ class ToolObservation:
         )
 
 
-def _validate_tool_use_id(tool_use_id: Any) -> None:
+def _validate_tool_use_id(tool_use_id: Any) -> str:
     if not isinstance(tool_use_id, str) or not tool_use_id.strip():
         raise ValueError("tool_use_id must be a non-empty string")
+    return tool_use_id
 
 
 class ToolBuffer:
@@ -152,6 +152,22 @@ class ToolBuffer:
             existed = tool_use_id in items
             items.pop(tool_use_id, None)
             return existed, existed
+
+        return self._mutate(update)
+
+    def remove_many(self, observations: List[ToolObservation]) -> set[str]:
+        """Acknowledge only snapshot entries that have not changed since export."""
+        expected = {item.tool_use_id: item.to_dict() for item in observations}
+
+        def update(items: Dict[str, ToolObservation]) -> Tuple[set[str], bool]:
+            removed = {
+                tool_use_id
+                for tool_use_id, value in expected.items()
+                if tool_use_id in items and items[tool_use_id].to_dict() == value
+            }
+            for tool_use_id in removed:
+                items.pop(tool_use_id, None)
+            return removed, bool(removed)
 
         return self._mutate(update)
 

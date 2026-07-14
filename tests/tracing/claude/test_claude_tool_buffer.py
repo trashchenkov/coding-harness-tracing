@@ -161,6 +161,18 @@ def test_multiple_concurrent_tool_ids_remain_isolated(state):
         assert item.ended_at_ms == index + 100
 
 
+def test_remove_many_only_acknowledges_unchanged_snapshot(buffer):
+    buffer.record_start("updated", tool_name="Read", started_at_ms=1)
+    buffer.record_start("exported", tool_name="Read", started_at_ms=2)
+    snapshot = buffer.all()
+
+    buffer.record_result("updated", status="success", tool_response="new", ended_at_ms=3)
+    buffer.record_start("new", tool_name="Bash", started_at_ms=4)
+
+    assert buffer.remove_many(snapshot) == {"exported"}
+    assert {item.tool_use_id for item in buffer.all()} == {"updated", "new"}
+
+
 def test_remove_and_clear_update_the_single_persisted_namespace(buffer, state):
     buffer.record_start("tool-1", tool_name="Read", tool_input={}, started_at_ms=1)
     buffer.record_start("tool-2", tool_name="Write", tool_input={}, started_at_ms=2)

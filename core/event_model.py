@@ -149,10 +149,12 @@ class EventGraph:
 
     events: List[BaseEvent] = field(default_factory=list)
     diagnostics: List[GraphDiagnostic] = field(default_factory=list, init=False)
+    _validation_diagnostics: List[GraphDiagnostic] = field(default_factory=list, init=False, repr=False)
 
     def __init__(self, events: Iterable[BaseEvent] = ()) -> None:
         self.events = list(events)
         self.diagnostics = []
+        self._validation_diagnostics = []
 
     def validate(self) -> List[GraphDiagnostic]:
         diagnostics: List[GraphDiagnostic] = []
@@ -172,6 +174,33 @@ class EventGraph:
                 first_by_id[event.event_id] = event
 
         known_ids = set(first_by_id)
+        parent_by_id = {
+            event.event_id: event.parent_event_id
+            for event in first_by_id.values()
+            if event.parent_event_id in known_ids
+        }
+        cycle_ids = set()
+        for event_id in known_ids:
+            path: List[str] = []
+            positions: Dict[str, int] = {}
+            current: Optional[str] = event_id
+            while current in parent_by_id:
+                if current in positions:
+                    cycle_ids.update(path[positions[current] :])
+                    break
+                positions[current] = len(path)
+                path.append(current)
+                current = parent_by_id[current]
+        for event_id in sorted(cycle_ids):
+            diagnostics.append(
+                GraphDiagnostic(
+                    code="parent_cycle",
+                    message="parent_event_id relationships must not contain cycles",
+                    event_id=event_id,
+                    related_event_id=parent_by_id.get(event_id),
+                )
+            )
+
         first_tool_by_call_id: Dict[str, ToolEvent] = {}
         for event in self.events:
             if event.parent_event_id and event.parent_event_id not in known_ids:
@@ -197,17 +226,33 @@ class EventGraph:
                 first_tool = first_tool_by_call_id.get(event.tool_call_id)
                 if first_tool is None:
                     first_tool_by_call_id[event.tool_call_id] = event
-                elif first_tool.tool_name != event.tool_name:
+                elif first_tool is not event:
                     diagnostics.append(
                         GraphDiagnostic(
                             code="duplicate_tool_call_id",
-                            message="tool_call_id is assigned to different tools",
+                            message="tool_call_id is assigned to more than one tool event",
                             event_id=event.event_id,
                             related_event_id=first_tool.event_id,
                         )
                     )
 
-        self.diagnostics = diagnostics
+        root_events = [event for event in self.events if not event.parent_event_id]
+        if len(root_events) > 1:
+            first_root = root_events[0]
+            for event in root_events[1:]:
+                diagnostics.append(
+                    GraphDiagnostic(
+                        code="multiple_roots",
+                        message="graph contains more than one root event",
+                        event_id=event.event_id,
+                        related_event_id=first_root.event_id,
+                    )
+                )
+
+        previous_validation_ids = {id(item) for item in self._validation_diagnostics}
+        retained = [item for item in self.diagnostics if id(item) not in previous_validation_ids]
+        self._validation_diagnostics = diagnostics
+        self.diagnostics = retained + diagnostics
         return diagnostics
 
     def to_dict(self) -> Dict[str, Any]:

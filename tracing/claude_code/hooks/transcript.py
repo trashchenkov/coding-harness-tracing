@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -87,7 +88,7 @@ def parse_claude_transcript(
                 )
 
             timestamp_ms = _timestamp_ms(entry.get("timestamp"))
-            if entry.get("timestamp") and timestamp_ms is None:
+            if "timestamp" in entry and timestamp_ms is None:
                 parser_diagnostics.append(
                     GraphDiagnostic(
                         code="invalid_timestamp",
@@ -131,8 +132,10 @@ def parse_claude_transcript(
                         )
                     )
                     continue
+                duplicate = call_id in tools_by_call_id
+                tool_event_id = f"tool:{call_id}:duplicate:{sequence}" if duplicate else f"tool:{call_id}"
                 tool = ToolEvent(
-                    event_id=f"tool:{call_id}",
+                    event_id=tool_event_id,
                     parent_event_id=model_event.event_id,
                     session_id=model_event.session_id,
                     turn_id=root_event.turn_id,
@@ -148,7 +151,7 @@ def parse_claude_transcript(
                     tool_name=_string(block.get("name")) or None,
                 )
                 graph.events.append(tool)
-                tools_by_call_id[call_id] = tool
+                tools_by_call_id.setdefault(call_id, tool)
                 sequence += 1
 
         elif role == "user":
@@ -159,9 +162,9 @@ def parse_claude_transcript(
                 call_id = _string(block.get("tool_use_id"))
                 if not call_id:
                     continue
-                tool = tools_by_call_id.get(call_id)
-                if tool is None:
-                    tool = ToolEvent(
+                correlated_tool = tools_by_call_id.get(call_id)
+                if correlated_tool is None:
+                    correlated_tool = ToolEvent(
                         event_id=f"tool:{call_id}",
                         parent_event_id=root_event.event_id,
                         session_id=_string(entry.get("sessionId")) or root_event.session_id,
@@ -177,25 +180,34 @@ def parse_claude_transcript(
                         tool_call_id=call_id,
                         tool_name=None,
                     )
-                    graph.events.append(tool)
-                    tools_by_call_id[call_id] = tool
+                    graph.events.append(correlated_tool)
+                    tools_by_call_id[call_id] = correlated_tool
                     sequence += 1
                     parser_diagnostics.append(
                         GraphDiagnostic(
                             code="orphan_tool_result",
                             message=f"tool result {call_id!r} has no matching tool_use",
-                            event_id=tool.event_id,
+                            event_id=correlated_tool.event_id,
                             severity="warning",
                         )
                     )
 
                 failed = bool(block.get("is_error")) or _tool_result_failed(entry.get("toolUseResult"))
                 content = block.get("content")
-                tool.output = _tool_output(entry, content)
-                tool.ended_at_ms = result_timestamp_ms
-                tool.status = EventStatus.FAILED if failed else EventStatus.COMPLETED
+                correlated_tool.output = _tool_output(entry, content)
+                correlated_tool.ended_at_ms = result_timestamp_ms
+                correlated_tool.status = EventStatus.FAILED if failed else EventStatus.COMPLETED
+                if "timestamp" in entry and result_timestamp_ms is None:
+                    parser_diagnostics.append(
+                        GraphDiagnostic(
+                            code="invalid_timestamp",
+                            message=f"tool result on line {line_index + 1} has an invalid timestamp",
+                            event_id=correlated_tool.event_id,
+                            severity="warning",
+                        )
+                    )
                 if failed:
-                    tool.error = _content_text(content) or "Tool call failed"
+                    correlated_tool.error = _content_text(content) or "Tool call failed"
 
     validation_diagnostics = graph.validate()
     graph.diagnostics = parser_diagnostics + validation_diagnostics
@@ -268,14 +280,14 @@ def _optional_nonnegative_int(value: Any) -> int | None:
 
 def _timestamp_ms(value: Any) -> int | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return int(value)
+        return int(value) if math.isfinite(value) and value >= 0 else None
     if not isinstance(value, str) or not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        timestamp = int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+        return timestamp if timestamp >= 0 else None
+    except (OSError, OverflowError, ValueError):
         return None
-    return int(parsed.timestamp() * 1000)
 
 
 def _string(value: Any) -> str:

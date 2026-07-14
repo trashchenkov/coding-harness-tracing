@@ -1,22 +1,27 @@
 """High-fidelity Claude hook integration contract."""
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 from core.common import StateManager
-from core.event_model import EventStatus, TurnEvent
+from core.event_model import EventGraph, EventStatus, ToolEvent, TurnEvent
 from tracing.claude_code.hooks.handlers import (
+    _buffer_subagent,
+    _cleanup_pending_subagents,
     _handle_post_tool_use,
     _handle_post_tool_use_failure,
     _handle_pre_tool_use,
     _handle_stop,
     _handle_subagent_start,
     _handle_subagent_stop,
+    _merge_pending_subagents,
     _merge_tool_observations,
+    _pending_subagents,
 )
 from tracing.claude_code.hooks.tool_buffer import ToolBuffer, ToolObservation
 from tracing.claude_code.hooks.transcript import parse_claude_transcript
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "main_tool_cycle.jsonl"
 SUBAGENT_MAIN_FIXTURE = Path(__file__).parent / "fixtures" / "subagent_main.jsonl"
@@ -29,6 +34,35 @@ def _spans(payload):
 
 def _attrs(span):
     return {attribute["key"]: next(iter(attribute["value"].values())) for attribute in span["attributes"]}
+
+
+def test_malformed_persisted_tool_timestamp_fails_soft_with_diagnostic():
+    root = TurnEvent(
+        event_id="turn",
+        session_id="session",
+        turn_id="1",
+        sequence=0,
+        started_at_ms=1,
+        ended_at_ms=2,
+        status=EventStatus.COMPLETED,
+    )
+    tool = ToolEvent(
+        event_id="tool:call",
+        parent_event_id="turn",
+        session_id="session",
+        turn_id="1",
+        sequence=1,
+        started_at_ms=1,
+        ended_at_ms=None,
+        status=EventStatus.PENDING,
+        tool_call_id="call",
+    )
+    graph = EventGraph([root, tool])
+    observation = ToolObservation.from_dict({"tool_use_id": "call", "ended_at_ms": "not-a-time", "status": "success"})
+
+    assert _merge_tool_observations(graph, [observation]) == [observation]
+    assert tool.ended_at_ms is None
+    assert any(item.code == "invalid_timestamp" and item.event_id == tool.event_id for item in graph.diagnostics)
 
 
 def test_hook_output_overlay_preserves_transcript_agent_correlation():
@@ -58,6 +92,118 @@ def test_hook_output_overlay_preserves_transcript_agent_correlation():
     assert agent_tool.output["toolUseResult"]["agentId"] == "agent-1"
 
 
+def test_hook_overlay_is_first_wins_for_duplicate_tool_call_ids():
+    tools = [
+        ToolEvent(
+            event_id=f"tool-{index}",
+            parent_event_id=f"model-{index}",
+            session_id="session",
+            turn_id="1",
+            sequence=index,
+            started_at_ms=None,
+            ended_at_ms=None,
+            status=EventStatus.PENDING,
+            tool_call_id="duplicate",
+            tool_name="Read",
+        )
+        for index in (1, 2)
+    ]
+    observation = ToolObservation(tool_use_id="duplicate", tool_response="hook-result", status="success")
+
+    matched = _merge_tool_observations(EventGraph(tools), [observation])
+
+    assert matched == [observation]
+    assert tools[0].status is EventStatus.COMPLETED
+    assert tools[0].output == "hook-result"
+    assert tools[1].status is EventStatus.PENDING
+    assert tools[1].output is None
+
+
+def test_unmatched_snapshots_are_not_acknowledged(tmp_path: Path):
+    state = StateManager(tmp_path, state_file=tmp_path / "state.json", lock_path=tmp_path / "state.lock")
+    state.init_state()
+    descriptor = {
+        "agent_id": "unmatched",
+        "agent_type": "general-purpose",
+        "transcript_path": str(SUBAGENT_AGENT_FIXTURE),
+    }
+    state.set("pending_subagents", json.dumps({"unmatched": descriptor}))
+    root = TurnEvent(
+        event_id="turn",
+        session_id="session",
+        turn_id="1",
+        sequence=0,
+        started_at_ms=None,
+        ended_at_ms=None,
+        status=EventStatus.COMPLETED,
+    )
+
+    matched = _merge_pending_subagents(EventGraph([root]), _pending_subagents(state))
+    _cleanup_pending_subagents(state, matched)
+
+    assert matched == {}
+    assert "unmatched" in _pending_subagents(state)
+
+
+def test_parallel_subagent_buffering_is_atomic(tmp_path: Path):
+    state = StateManager(tmp_path, state_file=tmp_path / "state.json", lock_path=tmp_path / "state.lock")
+    state.init_state()
+    count = 24
+    for index in range(count):
+        state.set(f"subagent_agent-{index}_start_time", str(index))
+
+    def add(index: int) -> None:
+        _buffer_subagent(
+            state,
+            {
+                "agent_id": f"agent-{index}",
+                "agent_type": "general-purpose",
+                "transcript_path": str(SUBAGENT_MAIN_FIXTURE),
+                "agent_transcript_path": str(SUBAGENT_AGENT_FIXTURE),
+            },
+            ended_at_ms=100 + index,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(add, range(count)))
+
+    assert set(_pending_subagents(state)) == {f"agent-{index}" for index in range(count)}
+
+
+def test_pending_subagent_cleanup_only_acknowledges_unchanged_snapshot(tmp_path: Path):
+    state = StateManager(tmp_path, state_file=tmp_path / "state.json", lock_path=tmp_path / "state.lock")
+    state.init_state()
+    state.set("subagent_old_start_time", "1")
+    _buffer_subagent(
+        state,
+        {
+            "agent_id": "old",
+            "agent_type": "general-purpose",
+            "transcript_path": str(SUBAGENT_MAIN_FIXTURE),
+            "agent_transcript_path": str(SUBAGENT_AGENT_FIXTURE),
+        },
+        ended_at_ms=10,
+    )
+    snapshot = _pending_subagents(state)
+
+    state.set("subagent_new_start_time", "2")
+    _buffer_subagent(
+        state,
+        {
+            "agent_id": "new",
+            "agent_type": "general-purpose",
+            "transcript_path": str(SUBAGENT_MAIN_FIXTURE),
+            "agent_transcript_path": str(SUBAGENT_AGENT_FIXTURE),
+        },
+        ended_at_ms=20,
+    )
+
+    _cleanup_pending_subagents(state, snapshot)
+
+    assert list(_pending_subagents(state)) == ["new"]
+    assert state.get("subagent_new_start_time") == "2"
+
+
 def test_real_v2_transcript_is_exported_once_as_correlated_tree(tmp_path: Path):
     state_file = tmp_path / "state.json"
     state = StateManager(tmp_path, state_file=state_file, lock_path=tmp_path / "state.lock")
@@ -80,7 +226,10 @@ def test_real_v2_transcript_is_exported_once_as_correlated_tree(tmp_path: Path):
     with (
         mock.patch("tracing.claude_code.hooks.handlers.resolve_session", return_value=state),
         mock.patch("tracing.claude_code.hooks.handlers.resolve_transcript_path", return_value=FIXTURE),
-        mock.patch("tracing.claude_code.hooks.handlers.get_timestamp_ms", side_effect=[1767268801000, 1767268802000, 1767268803000, 1767268804000, 1767268805000]),
+        mock.patch(
+            "tracing.claude_code.hooks.handlers.get_timestamp_ms",
+            side_effect=[1767268801000, 1767268802000, 1767268803000, 1767268804000, 1767268805000],
+        ),
         mock.patch("tracing.claude_code.hooks.handlers.send_span", side_effect=send_success),
     ):
         _handle_pre_tool_use(
@@ -206,9 +355,7 @@ def test_failed_export_retains_buffer_and_reuses_span_ids_on_retry(tmp_path: Pat
         _handle_stop({**common_input, "last_assistant_message": "SYNTHETIC_TOOL_OK"})
 
     assert len(attempts) == 2
-    assert [span["spanId"] for span in _spans(attempts[0])] == [
-        span["spanId"] for span in _spans(attempts[1])
-    ]
+    assert [span["spanId"] for span in _spans(attempts[0])] == [span["spanId"] for span in _spans(attempts[1])]
     assert ToolBuffer(state).all() == []
     assert state.get("current_trace_id") is None
     assert state.get("high_fidelity_span_ids") is None

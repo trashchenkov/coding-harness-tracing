@@ -6,7 +6,6 @@ from core.event_model import AgentEvent, EventGraph, EventStatus, ModelCallEvent
 from tracing.claude_code.hooks.span_renderer import render_event_graph
 from tracing.claude_code.hooks.transcript import parse_claude_transcript
 
-
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 TRACE_ID = "a" * 32
 SPAN_IDS = [f"{index:016x}" for index in range(1, 20)]
@@ -152,6 +151,76 @@ def test_renders_agent_as_agent_parent_for_its_model_and_tool():
     assert spans[2]["parentSpanId"] == spans[1]["spanId"]
 
 
+def test_duplicate_event_ids_receive_distinct_span_ids():
+    first = TurnEvent(
+        event_id="duplicate",
+        session_id="session",
+        turn_id="1",
+        sequence=0,
+        started_at_ms=100,
+        ended_at_ms=200,
+        status=EventStatus.COMPLETED,
+    )
+    second = TurnEvent(
+        event_id="duplicate",
+        session_id="session",
+        turn_id="1",
+        sequence=1,
+        started_at_ms=100,
+        ended_at_ms=200,
+        status=EventStatus.COMPLETED,
+    )
+
+    spans = _spans(render_event_graph(EventGraph([first, second]), trace_id=TRACE_ID, span_id_factory=_factory()))
+
+    assert spans[0]["spanId"] != spans[1]["spanId"]
+
+
+def test_renderer_normalizes_negative_timestamps():
+    event = TurnEvent(
+        event_id="negative",
+        session_id="session",
+        turn_id="1",
+        sequence=0,
+        started_at_ms=-2,
+        ended_at_ms=-1,
+        status=EventStatus.COMPLETED,
+    )
+
+    span = _spans(render_event_graph(EventGraph([event]), trace_id=TRACE_ID, span_id_factory=_factory()))[0]
+
+    assert int(span["startTimeUnixNano"]) >= 0
+    assert int(span["endTimeUnixNano"]) >= int(span["startTimeUnixNano"])
+
+
+def test_renderer_breaks_parent_cycles_into_a_valid_tree():
+    first = TurnEvent(
+        event_id="first",
+        parent_event_id="second",
+        session_id="session",
+        turn_id="1",
+        sequence=0,
+        started_at_ms=100,
+        ended_at_ms=200,
+        status=EventStatus.COMPLETED,
+    )
+    second = TurnEvent(
+        event_id="second",
+        parent_event_id="first",
+        session_id="session",
+        turn_id="1",
+        sequence=1,
+        started_at_ms=100,
+        ended_at_ms=200,
+        status=EventStatus.COMPLETED,
+    )
+
+    spans = _spans(render_event_graph(EventGraph([first, second]), trace_id=TRACE_ID, span_id_factory=_factory()))
+
+    assert "parentSpanId" not in spans[0]
+    assert spans[1]["parentSpanId"] == spans[0]["spanId"]
+
+
 def test_capture_flags_redact_root_model_and_tool_content(monkeypatch):
     monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
     monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
@@ -191,9 +260,26 @@ def test_capture_flags_redact_agent_and_tool_errors(monkeypatch):
     tool.error = "SECRET_TOOL_ERROR"
 
     spans = _spans(render_event_graph(graph, trace_id=TRACE_ID, span_id_factory=_factory()))
-    serialized_values = "\n".join(str(value) for span in spans for value in _attrs(span).values())
+    serialized_values = str(spans)
 
     assert "SECRET_AGENT_PROMPT" not in serialized_values
     assert "SECRET_AGENT_OUTPUT" not in serialized_values
     assert "SECRET_TOOL_ERROR" not in serialized_values
     assert "<redacted (" in serialized_values
+
+
+def test_duplicate_override_span_ids_are_replaced():
+    graph = _main_graph()
+    collision = "b" * 16
+    overrides = {graph.events[0].event_id: collision, graph.events[1].event_id: collision}
+
+    spans = _spans(
+        render_event_graph(
+            graph,
+            trace_id=TRACE_ID,
+            span_id_overrides=overrides,
+            span_id_factory=_factory(),
+        )
+    )
+
+    assert len({span["spanId"] for span in spans}) == len(spans)
