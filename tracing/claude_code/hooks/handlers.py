@@ -20,6 +20,7 @@ from core.common import (
     redact_content,
     send_span,
 )
+from core.event_model import AgentEvent, EventStatus, ModelCallEvent, ToolEvent, TurnEvent
 from tracing.claude_code.hooks.adapter import (
     SCOPE_NAME,
     SERVICE_NAME,
@@ -29,6 +30,9 @@ from tracing.claude_code.hooks.adapter import (
     resolve_session,
     resolve_transcript_path,
 )
+from tracing.claude_code.hooks.span_renderer import render_event_graph
+from tracing.claude_code.hooks.tool_buffer import ToolBuffer
+from tracing.claude_code.hooks.transcript import parse_claude_transcript
 
 # ---------------------------------------------------------------------------
 # Shared helper
@@ -49,6 +53,17 @@ def _read_stdin() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _has_live_transcript(input_json: dict) -> bool:
+    """Return whether this hook can participate in transcript correlation."""
+    transcript_path = input_json.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return False
+    try:
+        return Path(transcript_path).is_file()
+    except OSError:
+        return False
+
+
 def _handle_session_start(input_json: dict) -> None:
     """Handle session_start: initialize session."""
     state = resolve_session(input_json)
@@ -57,17 +72,48 @@ def _handle_session_start(input_json: dict) -> None:
 
 
 def _handle_pre_tool_use(input_json: dict) -> None:
-    """Handle pre_tool_use: record tool start time."""
+    """Handle pre_tool_use: durably record the tool start observation."""
     state = resolve_session(input_json)
     tool_id = input_json.get("tool_use_id") or generate_trace_id()
-    state.set(f"tool_{tool_id}_start", str(get_timestamp_ms()))
+    started_at_ms = get_timestamp_ms()
+    state.set(f"tool_{tool_id}_start", str(started_at_ms))
+    if _has_live_transcript(input_json):
+        ToolBuffer(state).record_start(
+            tool_id,
+            tool_name=input_json.get("tool_name"),
+            tool_input=input_json.get("tool_input"),
+            started_at_ms=started_at_ms,
+            hook_event_metadata={"hook_event_name": input_json.get("hook_event_name", "PreToolUse")},
+        )
 
 
 def _handle_post_tool_use(input_json: dict) -> None:
-    """Handle post_tool_use: build and send a TOOL span."""
+    """Handle post_tool_use: buffer for correlation or use the legacy immediate fallback."""
     state = resolve_session(input_json)
     session_id = state.get("session_id")
     if session_id is None:
+        return
+
+    if _has_live_transcript(input_json):
+        tool_id = input_json.get("tool_use_id") or generate_trace_id()
+        state.increment("tool_count")
+        buffer = ToolBuffer(state)
+        if buffer.get(tool_id) is None:
+            stored_start = state.get(f"tool_{tool_id}_start")
+            buffer.record_start(
+                tool_id,
+                tool_name=input_json.get("tool_name"),
+                tool_input=input_json.get("tool_input"),
+                started_at_ms=int(stored_start) if stored_start and stored_start.isdigit() else None,
+            )
+        buffer.record_result(
+            tool_id,
+            status="success",
+            tool_response=input_json.get("tool_response"),
+            ended_at_ms=get_timestamp_ms(),
+            hook_event_metadata={"hook_event_name": input_json.get("hook_event_name", "PostToolUse")},
+        )
+        state.delete(f"tool_{tool_id}_start")
         return
 
     trace_id = state.get("current_trace_id")
@@ -164,10 +210,34 @@ def _handle_post_tool_use(input_json: dict) -> None:
 
 
 def _handle_post_tool_use_failure(input_json: dict) -> None:
-    """Handle post_tool_use_failure: build and send a TOOL span with error attributes."""
+    """Handle failure: buffer for correlation or use the legacy immediate fallback."""
     state = resolve_session(input_json)
     session_id = state.get("session_id")
     if session_id is None:
+        return
+
+    if _has_live_transcript(input_json):
+        tool_id = input_json.get("tool_use_id") or generate_trace_id()
+        state.increment("tool_count")
+        buffer = ToolBuffer(state)
+        if buffer.get(tool_id) is None:
+            stored_start = state.get(f"tool_{tool_id}_start")
+            buffer.record_start(
+                tool_id,
+                tool_name=input_json.get("tool_name"),
+                tool_input=input_json.get("tool_input"),
+                started_at_ms=int(stored_start) if stored_start and stored_start.isdigit() else None,
+            )
+        error_text = input_json.get("error", "")
+        buffer.record_result(
+            tool_id,
+            status="error",
+            tool_response=input_json.get("tool_response"),
+            error=error_text,
+            ended_at_ms=get_timestamp_ms(),
+            hook_event_metadata={"hook_event_name": input_json.get("hook_event_name", "PostToolUseFailure")},
+        )
+        state.delete(f"tool_{tool_id}_start")
         return
 
     trace_id = state.get("current_trace_id")
@@ -448,6 +518,190 @@ def _scan_transcript_for_usage(
     return output, usage_totals, model
 
 
+def _has_stable_model_ids(graph) -> bool:
+    """Gate high-fidelity rendering on Claude v2 assistant UUIDs."""
+    models = [event for event in graph.events if isinstance(event, ModelCallEvent)]
+    return bool(models) and all(not event.event_id.startswith("assistant-line-") for event in models)
+
+
+def _merge_tool_observations(graph, observations) -> None:
+    """Overlay hook timing/results onto transcript-correlated tool events."""
+    by_call_id = {observation.tool_use_id: observation for observation in observations}
+    for event in graph.events:
+        if not isinstance(event, ToolEvent) or not event.tool_call_id:
+            continue
+        observation = by_call_id.get(event.tool_call_id)
+        if observation is None:
+            continue
+        if observation.tool_name:
+            event.tool_name = observation.tool_name
+        if observation.tool_input is not None:
+            event.input = observation.tool_input
+        if observation.tool_response is not None:
+            if isinstance(event.output, dict) and isinstance(event.output.get("toolUseResult"), dict):
+                event.output = {
+                    "content": observation.tool_response,
+                    "toolUseResult": event.output["toolUseResult"],
+                }
+            else:
+                event.output = observation.tool_response
+        if observation.started_at_ms is not None:
+            event.started_at_ms = observation.started_at_ms
+        if observation.ended_at_ms is not None:
+            event.ended_at_ms = observation.ended_at_ms
+        if observation.status == "error":
+            event.status = EventStatus.FAILED
+            event.error = str(observation.error or observation.tool_response or "Tool call failed")
+        elif observation.status == "success":
+            event.status = EventStatus.COMPLETED
+
+
+def _pending_subagents(state) -> dict[str, dict]:
+    raw = state.get("pending_subagents") or ""
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {str(agent_id): descriptor for agent_id, descriptor in decoded.items() if isinstance(descriptor, dict)}
+
+
+def _transcript_has_stable_assistant_uuid(path_value: object) -> bool:
+    if not isinstance(path_value, str) or not path_value:
+        return False
+    try:
+        path = Path(path_value)
+        if not path.is_file():
+            return False
+        with path.open(encoding="utf-8") as handle:
+            for raw_line in handle:
+                try:
+                    record = json.loads(raw_line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if record.get("type") == "assistant" and isinstance(record.get("uuid"), str) and record["uuid"]:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _buffer_subagent(state, input_json: dict, ended_at_ms: int) -> bool:
+    agent_id = input_json.get("agent_id")
+    transcript_path = input_json.get("agent_transcript_path")
+    main_transcript_path = input_json.get("transcript_path")
+    if main_transcript_path == transcript_path or not _transcript_has_stable_assistant_uuid(main_transcript_path):
+        return False
+    if not isinstance(agent_id, str) or not agent_id:
+        return False
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return False
+    try:
+        if not Path(transcript_path).is_file():
+            return False
+    except OSError:
+        return False
+
+    descriptors = _pending_subagents(state)
+    stored_start = state.get(f"subagent_{agent_id}_start_time") or ""
+    descriptors[agent_id] = {
+        "agent_id": agent_id,
+        "agent_type": input_json.get("agent_type") or "unknown",
+        "transcript_path": transcript_path,
+        "started_at_ms": int(stored_start) if stored_start.isdigit() else None,
+        "ended_at_ms": ended_at_ms,
+        "output": input_json.get("last_assistant_message") or "",
+    }
+    state.set("pending_subagents", json.dumps(descriptors, sort_keys=True))
+    return True
+
+
+def _agent_id_from_tool(event: ToolEvent) -> str:
+    if not isinstance(event.output, dict):
+        return ""
+    result = event.output.get("toolUseResult")
+    if not isinstance(result, dict):
+        return ""
+    agent_id = result.get("agentId")
+    return agent_id if isinstance(agent_id, str) else ""
+
+
+def _merge_pending_subagents(graph, state) -> None:
+    """Insert buffered foreground agent graphs beneath their invoking Agent tools."""
+    descriptors = _pending_subagents(state)
+    if not descriptors or not graph.events:
+        return
+    root = graph.events[0]
+    for agent_id, descriptor in descriptors.items():
+        parent_tool = next(
+            (
+                event
+                for event in graph.events
+                if isinstance(event, ToolEvent) and _agent_id_from_tool(event) == agent_id
+            ),
+            None,
+        )
+        parent_event_id = parent_tool.event_id if parent_tool is not None else root.event_id
+        agent_type = str(descriptor.get("agent_type") or "unknown")
+        agent_input = None
+        if parent_tool is not None and isinstance(parent_tool.input, dict):
+            agent_input = parent_tool.input.get("prompt")
+        agent_event = AgentEvent(
+            event_id=f"agent:{agent_id}",
+            parent_event_id=parent_event_id,
+            session_id=root.session_id,
+            turn_id=root.turn_id,
+            sequence=(parent_tool.sequence + 1) if parent_tool is not None else len(graph.events),
+            started_at_ms=descriptor.get("started_at_ms"),
+            ended_at_ms=descriptor.get("ended_at_ms"),
+            status=EventStatus.COMPLETED,
+            input=agent_input,
+            output=descriptor.get("output"),
+            agent_id=agent_id,
+            source_id=agent_type,
+        )
+        transcript_path = Path(str(descriptor.get("transcript_path") or ""))
+        subgraph = parse_claude_transcript(transcript_path, agent_event)
+        insertion_index = graph.events.index(parent_tool) + 1 if parent_tool is not None else len(graph.events)
+        graph.events[insertion_index:insertion_index] = subgraph.events
+        graph.diagnostics.extend(subgraph.diagnostics)
+    graph.diagnostics.extend(graph.validate())
+
+
+def _cleanup_pending_subagents(state) -> None:
+    for agent_id in _pending_subagents(state):
+        state.delete(f"subagent_{agent_id}_start_time")
+        state.delete(f"subagent_{agent_id}_prompt")
+    state.delete("pending_subagents")
+
+
+def _cleanup_turn_state(state) -> None:
+    for key in (
+        "current_trace_id",
+        "current_trace_span_id",
+        "current_trace_start_time",
+        "current_trace_prompt",
+        "trace_start_line",
+        "pending_expansion_type",
+        "pending_command_name",
+        "pending_command_args",
+        "pending_command_source",
+    ):
+        state.delete(key)
+
+
+def _periodic_gc(trace_count: str) -> None:
+    try:
+        count = int(trace_count or "0")
+    except (ValueError, TypeError):
+        count = 0
+    if count % 5 == 0:
+        gc_stale_state_files()
+
+
 def _handle_stop(input_json: dict) -> None:
     """Handle Stop: send the LLM span for the completed turn and clean up trace state."""
     state = resolve_session(input_json)
@@ -482,6 +736,89 @@ def _handle_stop(input_json: dict) -> None:
     if not output:
         output = "(No response)"
 
+    if transcript is not None:
+        root_event = TurnEvent(
+            event_id=f"turn:{trace_count}",
+            session_id=session_id,
+            turn_id=trace_count,
+            sequence=0,
+            started_at_ms=int(trace_start_time) if trace_start_time.isdigit() else None,
+            ended_at_ms=get_timestamp_ms(),
+            status=EventStatus.COMPLETED,
+            input=user_prompt,
+            output=output,
+        )
+        graph = parse_claude_transcript(
+            transcript,
+            root_event,
+            start_line=int(state.get("trace_start_line") or "0"),
+        )
+        if _has_stable_model_ids(graph):
+            buffer = ToolBuffer(state)
+            _merge_tool_observations(graph, buffer.all())
+            _merge_pending_subagents(graph, state)
+            timestamp_candidates = [
+                event.ended_at_ms for event in graph.events if event.ended_at_ms is not None
+            ]
+            if timestamp_candidates:
+                root_event.ended_at_ms = max(root_event.ended_at_ms or 0, *timestamp_candidates)
+
+            root_attrs = {
+                "trace.number": trace_count,
+                "project.name": project_name,
+            }
+            if user_id:
+                root_attrs["user.id"] = user_id
+            expansion_type = state.get("pending_expansion_type") or ""
+            command_name = state.get("pending_command_name") or ""
+            command_args = state.get("pending_command_args") or ""
+            command_source = state.get("pending_command_source") or ""
+            if expansion_type:
+                root_attrs["command.expansion_type"] = expansion_type
+            if command_name:
+                root_attrs["command.name"] = command_name
+            if command_args:
+                root_attrs["command.args"] = redact_content(env.log_prompts, command_args)
+            if command_source:
+                root_attrs["command.source"] = command_source
+
+            span_id_overrides = {root_event.event_id: trace_span_id}
+            stored_span_ids = state.get("high_fidelity_span_ids") or ""
+            if stored_span_ids:
+                try:
+                    decoded_span_ids = json.loads(stored_span_ids)
+                    if isinstance(decoded_span_ids, dict):
+                        span_id_overrides.update(
+                            {
+                                str(event_id): str(span_id)
+                                for event_id, span_id in decoded_span_ids.items()
+                                if isinstance(event_id, str) and isinstance(span_id, str) and span_id
+                            }
+                        )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            for event in graph.events:
+                span_id_overrides.setdefault(event.event_id, generate_span_id())
+            state.set("high_fidelity_span_ids", json.dumps(span_id_overrides, sort_keys=True))
+
+            payload = render_event_graph(
+                graph,
+                trace_id=trace_id,
+                service_name=SERVICE_NAME,
+                scope_name=SCOPE_NAME,
+                span_id_overrides=span_id_overrides,
+                extra_attributes={root_event.event_id: root_attrs},
+            )
+            if not send_span(payload):
+                return
+            buffer.clear()
+            state.delete("high_fidelity_span_ids")
+            _cleanup_pending_subagents(state)
+            _cleanup_turn_state(state)
+            _periodic_gc(trace_count)
+            return
+
+    # Legacy fallback for old/incomplete transcripts without stable assistant IDs.
     # Build and send LLM span. Redact at emit time, not at state-write time.
     redacted_prompt = redact_content(env.log_prompts, user_prompt)
     redacted_output = redact_content(env.log_prompts, output)
@@ -570,12 +907,18 @@ def _handle_subagent_stop(input_json: dict) -> None:
     session_id = state.get("session_id")
     agent_id = input_json.get("agent_id", "")
     agent_type = input_json.get("agent_type", "")
+    end_time = str(get_timestamp_ms())
+
+    # Claude Code 2.1.209 exposes the dedicated transcript only at
+    # SubagentStop. Buffer it until main Stop can resolve agent_id to the
+    # invoking Agent tool_use_id and export one coherent tree.
+    if _buffer_subagent(state, input_json, int(end_time)):
+        return
 
     if not agent_type or agent_type in ("unknown", "null"):
         return
 
     span_id = generate_span_id()
-    end_time = str(get_timestamp_ms())
     parent = state.get("current_trace_span_id")
 
     # Claude Code v2 ships the assistant's final text directly.

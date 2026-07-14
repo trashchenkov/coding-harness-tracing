@@ -118,13 +118,15 @@ class TestHooksJson:
         assert "hooks" in hooks_data
 
     def test_all_claude_events_registered(self, hooks_data):
-        """All 10 Claude hook events must be present."""
+        """All 12 Claude hook events must be present."""
         expected_events = {
             "SessionStart",
             "UserPromptSubmit",
             "PreToolUse",
             "PostToolUse",
+            "PostToolUseFailure",
             "Stop",
+            "SubagentStart",
             "SubagentStop",
             "StopFailure",
             "Notification",
@@ -221,6 +223,11 @@ class TestRunHookScript:
         text = (REPO_ROOT / "tracing" / "claude_code" / "scripts" / "run-hook").read_text()
         assert "CLAUDE_PLUGIN_ROOT" in text
         assert "CLAUDE_PLUGIN_DATA" in text
+
+    def test_run_hook_avoids_networked_build_isolation(self):
+        """Hook bootstrap must not download build requirements at runtime."""
+        text = (REPO_ROOT / "tracing" / "claude_code" / "scripts" / "run-hook").read_text()
+        assert "--no-build-isolation" in text
 
 
 # --- No bash/jq/curl references in docs ---

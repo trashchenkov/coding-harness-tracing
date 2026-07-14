@@ -3,6 +3,10 @@
 
 from pathlib import Path
 from unittest import mock
+import json
+
+
+HOOKS_JSON = Path(__file__).parents[3] / "tracing" / "claude_code" / "hooks" / "hooks.json"
 
 import pytest
 
@@ -55,6 +59,12 @@ def captured_spans():
 # ---------------------------------------------------------------------------
 # SubagentStart tests
 # ---------------------------------------------------------------------------
+
+
+def test_hooks_json_registers_subagent_start():
+    hooks = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))["hooks"]
+    commands = [entry["command"] for matcher in hooks["SubagentStart"] for entry in matcher["hooks"]]
+    assert any("arize-hook-subagent-start" in command for command in commands)
 
 
 class TestSubagentStart:

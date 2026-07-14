@@ -81,7 +81,10 @@ bootstrap() {
     fi
 
     echo "[arize] Installing claude-code-tracing from $PLUGIN_ROOT..." >&2
-    if ! "$PIP" install --quiet "$PLUGIN_ROOT" >&2; then
+    # The freshly-created venv already includes a sufficiently new setuptools.
+    # Avoid an isolated PEP 517 build env, which would download setuptools and
+    # can exceed Claude's hook timeout on offline or restricted networks.
+    if ! "$PIP" install --quiet --no-build-isolation "$PLUGIN_ROOT" >&2; then
         echo "[arize] pip install failed" >&2
         rm -f "$MARKER"
         return 1
