@@ -399,13 +399,15 @@ class TestUninstall:
 
         toml_path = fake_home / ".codex" / "config.toml"
         data = codex_toml._toml_load(toml_path)
-        data["notify"].append("/usr/local/bin/my-custom-hook")
+        our_notify = data["notify"][0]
+        foreign_argv = ["/usr/local/bin/my-dispatcher", "--delegate", our_notify]
+        data["notify"] = foreign_argv
         codex_toml._toml_write(data, toml_path)
 
         codex_install.uninstall()
 
         remaining = codex_toml._toml_load(toml_path)
-        assert remaining["notify"] == ["/usr/local/bin/my-custom-hook"]
+        assert remaining["notify"] == foreign_argv
 
     def test_uninstall_preserves_foreign_hook_entries(self, fake_home, mock_prompts):
         """A non-arize hook entry under [[hooks.PreToolUse]] survives uninstall."""
@@ -532,13 +534,13 @@ class TestTomlApplyRemove:
         data = codex_toml._toml_load(p)
         assert data["notify"] == ["/venv/bin/notify"]
 
-    def test_apply_preserves_existing_notify(self, tmp_path):
+    def test_apply_rejects_existing_notify_without_modifying_it(self, tmp_path):
         p = tmp_path / "config.toml"
-        p.write_text('notify = ["/usr/bin/other-hook"]\n')
-        self._apply(p)
-        data = codex_toml._toml_load(p)
-        assert "/usr/bin/other-hook" in data["notify"]
-        assert "/venv/bin/notify" in data["notify"]
+        original = 'notify = ["/usr/bin/other-hook"]\n'
+        p.write_text(original)
+        with pytest.raises(ValueError, match="one notify program argv"):
+            self._apply(p)
+        assert p.read_text() == original
 
     def test_apply_preserves_unrelated_sections(self, tmp_path):
         p = tmp_path / "config.toml"
@@ -566,16 +568,18 @@ class TestTomlApplyRemove:
         self._apply(p)
         assert not p.exists()
 
-    def test_remove_only_our_notify(self, tmp_path):
+    def test_remove_our_executable_removes_whole_argv(self, tmp_path):
         p = tmp_path / "config.toml"
-        self._apply(p)
-        data = codex_toml._toml_load(p)
-        data["notify"].append("/usr/bin/other")
-        codex_toml._toml_write(data, p)
-
+        p.write_text('notify = ["/venv/bin/notify", "--argument"]\n')
         codex_install._codex_toml_remove(p, "/venv/bin/notify")
-        remaining = codex_toml._toml_load(p)
-        assert remaining["notify"] == ["/usr/bin/other"]
+        assert "notify" not in codex_toml._toml_load(p)
+
+    def test_remove_preserves_foreign_argv_containing_our_path_as_argument(self, tmp_path):
+        p = tmp_path / "config.toml"
+        foreign_argv = ["/usr/bin/dispatcher", "/venv/bin/notify"]
+        codex_toml._toml_write({"notify": foreign_argv}, p)
+        codex_install._codex_toml_remove(p, "/venv/bin/notify")
+        assert codex_toml._toml_load(p)["notify"] == foreign_argv
 
     def test_remove_strips_legacy_hook_entries(self, tmp_path):
         """remove strips both our notify entry and any leftover arize-managed hooks."""
