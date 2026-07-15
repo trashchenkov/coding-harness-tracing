@@ -1286,6 +1286,26 @@ class TestSendLegacySingleSpan:
         assert attrs["input.value"]["stringValue"] == "yo"
         assert attrs["output.value"]["stringValue"] == "hi"
 
+    def test_uses_canonical_codex_string_input_messages(self):
+        sent = []
+        with mock.patch(
+            "tracing.codex.hooks.handlers.send_span_to_backend",
+            side_effect=lambda p: (sent.append(p), True)[1],
+        ):
+            _send_legacy_single_span(
+                "sess-live",
+                "turn-live",
+                {
+                    "last-assistant-message": "done",
+                    "input-messages": ["first instruction", "follow-up instruction"],
+                },
+            )
+
+        spans = sent[0]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        attrs = _attrs_of_span(spans[0])
+        assert attrs["input.value"]["stringValue"] == "first instruction\nfollow-up instruction"
+        assert attrs["output.value"]["stringValue"] == "done"
+
 
 class TestReviewerRegressions:
     def test_session_meta_after_twenty_noise_records_is_validated(self, tmp_path):

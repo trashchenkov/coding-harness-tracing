@@ -354,19 +354,23 @@ def _send_legacy_single_span(thread_id: str, turn_id: str, input_json: dict) -> 
     user_msgs = input_json.get("input-messages") or input_json.get("input_messages") or ""
     user_prompt = ""
     if isinstance(user_msgs, list):
-        for m in reversed(user_msgs):
-            if isinstance(m, dict) and m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, str) and c:
-                    user_prompt = c
-                    break
-                if isinstance(c, list):
-                    for piece in c:
-                        if isinstance(piece, dict) and piece.get("text"):
-                            user_prompt = piece["text"]
-                            break
-                    if user_prompt:
-                        break
+        prompt_parts = []
+        for message in user_msgs:
+            if isinstance(message, str) and message:
+                prompt_parts.append(message)
+                continue
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                prompt_parts.append(content)
+            elif isinstance(content, list):
+                prompt_parts.extend(
+                    piece["text"]
+                    for piece in content
+                    if isinstance(piece, dict) and isinstance(piece.get("text"), str) and piece["text"]
+                )
+        user_prompt = "\n".join(prompt_parts)
     elif isinstance(user_msgs, str):
         user_prompt = user_msgs
 
