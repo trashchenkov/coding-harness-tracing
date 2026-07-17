@@ -26,7 +26,7 @@ from unittest import mock
 
 import pytest
 
-from core.common import StateManager
+from core.common import FileLock, StateManager
 
 # Force synchronous send_span path in any handler that spawns a fork.
 os.environ["ARIZE_DISABLE_FORK"] = "true"
@@ -254,16 +254,213 @@ class TestReconcileBasic:
         assert edit_attrs["tool.name"]["stringValue"] == "edit"
         assert edit_attrs["output.value"]["stringValue"] == "edited main.py"
 
-    def test_tool_spans_are_children_of_turn_root(self, mock_resolve, mock_ensure, state, captured_spans):
-        """TOOLs are children of the Turn root (current_trace_span_id), NOT of the LLM span."""
+    def test_tool_spans_are_children_of_requesting_llm(self, mock_resolve, mock_ensure, state, captured_spans):
+        """ToolPart.messageID authoritatively identifies the requesting assistant message."""
         _handle_reconcile(_load_fixture("reconcile_basic.json"))
-        turn_span_id = state.get("current_trace_span_id")
+        llm_span_id = _get_span(_by_kind(captured_spans, "LLM")[0])["spanId"]
         trace_id = state.get("current_trace_id")
         for tool in _by_kind(captured_spans, "TOOL"):
             span = _get_span(tool)
-            assert span["parentSpanId"] == turn_span_id
+            assert span["parentSpanId"] == llm_span_id
             assert span["traceId"] == trace_id
 
+    def test_late_tool_completion_keeps_requesting_llm_parent(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        """A later snapshot must recover the already-emitted LLM span ID from state."""
+        first = _load_fixture("reconcile_basic.json")
+        first["messages"][1]["parts"][1]["state"] = {
+            "status": "running",
+            "input": {"command": "ls -la"},
+            "time": {"start": 2100},
+        }
+        first["messages"][1]["parts"] = first["messages"][1]["parts"][:2]
+        _handle_reconcile(first)
+
+        llm_span_id = _get_span(_by_kind(captured_spans, "LLM")[0])["spanId"]
+        assert not _by_kind(captured_spans, "TOOL")
+
+        second = _load_fixture("reconcile_basic.json")
+        second["messages"][1]["parts"] = second["messages"][1]["parts"][:2]
+        _handle_reconcile(second)
+
+        tool = _get_span(_by_kind(captured_spans, "TOOL")[0])
+        assert tool["parentSpanId"] == llm_span_id
+        assert state.get("span_msg_msg_assist_1") == llm_span_id
+
+    def test_mismatched_tool_message_id_falls_back_to_turn(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("reconcile_basic.json")
+        payload["messages"][1]["parts"][1]["messageID"] = "msg_missing"
+        payload["messages"][1]["parts"] = payload["messages"][1]["parts"][:2]
+
+        _handle_reconcile(payload)
+
+        tool = _by_kind(captured_spans, "TOOL")[0]
+        span = _get_span(tool)
+        attrs = _get_attrs(tool)
+        assert span["parentSpanId"] == state.get("current_trace_span_id")
+        assert attrs["tracing.parentage"]["stringValue"] == "turn_fallback"
+        assert state.get("span_msg_msg_missing") is None
+
+
+class TestSubagentSessionTopology:
+    def test_task_child_session_emits_agent_subtree(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("subagent_session.json")
+        _handle_close(payload)
+
+        llms = _by_kind(captured_spans, "LLM")
+        tools = _by_kind(captured_spans, "TOOL")
+        agents = _by_kind(captured_spans, "AGENT")
+        chains = _by_kind(captured_spans, "CHAIN")
+        assert len(llms) == 3
+        assert len(tools) == 1
+        assert len(agents) == 1
+        assert len(chains) == 1
+
+        parent_llm = next(s for s in llms if _get_attrs(s)["llm.message_id"]["stringValue"] == "msg_parent_llm_1")
+        child_llm = next(s for s in llms if _get_attrs(s)["llm.message_id"]["stringValue"] == "msg_child_llm")
+        task = tools[0]
+        agent = agents[0]
+
+        assert _get_span(task)["parentSpanId"] == _get_span(parent_llm)["spanId"]
+        assert _get_span(agent)["parentSpanId"] == _get_span(task)["spanId"]
+        assert _get_span(child_llm)["parentSpanId"] == _get_span(agent)["spanId"]
+        assert _get_attrs(agent)["session.id"]["stringValue"] == "ses_child"
+        assert _get_attrs(agent)["agent.name"]["stringValue"] == "general"
+
+    def test_subagent_snapshot_replay_is_idempotent(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("subagent_session.json")
+        _handle_close(payload)
+        first_count = len(captured_spans)
+        _handle_close(payload)
+        assert len(captured_spans) == first_count
+
+    def test_multi_turn_snapshot_keeps_child_subtree_in_task_trace(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("subagent_session.json")
+        payload["type"] = "reconcile"
+        payload["childSessions"][0]["messages"][1]["parts"].append(
+            {
+                "id": "prt_child_tool",
+                "sessionID": "ses_child",
+                "messageID": "msg_child_llm",
+                "type": "tool",
+                "tool": "read",
+                "callID": "call_child_read",
+                "state": {
+                    "status": "completed",
+                    "input": {"filePath": "[REDACTED]"},
+                    "output": "[REDACTED]",
+                    "time": {"start": 1800, "end": 2200},
+                },
+            }
+        )
+        payload["messages"].extend(
+            [
+                {
+                    "info": {
+                        "id": "msg_user_later",
+                        "sessionID": "ses_parent",
+                        "role": "user",
+                        "time": {"created": 5000},
+                    },
+                    "parts": [
+                        {
+                            "id": "prt_user_later",
+                            "sessionID": "ses_parent",
+                            "messageID": "msg_user_later",
+                            "type": "text",
+                            "text": "[REDACTED]",
+                        }
+                    ],
+                },
+                {
+                    "info": {
+                        "id": "msg_later_llm",
+                        "sessionID": "ses_parent",
+                        "role": "assistant",
+                        "parentID": "msg_user_later",
+                        "providerID": "opencode",
+                        "modelID": "free-model",
+                        "time": {"created": 5100, "completed": 5200},
+                        "tokens": {"input": 1, "output": 1},
+                        "finish": "stop",
+                    },
+                    "parts": [
+                        {
+                            "id": "prt_later_text",
+                            "sessionID": "ses_parent",
+                            "messageID": "msg_later_llm",
+                            "type": "text",
+                            "text": "[REDACTED]",
+                        }
+                    ],
+                },
+            ]
+        )
+
+        _handle_reconcile(payload)
+
+        task = next(
+            span
+            for span in _by_kind(captured_spans, "TOOL")
+            if _get_attrs(span).get("tool.call_id", {}).get("stringValue") == "call_task_1"
+        )
+        task_trace = _get_span(task)["traceId"]
+        agent = _by_kind(captured_spans, "AGENT")[0]
+        child_llm = next(
+            span
+            for span in _by_kind(captured_spans, "LLM")
+            if _get_attrs(span).get("session.id", {}).get("stringValue") == "ses_child"
+        )
+        child_tool = next(
+            span
+            for span in _by_kind(captured_spans, "TOOL")
+            if _get_attrs(span).get("tool.call_id", {}).get("stringValue") == "call_child_read"
+        )
+
+        assert _get_span(agent)["traceId"] == task_trace
+        assert _get_span(child_llm)["traceId"] == task_trace
+        assert _get_span(child_tool)["traceId"] == task_trace
+        assert _get_span(agent)["parentSpanId"] == _get_span(task)["spanId"]
+        assert _get_span(child_llm)["parentSpanId"] == _get_span(agent)["spanId"]
+        assert _get_span(child_tool)["parentSpanId"] == _get_span(child_llm)["spanId"]
+
+    def test_mismatched_child_parent_session_is_not_linked(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("subagent_session.json")
+        child = payload["childSessions"][0]
+        child["parentSessionID"] = "ses_unrelated"
+        child["info"]["parentID"] = "ses_unrelated"
+
+        _handle_close(payload)
+
+        assert _by_kind(captured_spans, "AGENT") == []
+        assert all(_get_attrs(span)["session.id"]["stringValue"] != "ses_child" for span in captured_spans)
+
+    def test_child_without_authoritative_parent_session_is_not_linked(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        payload = _load_fixture("subagent_session.json")
+        child = payload["childSessions"][0]
+        child.pop("parentSessionID")
+        child["info"].pop("parentID")
+
+        _handle_close(payload)
+
+        assert _by_kind(captured_spans, "AGENT") == []
+        assert all(_get_attrs(span)["session.id"]["stringValue"] != "ses_child" for span in captured_spans)
+
+
+class TestToolMetadataContinued:
     def test_tool_span_timing_from_state(self, mock_resolve, mock_ensure, state, captured_spans):
         """TOOL span timestamps come from state.time.start / state.time.end."""
         _handle_reconcile(_load_fixture("reconcile_basic.json"))
@@ -903,6 +1100,61 @@ class TestMultiTurnSnapshotDedup:
 
 
 class TestMainEntryPoint:
+    def test_lock_timeout_fails_soft_without_force_acquire(self, state):
+        payload = {"type": "reconcile", "sessionID": "ses_race", "messages": []}
+        handler_lock = state.state_file.with_name(state.state_file.name + ".handler.lock")
+        break_values = []
+
+        def short_lock(path, timeout, *, break_on_timeout=None):
+            break_values.append(break_on_timeout)
+            kwargs = {} if break_on_timeout is None else {"break_on_timeout": break_on_timeout}
+            return FileLock(path, timeout=0.01, **kwargs)
+
+        with FileLock(handler_lock, timeout=1.0):
+            with (
+                mock.patch("tracing.opencode.hooks.handlers.check_requirements", return_value=True),
+                mock.patch("tracing.opencode.hooks.handlers._read_stdin", return_value=payload),
+                mock.patch("tracing.opencode.hooks.handlers.resolve_session", return_value=state),
+                mock.patch("tracing.opencode.hooks.handlers.FileLock", side_effect=short_lock),
+                mock.patch("tracing.opencode.hooks.handlers._handle_reconcile") as reconcile,
+            ):
+                main()
+
+        assert break_values == [False]
+        reconcile.assert_not_called()
+
+    def test_serializes_same_session_invocations(self, monkeypatch, state):
+        import threading
+        import time
+
+        payload = {"type": "reconcile", "sessionID": "ses_race", "messages": []}
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+
+        def slow_reconcile(_payload):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.1)
+            with guard:
+                active -= 1
+
+        with (
+            mock.patch("tracing.opencode.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.opencode.hooks.handlers._read_stdin", return_value=payload),
+            mock.patch("tracing.opencode.hooks.handlers.resolve_session", return_value=state),
+            mock.patch("tracing.opencode.hooks.handlers._handle_reconcile", side_effect=slow_reconcile),
+        ):
+            threads = [threading.Thread(target=main) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        assert max_active == 1
+
     def test_dispatches_reconcile(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         payload = {"type": "reconcile", "sessionID": "ses_d", "messages": []}
