@@ -14,6 +14,7 @@ Payload shape:
 message ID and tool callID. `close` does the same and then emits the
 Turn CHAIN root for the pending turn.
 """
+
 from __future__ import annotations
 
 import json
@@ -527,7 +528,7 @@ def _emit_tool_span(
 # ---------------------------------------------------------------------------
 
 
-def _emit_child_session(state: StateManager, child: dict) -> None:
+def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: bool = False) -> None:
     """Emit one child AGENT subtree linked to its authoritative task call."""
     child_session_id = child.get("sessionID") or ""
     parent_call_id = child.get("parentCallID") or ""
@@ -573,7 +574,7 @@ def _emit_child_session(state: StateManager, child: dict) -> None:
                 final_output = _text_of(parts)
                 final_completed = completed
 
-    if state.get(f"emitted_agent_{child_session_id}") is None:
+    if finalize_agent and state.get(f"emitted_agent_{child_session_id}") is None:
         time_block = info.get("time") or {}
         start_ms = time_block.get("created")
         end_ms = time_block.get("updated") or final_completed
@@ -638,10 +639,10 @@ def _emit_child_session(state: StateManager, child: dict) -> None:
             )
 
 
-def _reconcile_child_sessions(state: StateManager, child_sessions: list) -> None:
+def _reconcile_child_sessions(state: StateManager, child_sessions: list, *, finalize_agents: bool = False) -> None:
     for child in child_sessions or []:
         if isinstance(child, dict):
-            _emit_child_session(state, child)
+            _emit_child_session(state, child, finalize_agent=finalize_agents)
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +711,7 @@ def _handle_close(input_json: dict) -> None:
 
     messages = input_json.get("messages") or []
     final = _reconcile_messages(state, messages)
-    _reconcile_child_sessions(state, input_json.get("childSessions") or [])
+    _reconcile_child_sessions(state, input_json.get("childSessions") or [], finalize_agents=True)
 
     trace_id = state.get("current_trace_id")
     span_id = state.get("current_trace_span_id")

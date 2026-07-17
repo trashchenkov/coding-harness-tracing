@@ -757,9 +757,7 @@ class FileLock:
     - mkdir fallback: creates lock_path as a directory (matches bash behavior)
     """
 
-    def __init__(
-        self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True
-    ) -> None:
+    def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True) -> None:
         self.lock_path = Path(lock_path)
         self.timeout = timeout
         self.break_on_timeout = break_on_timeout
