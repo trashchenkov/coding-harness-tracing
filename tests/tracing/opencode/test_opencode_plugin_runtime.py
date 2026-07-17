@@ -4,7 +4,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 PLUGIN = Path(__file__).parents[3] / "tracing" / "opencode" / "plugin" / "arize-tracing.ts"
 
 

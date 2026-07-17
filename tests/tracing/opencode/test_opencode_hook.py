@@ -15,8 +15,10 @@ Turn CHAIN root is emitted only on `close` (session.idle).
 
 Tests are modelled after tests/tracing/gemini/test_gemini_hook.py.
 """
+
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -264,9 +266,7 @@ class TestReconcileBasic:
             assert span["parentSpanId"] == llm_span_id
             assert span["traceId"] == trace_id
 
-    def test_late_tool_completion_keeps_requesting_llm_parent(
-        self, mock_resolve, mock_ensure, state, captured_spans
-    ):
+    def test_late_tool_completion_keeps_requesting_llm_parent(self, mock_resolve, mock_ensure, state, captured_spans):
         """A later snapshot must recover the already-emitted LLM span ID from state."""
         first = _load_fixture("reconcile_basic.json")
         first["messages"][1]["parts"][1]["state"] = {
@@ -288,9 +288,7 @@ class TestReconcileBasic:
         assert tool["parentSpanId"] == llm_span_id
         assert state.get("span_msg_msg_assist_1") == llm_span_id
 
-    def test_mismatched_tool_message_id_falls_back_to_turn(
-        self, mock_resolve, mock_ensure, state, captured_spans
-    ):
+    def test_mismatched_tool_message_id_falls_back_to_turn(self, mock_resolve, mock_ensure, state, captured_spans):
         payload = _load_fixture("reconcile_basic.json")
         payload["messages"][1]["parts"][1]["messageID"] = "msg_missing"
         payload["messages"][1]["parts"] = payload["messages"][1]["parts"][:2]
@@ -306,9 +304,7 @@ class TestReconcileBasic:
 
 
 class TestSubagentSessionTopology:
-    def test_task_child_session_emits_agent_subtree(
-        self, mock_resolve, mock_ensure, state, captured_spans
-    ):
+    def test_task_child_session_emits_agent_subtree(self, mock_resolve, mock_ensure, state, captured_spans):
         payload = _load_fixture("subagent_session.json")
         _handle_close(payload)
 
@@ -332,14 +328,30 @@ class TestSubagentSessionTopology:
         assert _get_attrs(agent)["session.id"]["stringValue"] == "ses_child"
         assert _get_attrs(agent)["agent.name"]["stringValue"] == "general"
 
-    def test_subagent_snapshot_replay_is_idempotent(
-        self, mock_resolve, mock_ensure, state, captured_spans
-    ):
+    def test_subagent_snapshot_replay_is_idempotent(self, mock_resolve, mock_ensure, state, captured_spans):
         payload = _load_fixture("subagent_session.json")
         _handle_close(payload)
         first_count = len(captured_spans)
         _handle_close(payload)
         assert len(captured_spans) == first_count
+
+    def test_partial_child_reconcile_does_not_freeze_agent_span(self, mock_resolve, mock_ensure, state, captured_spans):
+        completed = _load_fixture("subagent_session.json")
+        partial = copy.deepcopy(completed)
+        partial["type"] = "reconcile"
+        child = partial["childSessions"][0]
+        child["info"]["time"]["updated"] = 1800
+        child["messages"] = child["messages"][:1]
+
+        _handle_reconcile(partial)
+        assert _by_kind(captured_spans, "AGENT") == []
+
+        _handle_close(completed)
+        agents = _by_kind(captured_spans, "AGENT")
+        assert len(agents) == 1
+        agent = agents[0]
+        assert _get_attrs(agent)["output.value"]["stringValue"] == "[REDACTED]"
+        assert _get_span(agent)["endTimeUnixNano"] == "2800000000"
 
     def test_multi_turn_snapshot_keeps_child_subtree_in_task_trace(
         self, mock_resolve, mock_ensure, state, captured_spans
@@ -407,6 +419,7 @@ class TestSubagentSessionTopology:
         )
 
         _handle_reconcile(payload)
+        _handle_close(payload)
 
         task = next(
             span
@@ -433,9 +446,7 @@ class TestSubagentSessionTopology:
         assert _get_span(child_llm)["parentSpanId"] == _get_span(agent)["spanId"]
         assert _get_span(child_tool)["parentSpanId"] == _get_span(child_llm)["spanId"]
 
-    def test_mismatched_child_parent_session_is_not_linked(
-        self, mock_resolve, mock_ensure, state, captured_spans
-    ):
+    def test_mismatched_child_parent_session_is_not_linked(self, mock_resolve, mock_ensure, state, captured_spans):
         payload = _load_fixture("subagent_session.json")
         child = payload["childSessions"][0]
         child["parentSessionID"] = "ses_unrelated"
