@@ -98,18 +98,64 @@ def test_tool_failure_emits_error_span_and_cleans_pair(captured_spans, _state_di
     assert not list(_state_dir.glob("*failed-tool*.stack.json"))
 
 
-def test_subagents_pair_by_subagent_id(captured_spans):
+def test_subagents_pair_from_declared_shared_fields(captured_spans, _state_dir):
     common = {"conversation_id": "c", "generation_id": "g", "subagent_type": "explore"}
     with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000):
         _dispatch("subagentStart", {**common, "subagent_id": "a", "task": "first"})
         _dispatch("subagentStart", {**common, "subagent_id": "b", "task": "second"})
     with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1400):
-        _dispatch("subagentStop", {**common, "subagent_id": "a", "summary": "A", "status": "completed"})
+        _dispatch("subagentStop", {**common, "task": "first", "summary": "A", "status": "completed"})
     with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1500):
-        _dispatch("subagentStop", {**common, "subagent_id": "b", "summary": "B", "status": "completed"})
+        _dispatch("subagentStop", {**common, "task": "second", "summary": "B", "status": "completed"})
 
-    assert [_attrs(_span(p))["input.value"] for p in captured_spans] == ["first", "second"]
-    assert [_attrs(_span(p))["output.value"] for p in captured_spans] == ["A", "B"]
+    spans = [_span(payload) for payload in captured_spans]
+    assert [_attrs(span)["input.value"] for span in spans] == ["first", "second"]
+    assert [_attrs(span)["output.value"] for span in spans] == ["A", "B"]
+    assert [_attrs(span)["cursor.subagent.id"] for span in spans] == ["a", "b"]
+    assert all(span["startTimeUnixNano"].startswith("1000") for span in spans)
+    assert not list(_state_dir.glob("subagent_*.stack.json"))
+
+
+@pytest.mark.parametrize(
+    ("log_prompts", "log_model_outputs", "expected_task", "expected_summary"),
+    [
+        ("false", "true", "<redacted (11 chars)>", "SUMMARY_SECRET"),
+        ("true", "false", "TASK_SECRET", "<redacted (14 chars)>"),
+    ],
+)
+def test_subagent_task_and_summary_privacy_are_independent(
+    captured_spans,
+    monkeypatch,
+    log_prompts,
+    log_model_outputs,
+    expected_task,
+    expected_summary,
+):
+    monkeypatch.setenv("ARIZE_LOG_PROMPTS", log_prompts)
+    monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", log_model_outputs)
+    common = {"conversation_id": "privacy", "generation_id": "subagent-privacy", "subagent_type": "explore"}
+    _dispatch("subagentStart", {**common, "subagent_id": "s", "task": "TASK_SECRET"})
+    _dispatch(
+        "subagentStop",
+        {**common, "task": "TASK_SECRET", "summary": "SUMMARY_SECRET", "status": "completed"},
+    )
+
+    attrs = _attrs(_span(captured_spans[0]))
+    assert attrs["input.value"] == expected_task
+    assert attrs["output.value"] == expected_summary
+
+
+def test_subagent_stop_reapplies_current_prompt_privacy(captured_spans, monkeypatch):
+    common = {"conversation_id": "privacy", "generation_id": "privacy-change", "subagent_type": "explore"}
+    monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+    _dispatch("subagentStart", {**common, "subagent_id": "s", "task": "TASK_SECRET"})
+    monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+    _dispatch(
+        "subagentStop",
+        {**common, "task": "TASK_SECRET", "summary": "safe", "status": "completed"},
+    )
+
+    assert _attrs(_span(captured_spans[0]))["input.value"] == "<redacted (11 chars)>"
 
 
 @pytest.mark.parametrize(

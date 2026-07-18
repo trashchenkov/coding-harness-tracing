@@ -7,6 +7,7 @@ Input contract: JSON on stdin, all registered events routed here.
 stdout: MUST print permissive JSON response, even on error.
 stderr: redirected to ARIZE_LOG_FILE before dispatch.
 """
+import hashlib
 import json
 import os
 import sys
@@ -1121,35 +1122,47 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     log(f"postToolUseFailure: span for tool={tool_name}")
 
 
-def _subagent_state_key(gen_id: str, subagent_id: str) -> str:
-    return f"subagent_{sanitize(gen_id)}_{sanitize(subagent_id)}"
+def _subagent_state_key(gen_id: str, subagent_type: str, task: str) -> str:
+    """Key subagent state from fields declared on both lifecycle events.
+
+    Cursor's declared ``subagentStop`` schema omits ``subagent_id``.  Hash the
+    shared type/task tuple so task content is not exposed in a state filename.
+    Identical concurrent tasks share a LIFO stack rather than claiming ID-safe
+    pairing the host contract cannot provide.
+    """
+    correlation = hashlib.sha256(f"{subagent_type}\0{task}".encode("utf-8")).hexdigest()[:24]
+    return f"subagent_{sanitize(gen_id)}_{correlation}"
 
 
 def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """Capture parallel-safe subagent start state."""
+    """Capture subagent start state using declared cross-event fields."""
     subagent_id = _jq_str(input_json, "subagent_id")
-    if not subagent_id:
-        return
+    subagent_type = _jq_str(input_json, "subagent_type")
+    raw_task = _jq_str(input_json, "task")
     state_push(
-        _subagent_state_key(gen_id, subagent_id),
+        _subagent_state_key(gen_id, subagent_type, raw_task),
         {
             "start_ms": now_ms,
-            "task": redact_content(env.log_prompts, _jq_str(input_json, "task")),
-            "subagent_type": _jq_str(input_json, "subagent_type"),
+            "task": redact_content(env.log_prompts, raw_task),
+            "subagent_type": subagent_type,
+            "subagent_id": subagent_id,
         },
     )
-    log(f"subagentStart: pushed state for subagent_id={subagent_id}")
+    log("subagentStart: pushed contract-correlated state")
 
 
 def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Emit one CHAIN span for a completed, failed, or aborted subagent."""
-    subagent_id = _jq_str(input_json, "subagent_id")
-    popped = state_pop(_subagent_state_key(gen_id, subagent_id)) if subagent_id else None
+    raw_task = _jq_str(input_json, "task")
+    stop_type = _jq_str(input_json, "subagent_type")
+    popped = state_pop(_subagent_state_key(gen_id, stop_type, raw_task))
+    subagent_id = (popped or {}).get("subagent_id", "") or _jq_str(input_json, "subagent_id")
     duration = _to_int(input_json.get("duration_ms"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
-    subagent_type = _jq_str(input_json, "subagent_type") or (popped or {}).get("subagent_type", "")
-    task = (popped or {}).get("task", "") or redact_content(env.log_prompts, _jq_str(input_json, "task"))
-    summary = redact_content(env.log_prompts, _jq_str(input_json, "summary", "error_message"))
+    subagent_type = stop_type or (popped or {}).get("subagent_type", "")
+    task_source = raw_task or (popped or {}).get("task", "")
+    task = redact_content(env.log_prompts, task_source)
+    summary = redact_content(env.log_model_outputs, _jq_str(input_json, "summary", "error_message"))
     attrs = {
         "openinference.span.kind": "CHAIN",
         "input.value": task,

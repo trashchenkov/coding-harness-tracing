@@ -227,11 +227,11 @@ Cursor documents 21 events across Agent, Tab, and app-lifecycle categories. All 
 | `beforeReadFile`, `afterFileEdit` | File-operation TOOL spans |
 | `beforeTabFileRead`, `afterTabFileEdit` | Tab-operation TOOL spans |
 | `preToolUse`, `postToolUse`, `postToolUseFailure` | ID-scoped generic tool lifecycle, including failure status |
-| `subagentStart`, `subagentStop` | ID-scoped subagent CHAIN lifecycle |
+| `subagentStart`, `subagentStop` | Contract-correlated subagent CHAIN lifecycle |
 | `preCompact` | Observational compaction CHAIN span |
-| `workspaceOpen` | Workspace lifecycle CHAIN span; returns an empty `pluginPaths` list unless another plugin path is intentionally supplied |
+| `workspaceOpen` | Loads the tracing hook without creating a sessionless span; returns an empty `pluginPaths` list unless another plugin path is intentionally supplied |
 
-Paired shell, MCP, generic-tool, and subagent events use disk-backed state scoped by stable upstream identifiers. State is removed after the terminal event.
+Paired shell, MCP, and generic-tool events use disk-backed state scoped by stable upstream identifiers. Subagents are correlated from the fields declared on both events (`generation_id`, `subagent_type`, and a SHA-256 task digest that keeps raw task text out of the filename), because the declared `subagentStop` payload has no `subagent_id`; the start ID is recovered as an attribute when that correlation matches. Identical concurrent subagent type/task pairs share a LIFO stack and are not claimed to be ID-safe. State is removed after a matching terminal event; unmatched state is retained only until generation/session cleanup.
 
 ### What We Capture
 
