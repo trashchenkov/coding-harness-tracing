@@ -1191,6 +1191,7 @@ def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms
         {
             "start_ms": now_ms,
             "task": redact_content(env.log_prompts, raw_task),
+            "task_redacted": not env.log_prompts,
             "subagent_type": subagent_type,
             "subagent_id": subagent_id,
         },
@@ -1207,8 +1208,13 @@ def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms)
     duration = _to_int(input_json.get("duration_ms"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
     subagent_type = stop_type or (popped or {}).get("subagent_type", "")
-    task_source = raw_task or (popped or {}).get("task", "")
-    task = redact_content(env.log_prompts, task_source)
+    if popped:
+        task_source = popped.get("task", "")
+        task_was_redacted = bool(popped.get("task_redacted", False))
+    else:
+        task_source = raw_task
+        task_was_redacted = False
+    task = _redact_deferred(env.log_prompts, task_source, task_was_redacted)
     summary = redact_content(env.log_model_outputs, _jq_str(input_json, "summary", "error_message"))
     attrs = {
         "openinference.span.kind": "CHAIN",

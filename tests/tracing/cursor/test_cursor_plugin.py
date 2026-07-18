@@ -337,6 +337,76 @@ class TestRunHook:
         assert [stdout for stdout, _ in results] == [b"{}", b"{}"]
         assert count_file.read_text() == "x"
 
+    def test_stale_lock_recovery_cannot_remove_a_new_active_lock(self, tmp_path):
+        home = tmp_path / "home"
+        data_dir = home / ".arize" / "harness"
+        venv_bin = data_dir / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        lock_dir = data_dir / ".cursor-plugin-bootstrap.lock"
+        lock_dir.mkdir()
+        stale_pid = "99999999"
+        (lock_dir / "pid").write_text(stale_pid)
+
+        count_file = tmp_path / "install-count"
+        overlap_file = tmp_path / "install-overlap"
+        active_dir = tmp_path / "install-active"
+        entry_point = venv_bin / "arize-hook-cursor"
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            f"printf x >> '{count_file}'\n"
+            f"if /usr/bin/mkdir '{active_dir}' 2>/dev/null; then\n"
+            "  /usr/bin/sleep 0.3\n"
+            f"  /usr/bin/rmdir '{active_dir}'\n"
+            "else\n"
+            f"  printf overlap > '{overlap_file}'\n"
+            "fi\n"
+            f"printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
+            f"chmod +x '{entry_point}'\n"
+        )
+        pip.chmod(0o755)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+        )
+        python.chmod(0o755)
+        leader_dir = tmp_path / "stale-removal-leader"
+        fake_rm = fake_bin / "rm"
+        fake_rm.write_text(
+            "#!/bin/sh\n"
+            f'if [ "$1" = -rf ] && [ "$2" = \'{lock_dir}\' ]; then\n'
+            f"  if /usr/bin/mkdir '{leader_dir}' 2>/dev/null; then\n"
+            '    exec /usr/bin/rm "$@"\n'
+            "  fi\n"
+            "  attempts=0\n"
+            f"  while [ \"$(/usr/bin/cat '{lock_dir}/pid' 2>/dev/null || true)\" = '{stale_pid}' ] || "
+            f"        [ ! -f '{lock_dir}/pid' ]; do\n"
+            "    attempts=$((attempts + 1))\n"
+            '    [ "$attempts" -ge 200 ] && exit 1\n'
+            "    /usr/bin/sleep 0.01\n"
+            "  done\n"
+            "fi\n"
+            'exec /usr/bin/rm "$@"\n'
+        )
+        fake_rm.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        processes = [
+            subprocess.Popen(
+                [str(RUN_HOOK)], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(b"{}", timeout=30) for process in processes]
+
+        assert all(process.returncode == 0 for process in processes)
+        assert [stdout for stdout, _ in results] == [b"{}", b"{}"]
+        assert count_file.read_text() == "x"
+        assert not overlap_file.exists()
+
     def test_reinstalls_when_installable_source_changes(self, tmp_path):
         plugin_root = tmp_path / "plugin"
         shutil.copytree(PLUGIN_DIR, plugin_root)
