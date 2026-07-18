@@ -1611,26 +1611,27 @@ class TestDeferredStatePrivacy:
         )
 
         monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
-        _dispatch(
-            "afterShellExecution",
-            {
-                "conversation_id": "privacy-conv",
-                "generation_id": "privacy-gen",
-                "command": command,
-                "output": "done",
-                "exit_code": "0",
-            },
-        )
+        after_payload = {
+            "conversation_id": "privacy-conv",
+            "generation_id": "privacy-gen",
+            "command": command,
+            "output": "done",
+            "exit_code": "0",
+        }
+        _dispatch("afterShellExecution", after_payload)
+        _dispatch("afterShellExecution", after_payload)
 
-        shell_payload = next(
+        shell_payloads = [
             payload
             for payload in captured_spans
             if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Shell"
-        )
-        shell_span = shell_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-        attrs = {item["key"]: item["value"]["stringValue"] for item in shell_span["attributes"]}
-        assert attrs["input.value"].startswith("<redacted")
-        assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
+        ]
+        assert len(shell_payloads) == 2
+        for shell_payload in shell_payloads:
+            shell_span = shell_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            attrs = {item["key"]: item["value"]["stringValue"] for item in shell_span["attributes"]}
+            assert attrs["input.value"].startswith("<redacted")
+            assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
 
     def test_subagent_creation_redaction_is_irreversible_when_stop_repeats_task(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")

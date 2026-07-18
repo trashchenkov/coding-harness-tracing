@@ -407,6 +407,38 @@ class TestRunHook:
         assert count_file.read_text() == "x"
         assert not overlap_file.exists()
 
+    def test_abandoned_reclaim_claim_does_not_wedge_stale_recovery(self, tmp_path):
+        home = tmp_path / "home"
+        data_dir = home / ".arize" / "harness"
+        venv_bin = data_dir / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        lock_dir = data_dir / ".cursor-plugin-bootstrap.lock"
+        (lock_dir / ".reclaim").mkdir(parents=True)
+        (lock_dir / "pid").write_text("99999999")
+
+        entry_point = venv_bin / "arize-hook-cursor"
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            f"printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
+            f"chmod +x '{entry_point}'\n"
+        )
+        pip.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+        )
+        python.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        result = subprocess.run([str(RUN_HOOK)], env=env, input=b"{}", capture_output=True, timeout=10)
+
+        assert result.returncode == 0
+        assert result.stdout == b"{}"
+        assert not lock_dir.exists()
+
     def test_reinstalls_when_installable_source_changes(self, tmp_path):
         plugin_root = tmp_path / "plugin"
         shutil.copytree(PLUGIN_DIR, plugin_root)
