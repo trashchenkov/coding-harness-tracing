@@ -1507,6 +1507,202 @@ class TestHandlePostToolUse:
 
 
 # ---------------------------------------------------------------------------
+# Deferred-state privacy boundary tests
+# ---------------------------------------------------------------------------
+
+
+class TestDeferredStatePrivacy:
+
+    def test_disabled_prompt_logging_never_persists_raw_prompt(self, monkeypatch, _patch_cursor_state):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+
+        _dispatch(
+            "beforeSubmitPrompt",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "prompt": "PROMPT_DISK_SECRET",
+            },
+        )
+
+        state_text = "\n".join(path.read_text() for path in _patch_cursor_state.rglob("*") if path.is_file())
+        assert "PROMPT_DISK_SECRET" not in state_text
+        assert "<redacted" in state_text
+
+    def test_marker_shaped_raw_prompt_is_not_trusted_as_already_redacted(self, monkeypatch, _patch_cursor_state):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        raw_prompt = "<redacted (123 chars)>"
+
+        _dispatch(
+            "beforeSubmitPrompt",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "prompt": raw_prompt,
+            },
+        )
+
+        state_text = "\n".join(path.read_text() for path in _patch_cursor_state.rglob("*") if path.is_file())
+        assert raw_prompt not in state_text
+
+    def test_creation_redaction_is_irreversible_if_terminal_policy_is_later_enabled(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "true")
+        _dispatch(
+            "beforeSubmitPrompt",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "prompt": "IRREVERSIBLE_PROMPT_SECRET",
+            },
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+        _dispatch(
+            "afterAgentResponse",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "text": "allowed output",
+            },
+        )
+        _dispatch("stop", {"conversation_id": "privacy-conv", "generation_id": "privacy-gen"})
+
+        llm_payload = next(
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Agent Response"
+        )
+        assert "IRREVERSIBLE_PROMPT_SECRET" not in json.dumps(llm_payload)
+
+    def test_disabled_tool_details_never_persists_raw_shell_command(self, monkeypatch, _patch_cursor_state):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+
+        _dispatch(
+            "beforeShellExecution",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "command": "printf SHELL_DISK_SECRET",
+            },
+        )
+
+        state_text = "\n".join(path.read_text() for path in _patch_cursor_state.rglob("*") if path.is_file())
+        assert "SHELL_DISK_SECRET" not in state_text
+        assert "<redacted" in state_text
+
+    def test_stop_reapplies_current_prompt_and_model_output_policy(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "true")
+
+        _dispatch(
+            "beforeSubmitPrompt",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "prompt": "PROMPT_TERMINAL_SECRET",
+            },
+        )
+        _dispatch(
+            "afterAgentResponse",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "text": "MODEL_TERMINAL_SECRET",
+            },
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "false")
+        _dispatch(
+            "stop",
+            {"conversation_id": "privacy-conv", "generation_id": "privacy-gen"},
+        )
+
+        llm_payload = next(
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Agent Response"
+        )
+        llm_span = llm_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in llm_span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert attrs["output.value"].startswith("<redacted")
+        assert "PROMPT_TERMINAL_SECRET" not in json.dumps(llm_payload)
+        assert "MODEL_TERMINAL_SECRET" not in json.dumps(llm_payload)
+
+    def test_post_tool_use_reapplies_current_tool_content_policy(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch(
+            "preToolUse",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "tool_use_id": "tool-1",
+                "tool_name": "custom_search",
+                "tool_input": {"query": "TOOL_TERMINAL_SECRET"},
+            },
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        _dispatch(
+            "postToolUse",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "tool_use_id": "tool-1",
+                "tool_name": "custom_search",
+                "tool_output": "TOOL_OUTPUT_TERMINAL_SECRET",
+            },
+        )
+
+        payload = captured_spans[-1]
+        span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert attrs["output.value"].startswith("<redacted")
+        assert "TOOL_TERMINAL_SECRET" not in json.dumps(payload)
+        assert "TOOL_OUTPUT_TERMINAL_SECRET" not in json.dumps(payload)
+
+    def test_after_mcp_reapplies_current_tool_content_policy(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch(
+            "beforeMCPExecution",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "tool_name": "search",
+                "tool_input": "MCP_TERMINAL_SECRET",
+            },
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        _dispatch(
+            "afterMCPExecution",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "tool_name": "search",
+                "result": "MCP_OUTPUT_TERMINAL_SECRET",
+            },
+        )
+
+        payload = captured_spans[-1]
+        span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert attrs["output.value"].startswith("<redacted")
+        assert "MCP_TERMINAL_SECRET" not in json.dumps(payload)
+
+
+# ---------------------------------------------------------------------------
 # _handle_stop token count tests
 # ---------------------------------------------------------------------------
 

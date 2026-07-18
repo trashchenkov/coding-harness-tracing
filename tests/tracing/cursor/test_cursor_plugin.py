@@ -378,6 +378,45 @@ class TestRunHook:
         assert second.stdout == b"NEW_ARTIFACT"
         assert marker.read_text().strip() == _install_source_hash(plugin_root)
 
+    def test_terminating_signal_does_not_publish_marker_or_execute_artifact(self, tmp_path):
+        plugin_root = tmp_path / "plugin"
+        shutil.copytree(PLUGIN_DIR, plugin_root)
+        run_hook = plugin_root / "scripts" / "run-hook"
+        home = tmp_path / "home"
+        venv_bin = home / ".arize" / "harness" / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            'kill -TERM "$PPID"\n'
+            "/usr/bin/sleep 0.1\n"
+            'BIN_DIR=$(dirname "$0")\n'
+            "printf '#!/bin/sh\\nprintf EXECUTED_AFTER_TERM\\n' > \"$BIN_DIR/arize-hook-cursor\"\n"
+            'chmod +x "$BIN_DIR/arize-hook-cursor"\n'
+        )
+        pip.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+        )
+        python.chmod(0o755)
+
+        result = subprocess.run(
+            [str(run_hook)],
+            env={**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            input=b"{}",
+            capture_output=True,
+            timeout=10,
+        )
+
+        data_dir = home / ".arize" / "harness"
+        assert result.returncode == 0
+        assert result.stdout == b""
+        assert not (data_dir / ".cursor-plugin.pyproject.sha256").exists()
+        assert not (data_dir / ".cursor-plugin-bootstrap.lock").exists()
+
     @pytest.mark.parametrize("pid_contents", [None, "", "not-a-pid"])
     def test_recovers_lock_with_missing_or_malformed_pid(self, tmp_path, pid_contents):
         home = tmp_path / "home"

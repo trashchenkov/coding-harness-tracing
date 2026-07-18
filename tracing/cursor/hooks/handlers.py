@@ -131,6 +131,13 @@ def _json_string(value) -> str:
     return str(value)
 
 
+def _redact_deferred(allowed: bool, content: str, already_redacted: bool = False) -> str:
+    """Apply the terminal policy to explicitly classified persisted content."""
+    if already_redacted:
+        return content or ""
+    return redact_content(allowed, content)
+
+
 def _resolve_user_id(input_json: dict) -> str:
     """env.get_user_id(SERVICE_NAME) (global config < harnesses.cursor.user_id < ARIZE_USER_ID env)
     > payload `user_email` > "".
@@ -235,7 +242,8 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
     if gen_id:
         gen_root_span_save(gen_id, sid)
 
-    prompt = _jq_str(input_json, "prompt", "input", "text")
+    prompt_allowed = env.log_prompts
+    prompt = redact_content(prompt_allowed, _jq_str(input_json, "prompt", "input", "text"))
     model = _jq_str(input_json, "model", "model_name")
     deferred_root = bool(gen_id)
 
@@ -248,6 +256,7 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
                 "conversation_id": conversation_id,
                 "start_ms": now_ms,
                 "prompt": prompt,
+                "prompt_redacted": not prompt_allowed,
                 "model": model,
                 "deferred_root": deferred_root,
             },
@@ -261,7 +270,7 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
 
     root_attrs = {
         "openinference.span.kind": "CHAIN",
-        "input.value": redact_content(env.log_prompts, prompt),
+        "input.value": prompt,
         "session.id": conversation_id,
     }
     if conversation_id:
@@ -303,8 +312,11 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     deferred_root = root_state.get("deferred_root", True) if root_state else True
 
     # Prompt and model output have independent privacy controls.
-    prompt = redact_content(env.log_prompts, prompt)
-    response = redact_content(env.log_model_outputs, response)
+    prompt_was_redacted = bool(root_state and root_state.get("prompt_redacted", False))
+    prompt = _redact_deferred(env.log_prompts, prompt, prompt_was_redacted)
+    response_allowed = env.log_model_outputs
+    response = redact_content(response_allowed, response)
+    prompt_is_redacted = prompt_was_redacted or not env.log_prompts
 
     user_id = _resolve_user_id(input_json)
 
@@ -346,6 +358,8 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
         "trace_id": trace_id,
         "input": prompt,
         "output": response,
+        "input_redacted": prompt_is_redacted,
+        "output_redacted": not response_allowed,
         "model": model,
         "conversation_id": conversation_id,
         "user_id": user_id,
@@ -430,11 +444,13 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
 
     command = _jq_str(input_json, "command", "shell_command")
     cwd = _jq_str(input_json, "cwd", "working_directory")
+    command_allowed = env.log_tool_details
 
     state_push(
         f"shell_{sanitize(gen_id)}",
         {
-            "command": command,
+            "command": redact_content(command_allowed, command),
+            "command_redacted": not command_allowed,
             "cwd": cwd,
             "start_ms": str(now_ms),
             "trace_id": trace_id,
@@ -453,20 +469,23 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     if popped:
         start_ms = popped.get("start_ms", "")
         command = popped.get("command", "")
+        command_was_redacted = bool(popped.get("command_redacted", False))
     else:
         start_ms = ""
         command = ""
+        command_was_redacted = False
     start_ms = start_ms or str(now_ms)
 
     # Override command from after-event if present
     after_cmd = _jq_str(input_json, "command", "shell_command")
     if after_cmd:
         command = after_cmd
+        command_was_redacted = False
 
     output = _jq_str(input_json, "output", "stdout", "result")
     exit_code = _jq_str(input_json, "exit_code", "exitCode")
 
-    command = redact_content(env.log_tool_details, command)
+    command = _redact_deferred(env.log_tool_details, command, command_was_redacted)
     output = redact_content(env.log_tool_content, output)
 
     user_id = _resolve_user_id(input_json)
@@ -510,12 +529,14 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
     tool_input = _jq_str(input_json, "tool_input", "toolInput", "input", "arguments")
     mcp_url = _jq_str(input_json, "url", "server_url", "serverUrl")
     mcp_cmd = _jq_str(input_json, "command")
+    tool_content_allowed = env.log_tool_content
 
     state_push(
         f"mcp_{sanitize(gen_id)}",
         {
             "tool_name": tool_name,
-            "tool_input": redact_content(env.log_tool_content, tool_input),
+            "tool_input": redact_content(tool_content_allowed, tool_input),
+            "tool_input_redacted": not tool_content_allowed,
             "url": redact_content(env.log_tool_details, mcp_url),
             "command": redact_content(env.log_tool_details, mcp_cmd),
             "start_ms": str(now_ms),
@@ -535,7 +556,11 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     if popped:
         start_ms = popped.get("start_ms", "")
         tool_name = popped.get("tool_name", "")
-        tool_input = popped.get("tool_input", "")
+        tool_input = _redact_deferred(
+            env.log_tool_content,
+            popped.get("tool_input", ""),
+            bool(popped.get("tool_input_redacted", False)),
+        )
     else:
         start_ms = ""
         tool_name = ""
@@ -788,8 +813,12 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         entry_conv_id = entry.get("conversation_id")
         llm_attrs = {
             "openinference.span.kind": "LLM",
-            "input.value": entry.get("input", ""),
-            "output.value": entry.get("output", ""),
+            "input.value": _redact_deferred(
+                env.log_prompts, entry.get("input", ""), bool(entry.get("input_redacted", False))
+            ),
+            "output.value": _redact_deferred(
+                env.log_model_outputs, entry.get("output", ""), bool(entry.get("output_redacted", False))
+            ),
         }
         if entry_conv_id:
             llm_attrs["session.id"] = entry_conv_id
@@ -1007,12 +1036,14 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     tool_use_id = _jq_str(input_json, "tool_use_id")
     if not tool_use_id:
         return
+    tool_content_allowed = env.log_tool_content
     state_push(
         _tool_state_key(gen_id, tool_use_id),
         {
             "start_ms": now_ms,
             "tool_name": _jq_str(input_json, "tool_name"),
-            "tool_input": redact_content(env.log_tool_content, _json_string(input_json.get("tool_input"))),
+            "tool_input": redact_content(tool_content_allowed, _json_string(input_json.get("tool_input"))),
+            "tool_input_redacted": not tool_content_allowed,
         },
     )
     log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
@@ -1032,7 +1063,15 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
     sid = span_id_16()
     parent = gen_root_span_get(gen_id) if gen_id else ""
-    tool_input = popped.get("tool_input", "") if popped else ""
+    tool_input = (
+        _redact_deferred(
+            env.log_tool_content,
+            popped.get("tool_input", ""),
+            bool(popped.get("tool_input_redacted", False)),
+        )
+        if popped
+        else ""
+    )
     if not tool_input:
         raw_input = input_json.get("tool_input")
         if raw_input is None:
@@ -1082,7 +1121,15 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     tool_name = _jq_str(input_json, "tool_name") or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
     popped = state_pop(_tool_state_key(gen_id, tool_use_id)) if tool_use_id else None
-    tool_input = popped.get("tool_input", "") if popped else ""
+    tool_input = (
+        _redact_deferred(
+            env.log_tool_content,
+            popped.get("tool_input", ""),
+            bool(popped.get("tool_input_redacted", False)),
+        )
+        if popped
+        else ""
+    )
     if not tool_input:
         tool_input = redact_content(env.log_tool_content, _json_string(input_json.get("tool_input")))
     error_message = redact_content(env.log_tool_content, _jq_str(input_json, "error_message"))

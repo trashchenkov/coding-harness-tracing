@@ -107,8 +107,10 @@ install.bat uninstall cursor
 
 ## Privacy controls
 
-Content capture is on by default. Redact categories independently before
-exporting spans:
+Content capture is on by default. Redact categories independently. Deferred
+content disabled at creation is redacted before it reaches disk-backed state,
+and the current policy is applied again at terminal events before spans are
+exported:
 
 ```bash
 export ARIZE_LOG_PROMPTS=false       # user prompts
