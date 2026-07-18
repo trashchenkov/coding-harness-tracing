@@ -24,7 +24,9 @@ DATA_DIR="$HOME/.arize/harness"
 VENV_DIR="$DATA_DIR/cursor-plugin-venv"
 MARKER="$DATA_DIR/.cursor-plugin.pyproject.sha256"
 LOCK_DIR="$DATA_DIR/.cursor-plugin-bootstrap.lock"
+CLAIM_PATH="$LOCK_DIR/.reclaim"
 LOCK_HELD=0
+CLAIM_HELD=0
 
 # Serialize first-fire installation.  mkdir is atomic on the local filesystems
 # where Cursor keeps plugin data.  A PID file lets a later invocation recover
@@ -37,12 +39,58 @@ release_lock() {
     fi
 }
 
-# Reclaiming is itself serialized inside the existing lock directory. The
-# atomic nested mkdir prevents two contenders that observed the same stale PID
-# from both retaining authority to remove a subsequently acquired live lock.
+release_claim() {
+    if [ "$CLAIM_HELD" -eq 1 ]; then
+        claim_owner=$(readlink "$CLAIM_PATH" 2>/dev/null || true)
+        if [ "$claim_owner" = "$$" ]; then
+            rm -f "$CLAIM_PATH"
+        fi
+        CLAIM_HELD=0
+    fi
+}
+
+acquire_reclaim_claim() {
+    if ln -s "$$" "$CLAIM_PATH" 2>/dev/null; then
+        CLAIM_HELD=1
+        return 0
+    fi
+
+    observed_claim=$(readlink "$CLAIM_PATH" 2>/dev/null || true)
+    case "$observed_claim" in
+        ''|*[!0-9]*) claim_is_stale=1 ;;
+        *)
+            if kill -0 "$observed_claim" 2>/dev/null; then
+                return 1
+            fi
+            claim_is_stale=1
+            ;;
+    esac
+
+    if [ "$claim_is_stale" -eq 1 ]; then
+        quarantine="$LOCK_DIR/.reclaim.stale.$$"
+        rm -rf "$quarantine"
+        if mv "$CLAIM_PATH" "$quarantine" 2>/dev/null; then
+            moved_claim=$(readlink "$quarantine" 2>/dev/null || true)
+            if [ "$moved_claim" = "$observed_claim" ]; then
+                rm -rf "$quarantine"
+            elif [ ! -e "$CLAIM_PATH" ] && [ ! -L "$CLAIM_PATH" ]; then
+                mv "$quarantine" "$CLAIM_PATH" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    if ln -s "$$" "$CLAIM_PATH" 2>/dev/null; then
+        CLAIM_HELD=1
+        return 0
+    fi
+    return 1
+}
+
+# Claiming stale recovery with an atomic PID symlink prevents two contenders
+# from retaining authority to remove a subsequently acquired live outer lock.
+# A dead or invalid claimant is atomically quarantined and can be replaced.
 reclaim_lock_if_stale() {
-    RECLAIM_DIR="$LOCK_DIR/.reclaim"
-    mkdir "$RECLAIM_DIR" 2>/dev/null || return 1
+    acquire_reclaim_claim || return 1
 
     latest_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
     stale=0
@@ -55,14 +103,19 @@ reclaim_lock_if_stale() {
             ;;
     esac
 
-    if [ "$stale" -eq 1 ]; then
+    claim_owner=$(readlink "$CLAIM_PATH" 2>/dev/null || true)
+    if [ "$stale" -eq 1 ] && [ "$claim_owner" = "$$" ]; then
         rm -rf "$LOCK_DIR"
+        CLAIM_HELD=0
         return 0
     fi
 
-    rmdir "$RECLAIM_DIR" 2>/dev/null || true
+    release_claim
     return 1
 }
+
+trap 'release_claim; release_lock' EXIT
+trap 'release_claim; release_lock; exit 0' HUP INT TERM
 
 acquire_lock() {
     attempts=0

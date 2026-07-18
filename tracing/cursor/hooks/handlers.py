@@ -446,6 +446,9 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
     cwd = _jq_str(input_json, "cwd", "working_directory")
     command_allowed = env.log_tool_details
 
+    privacy_key = f"shell_privacy_{sanitize(gen_id)}"
+    while state_pop(privacy_key):
+        pass
     state_push(
         f"shell_{sanitize(gen_id)}",
         {
@@ -464,7 +467,9 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     """Merge with before state, create TOOL span. Replaces bash lines 184-232."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
+    privacy_key = f"shell_privacy_{sanitize(gen_id)}" if gen_id else ""
     popped = state_pop(f"shell_{sanitize(gen_id)}") if gen_id else None
+    privacy_state = state_pop(privacy_key) if privacy_key else None
 
     if popped:
         start_ms = popped.get("start_ms", "")
@@ -472,8 +477,19 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
         command_was_redacted = bool(popped.get("command_redacted", False))
     else:
         start_ms = ""
-        command = ""
-        command_was_redacted = False
+        command = privacy_state.get("command", "") if privacy_state else ""
+        command_was_redacted = bool(privacy_state and privacy_state.get("command_redacted", False))
+
+    # Keep raw-content-free privacy provenance for duplicate terminal
+    # deliveries. A redaction marker may be retained; the command may not.
+    if privacy_key:
+        state_push(
+            privacy_key,
+            {
+                "command_redacted": command_was_redacted,
+                "command": command if command_was_redacted else "",
+            },
+        )
     start_ms = start_ms or str(now_ms)
 
     # Use the after-event command only when creation-time state did not redact
