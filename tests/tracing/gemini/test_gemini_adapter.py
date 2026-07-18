@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import threading
 import time
 
 import pytest
@@ -67,6 +69,21 @@ class TestCheckRequirements:
         assert adapter.check_requirements() is True
         assert state_dir.is_dir()
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_state_directory_and_file_are_private(self, tmp_harness_dir, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("GEMINI_SESSION_ID", "private-state")
+        state_dir = tmp_harness_dir / "state" / "gemini-private"
+        monkeypatch.setattr(adapter, "STATE_DIR", state_dir)
+
+        assert adapter.check_requirements() is True
+        sm = adapter.resolve_session({})
+        sm.set("current_trace_response", "private output")
+
+        assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
+        assert sm.state_file is not None
+        assert stat.S_IMODE(sm.state_file.stat().st_mode) == 0o600
+
     def test_disabled_returns_false(self, tmp_harness_dir, monkeypatch):
         """trace_enabled=False -> returns False, STATE_DIR not created."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "false")
@@ -80,17 +97,64 @@ class TestCheckRequirements:
 
 
 class TestResolveSession:
+    def test_migrates_safe_legacy_state_file(self, gemini_state_dir, disable_env_vars, monkeypatch):
+        """An in-flight pre-namespacing session retains its buffered trace state."""
+        monkeypatch.setenv("GEMINI_SESSION_ID", "upgrade-session")
+        legacy = gemini_state_dir / "state_upgrade-session.json"
+        legacy.write_text(
+            json.dumps({"session_id": "upgrade-session", "current_trace_id": "a" * 32, "trace_count": "2"})
+        )
+
+        sm = adapter.resolve_session({})
+
+        assert sm.state_file == gemini_state_dir / "state_s_upgrade-session.json"
+        assert sm.get("current_trace_id") == "a" * 32
+        assert sm.get("trace_count") == "2"
+        assert not legacy.exists()
+
+    @pytest.mark.parametrize("session_id", ["../../../escape", "nested/path", "x" * 300])
+    def test_unsafe_session_id_paths_stay_in_state_dir(
+        self, gemini_state_dir, disable_env_vars, monkeypatch, session_id
+    ):
+        """Untrusted session IDs cannot escape STATE_DIR or exceed filename limits."""
+        monkeypatch.setenv("GEMINI_SESSION_ID", session_id)
+
+        sm = adapter.resolve_session({})
+
+        assert sm.state_file is not None
+        assert sm._lock_path is not None
+        assert sm.state_file.parent == gemini_state_dir
+        assert sm._lock_path.parent == gemini_state_dir
+        assert sm.state_file.name.startswith("state_h_")
+        assert sm._lock_path.name.startswith(".lock_h_")
+        assert sm.state_file.exists()
+
+    def test_generated_and_literal_key_namespaces_are_disjoint(self, gemini_state_dir, disable_env_vars, monkeypatch):
+        """A literal ID cannot alias a generated hash or fallback key."""
+        monkeypatch.setenv("GEMINI_SESSION_ID", "nested/path")
+        hashed = adapter.resolve_session({}).state_file
+        assert hashed is not None
+
+        monkeypatch.setenv("GEMINI_SESSION_ID", hashed.stem.removeprefix("state_"))
+        literal_hash = adapter.resolve_session({}).state_file
+        monkeypatch.setenv("GEMINI_SESSION_ID", "f_4242")
+        literal_fallback = adapter.resolve_session({}).state_file
+
+        assert literal_hash != hashed
+        assert literal_hash is not None and literal_hash.name.startswith("state_s_h_")
+        assert literal_fallback == gemini_state_dir / "state_s_f_4242.json"
+
     def test_uses_gemini_session_id_env(self, gemini_state_dir, disable_env_vars, monkeypatch):
         """GEMINI_SESSION_ID env var is the preferred session key."""
         monkeypatch.setenv("GEMINI_SESSION_ID", "env-session-42")
         sm = adapter.resolve_session({})
-        assert sm.state_file == gemini_state_dir / "state_env-session-42.json"
+        assert sm.state_file == gemini_state_dir / "state_s_env-session-42.json"
         assert sm.state_file.exists()
 
     def test_falls_back_to_payload_session_id(self, gemini_state_dir, disable_env_vars):
         """Falls back to input_json['session_id'] when env var not set."""
         sm = adapter.resolve_session({"session_id": "payload-sess-99"})
-        assert sm.state_file == gemini_state_dir / "state_payload-sess-99.json"
+        assert sm.state_file == gemini_state_dir / "state_s_payload-sess-99.json"
 
     def test_falls_back_to_grandparent_pid_when_no_session_id(self, gemini_state_dir, disable_env_vars):
         """Falls back to grandparent PID when neither env var nor payload has session_id.
@@ -100,8 +164,9 @@ class TestResolveSession:
         string so subsequent gc passes can liveness-check it.
         """
         sm = adapter.resolve_session({})
+        assert sm.state_file is not None
         assert sm.state_file.exists()
-        key = sm.state_file.stem.replace("state_", "", 1)
+        key = sm.state_file.stem.replace("state_f_", "", 1)
         assert key.isdigit()
         assert int(key) > 0
 
@@ -124,13 +189,13 @@ class TestResolveSession:
         """Lock file is named .lock_{key} in STATE_DIR."""
         monkeypatch.setenv("GEMINI_SESSION_ID", "lock-test")
         sm = adapter.resolve_session({})
-        assert sm._lock_path == gemini_state_dir / ".lock_lock-test"
+        assert sm._lock_path == gemini_state_dir / ".lock_s_lock-test"
 
     def test_env_takes_priority_over_payload(self, gemini_state_dir, disable_env_vars, monkeypatch):
         """GEMINI_SESSION_ID env var takes priority over payload session_id."""
         monkeypatch.setenv("GEMINI_SESSION_ID", "from-env")
         sm = adapter.resolve_session({"session_id": "from-payload"})
-        assert sm.state_file == gemini_state_dir / "state_from-env.json"
+        assert sm.state_file == gemini_state_dir / "state_s_from-env.json"
 
 
 # ── ensure_session_initialized tests ─────────────────────────────────────────
@@ -259,6 +324,33 @@ class TestEnsureSessionInitialized:
 
 
 class TestGcStaleStateFiles:
+    def test_live_dispatch_lock_prevents_collection(self, gemini_state_dir, disable_env_vars):
+        """GC must not unlink state while that session is actively dispatching."""
+        from core.common import FileLock
+
+        key = "s-live-session"
+        state_file = gemini_state_dir / f"state_{key}.json"
+        state_file.write_text("{}")
+        old_time = time.time() - 90000
+        os.utime(state_file, (old_time, old_time))
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_dispatch():
+            with FileLock(gemini_state_dir / f".dispatch_{key}", timeout=2.0, break_on_timeout=False):
+                held.set()
+                release.wait(timeout=5)
+
+        thread = threading.Thread(target=hold_dispatch, daemon=True)
+        thread.start()
+        assert held.wait(timeout=2)
+        try:
+            adapter.gc_stale_state_files()
+            assert state_file.exists()
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
     def test_old_file_removed(self, gemini_state_dir, disable_env_vars):
         """State file older than 24h is removed."""
         state_file = gemini_state_dir / "state_old-session.json"
@@ -277,8 +369,8 @@ class TestGcStaleStateFiles:
         adapter.gc_stale_state_files()
         assert state_file.exists()
 
-    def test_lock_dir_removed(self, gemini_state_dir, disable_env_vars):
-        """Lock dir is removed when state file is removed."""
+    def test_orphan_lock_dir_replaced_by_lock_file(self, gemini_state_dir, disable_env_vars):
+        """A crashed directory lock is reclaimed under dispatch and replaced safely."""
         state_file = gemini_state_dir / "state_old-lock-dir.json"
         state_file.write_text("{}")
         lock_dir = gemini_state_dir / ".lock_old-lock-dir"
@@ -287,10 +379,10 @@ class TestGcStaleStateFiles:
         os.utime(state_file, (old_time, old_time))
         adapter.gc_stale_state_files()
         assert not state_file.exists()
-        assert not lock_dir.exists()
+        assert lock_dir.is_file()
 
-    def test_lock_file_removed(self, gemini_state_dir, disable_env_vars):
-        """Lock file (fcntl-style) is removed when state file is removed."""
+    def test_lock_file_inode_persists(self, gemini_state_dir, disable_env_vars):
+        """fcntl-style lock inode persists so existing waiters cannot split."""
         state_file = gemini_state_dir / "state_old-lock-file.json"
         state_file.write_text("{}")
         lock_file = gemini_state_dir / ".lock_old-lock-file"
@@ -299,7 +391,7 @@ class TestGcStaleStateFiles:
         os.utime(state_file, (old_time, old_time))
         adapter.gc_stale_state_files()
         assert not state_file.exists()
-        assert not lock_file.exists()
+        assert lock_file.exists()
 
     def test_empty_dir_no_error(self, gemini_state_dir, disable_env_vars):
         """Empty STATE_DIR causes no errors."""
@@ -449,6 +541,19 @@ class TestGcPidKeyed:
         adapter.gc_stale_state_files()
         assert not state_file.exists()
 
+    def test_namespaced_dead_pid_state_file_removed(self, gemini_state_dir, disable_env_vars, monkeypatch):
+        """Current f_<pid> fallback files retain PID-liveness GC semantics."""
+        state_file = gemini_state_dir / "state_f_999999.json"
+        state_file.write_text("{}")
+        lock_file = gemini_state_dir / ".lock_f_999999"
+        lock_file.write_text("")
+        monkeypatch.setattr(adapter, "_is_pid_alive", lambda pid: False)
+
+        adapter.gc_stale_state_files()
+
+        assert not state_file.exists()
+        assert lock_file.exists()
+
     def test_alive_pid_state_file_kept(self, gemini_state_dir, disable_env_vars, monkeypatch):
         """A state file keyed by an alive PID is kept regardless of mtime."""
         state_file = gemini_state_dir / "state_42.json"
@@ -472,7 +577,7 @@ class TestResolveSessionWindowsFallback:
         ppid = 4242
         monkeypatch.setattr(adapter.os, "getppid", lambda: ppid)
         sm = adapter.resolve_session({})
-        assert sm.state_file == gemini_state_dir / f"state_{ppid}.json"
+        assert sm.state_file == gemini_state_dir / f"state_f_{ppid}.json"
 
 
 # ── module-level log-file env wiring ─────────────────────────────────────────

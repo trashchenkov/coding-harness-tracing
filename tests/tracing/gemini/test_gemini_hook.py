@@ -239,6 +239,31 @@ class TestSessionEnd:
         assert state.get("current_trace_id") is None
         assert state.get("current_trace_span_id") is None
 
+    def test_failsafe_root_preserves_last_visible_model_output(self, mock_resolve, state, captured_spans):
+        """Cancellation closes the root with the partial answer, not a synthetic replacement."""
+        state.set("current_trace_id", "t" * 32)
+        state.set("current_trace_span_id", "s" * 16)
+        state.set("current_trace_start_time", "1000")
+        state.set("current_model_call_id", "mc-cancel")
+        state.set("model_mc-cancel_start", "1001")
+        state.set("model_mc-cancel_response", "partial answer")
+
+        with (
+            mock.patch("tracing.gemini.hooks.handlers.log"),
+            mock.patch("tracing.gemini.hooks.handlers.gc_stale_state_files"),
+        ):
+            _handle_session_end({})
+
+        assert len(captured_spans) == 2
+        root = next(
+            span
+            for span in captured_spans
+            if _get_span_attrs(span)["openinference.span.kind"]["stringValue"] == "CHAIN"
+        )
+        attrs = _get_span_attrs(root)
+        assert attrs["output.value"]["stringValue"] == "partial answer"
+        assert attrs["gemini.turn.close_reason"]["stringValue"] == "SessionEnd"
+
 
 # ---------------------------------------------------------------------------
 # before_agent tests
@@ -347,6 +372,29 @@ class TestAfterAgent:
         _handle_after_agent({"llm_response": {"candidates": [{"content": {"parts": [{"text": "resp 2"}]}}]}})
         assert _get_span_attrs(captured_spans[1])["output.value"]["stringValue"] == "resp 2"
 
+    @pytest.mark.parametrize("empty_response", [{}, []])
+    def test_empty_response_falls_back_to_latest_model_output(
+        self, mock_resolve, state, captured_spans, empty_response
+    ):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_trace_response", "latest partial")
+
+        _handle_after_agent({"prompt_response": empty_response})
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["output.value"]["stringValue"] == "latest partial"
+
+    def test_empty_preferred_response_does_not_mask_populated_alias(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_trace_response", "stale partial")
+
+        _handle_after_agent({"prompt_response": {}, "response": {"content": "real final"}})
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["output.value"]["stringValue"] == "real final"
+
     def test_redacts_response(self, mock_resolve, state, captured_spans, monkeypatch):
         """Response is redacted when log_prompts is False."""
         monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
@@ -443,7 +491,7 @@ class TestBeforeModel:
 def _final_chunk(extra: dict = None, p: int = 10, c: int = 5) -> dict:
     """Build an AfterModel payload that includes usage tokens, marking it as
     the final streaming chunk so _handle_after_model flushes immediately."""
-    payload = {"usageMetadata": {"promptTokenCount": p, "candidatesTokenCount": c}}
+    payload = {"isFinal": True, "usageMetadata": {"promptTokenCount": p, "candidatesTokenCount": c}}
     if extra:
         payload.update(extra)
     return payload
@@ -463,6 +511,7 @@ class TestAfterModel:
         state.set("model_mc-1_prompt", json.dumps([{"role": "user", "content": "what is 2+2?"}]))
         _handle_after_model(
             {
+                "isFinal": True,
                 "model": "gemini-2.5-pro",
                 "llm_response": {"candidates": [{"content": {"parts": ["4"]}}]},
                 "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
@@ -475,9 +524,76 @@ class TestAfterModel:
         assert attrs["llm.model_name"]["stringValue"] == "gemini-2.5-pro"
         assert attrs["llm.token_count.prompt"]["intValue"] == 10
         assert attrs["llm.token_count.completion"]["intValue"] == 5
-        assert attrs["llm.token_count.total"]["intValue"] == 15
+        assert "llm.token_count.total" not in attrs
         assert attrs["input.value"]["stringValue"] == json.dumps([{"role": "user", "content": "what is 2+2?"}])
         assert attrs["output.value"]["stringValue"] == "4"
+
+    def test_uses_authoritative_total_token_count(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-total")
+        state.set("model_mc-total_start", "1000")
+
+        _handle_after_model(
+            {
+                "isFinal": True,
+                "model_call_id": "mc-total",
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 14,
+                },
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.total"]["intValue"] == 14
+
+    def test_preserves_authoritative_zero_total(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-zero-total")
+        state.set("model_mc-zero-total_start", "1000")
+
+        _handle_after_model(
+            {
+                "isFinal": True,
+                "model_call_id": "mc-zero-total",
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 0,
+                },
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.total"]["intValue"] == 0
+
+    def test_reasoning_tokens_are_completion_detail_and_in_completion_total(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-reasoning")
+        state.set("model_mc-reasoning_start", "1000")
+
+        _handle_after_model(
+            {
+                "isFinal": True,
+                "model_call_id": "mc-reasoning",
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 20,
+                    "totalTokenCount": 35,
+                },
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.prompt"]["intValue"] == 10
+        assert attrs["llm.token_count.completion"]["intValue"] == 25
+        assert attrs["llm.token_count.completion_details.reasoning"]["intValue"] == 20
+        assert attrs["llm.token_count.total"]["intValue"] == 35
 
     def test_streaming_chunks_coalesce_into_one_span(self, mock_resolve, state, captured_spans):
         """Multiple AfterModel events for one call concatenate into a single span."""
@@ -492,9 +608,10 @@ class TestAfterModel:
         _handle_after_model({"llm_response": {"text": "world"}, "model_call_id": "mc-1"})
         assert captured_spans == []
 
-        # Chunk 4: final chunk with tokens — flushes the accumulated span
+        # Chunk 4: explicit final chunk with tokens flushes the accumulated span
         _handle_after_model(
             {
+                "isFinal": True,
                 "llm_response": {"text": ""},
                 "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 3},
                 "model_call_id": "mc-1",
@@ -506,6 +623,138 @@ class TestAfterModel:
         assert attrs["llm.model_name"]["stringValue"] == "gemini-3-flash"
         assert attrs["llm.token_count.completion"]["intValue"] == 3
 
+    def test_metadata_only_preferred_alias_does_not_mask_final_accounting(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-alias")
+        state.set("model_mc-alias_start", "1000")
+
+        _handle_after_model(
+            {
+                "model_call_id": "mc-alias",
+                "llm_response": {"usageMetadata": {}},
+                "response": {
+                    "isFinal": True,
+                    "content": "answer",
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 10,
+                    },
+                },
+            }
+        )
+
+        assert len(captured_spans) == 1
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["output.value"]["stringValue"] == "answer"
+        assert attrs["llm.token_count.prompt"]["intValue"] == 7
+        assert attrs["llm.token_count.completion"]["intValue"] == 3
+        assert attrs["llm.token_count.total"]["intValue"] == 10
+
+    def test_partial_preferred_usage_resolves_missing_counters_from_later_alias(self):
+        payload = {
+            "llm_response": {"usageMetadata": {"promptTokenCount": 7}},
+            "response": {
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 10,
+                }
+            },
+        }
+        assert handlers_mod._extract_token_updates(payload) == (7, 3, None, 10)
+
+    @pytest.mark.parametrize(
+        "payload,expected",
+        [
+            ({"finishReason": True}, False),
+            ({"candidates": [{"finishReason": ["STOP"]}]}, False),
+            ({"isFinal": False, "done": True}, True),
+            ({"candidates": [{"finishReason": "STOP"}]}, True),
+            ({"response": {"candidates": [{"finishReason": "STOP"}]}}, True),
+        ],
+    )
+    def test_model_finality_validates_all_markers_consistently(self, payload, expected):
+        assert handlers_mod._is_model_final(payload) is expected
+
+    @pytest.mark.parametrize(
+        "usage,expected,present,absent",
+        [
+            (None, {}, set(), {"prompt", "completion", "total"}),
+            (
+                {"promptTokenCount": 7},
+                {"prompt": 7},
+                {"prompt"},
+                {"completion", "total"},
+            ),
+            (
+                {"promptTokenCount": 7, "candidatesTokenCount": 3},
+                {"prompt": 7, "completion": 3},
+                {"prompt", "completion"},
+                {"total"},
+            ),
+        ],
+    )
+    def test_flush_exports_only_explicit_token_counters(
+        self, mock_resolve, state, captured_spans, usage, expected, present, absent
+    ):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "m")
+        state.set("model_m_start", "1000")
+        payload = {"model_call_id": "m", "response": {"isFinal": True, "content": "answer"}}
+        if usage is not None:
+            payload["response"]["usageMetadata"] = usage
+
+        _handle_after_model(payload)
+
+        attrs = _get_span_attrs(captured_spans[0])
+        for name in present:
+            assert attrs[f"llm.token_count.{name}"]["intValue"] == expected[name]
+        for name in absent:
+            assert f"llm.token_count.{name}" not in attrs
+
+    @pytest.mark.parametrize("alias", ["llmResponse", "modelResponse"])
+    def test_camel_case_response_alias_preserves_visible_output(self, mock_resolve, state, captured_spans, alias):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "m")
+        state.set("model_m_start", "1000")
+
+        _handle_after_model(
+            {
+                "model_call_id": "m",
+                alias: {"content": "VISIBLE", "finishReason": "STOP"},
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["output.value"]["stringValue"] == "VISIBLE"
+
+    def test_empty_final_chunk_preserves_response_for_after_agent(self, mock_resolve, state, captured_spans):
+        """Usage-only final chunks cannot replace the latest visible model output."""
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-response")
+        state.set("model_mc-response_start", "1000")
+
+        _handle_after_model({"model_call_id": "mc-response", "llm_response": {"content": "real partial"}})
+        _handle_after_model(
+            {
+                "model_call_id": "mc-response",
+                "isFinal": True,
+                "llm_response": {},
+                "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1},
+            }
+        )
+
+        assert _get_span_attrs(captured_spans[0])["output.value"]["stringValue"] == "real partial"
+        assert state.get("current_trace_response") == "real partial"
+
+        _handle_after_agent({"prompt_response": {}})
+        assert _get_span_attrs(captured_spans[1])["output.value"]["stringValue"] == "real partial"
+
     def test_non_final_chunk_does_not_emit(self, mock_resolve, state, captured_spans):
         """AfterModel with no tokens accumulates into state without emitting."""
         state.set("current_trace_id", "a" * 32)
@@ -516,6 +765,97 @@ class TestAfterModel:
         assert captured_spans == []
         # current_model_call_id is preserved so the next chunk continues the same span
         assert state.get("current_model_call_id") == "mc-1"
+
+    def test_usage_without_explicit_finality_is_buffered(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-usage")
+        state.set("model_mc-usage_start", "1000")
+
+        _handle_after_model(
+            {
+                "model_call_id": "mc-usage",
+                "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3},
+            }
+        )
+
+        assert captured_spans == []
+        assert state.get("model_mc-usage_p_tokens") == "7"
+
+    def test_empty_terminal_usage_preserves_prior_counts(self, mock_resolve, state, captured_spans):
+        """A terminal marker with an empty usage object must not erase earlier usage."""
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-preserve")
+        state.set("model_mc-preserve_start", "1000")
+
+        _handle_after_model(
+            {
+                "model_call_id": "mc-preserve",
+                "usageMetadata": {
+                    "promptTokenCount": 7,
+                    "candidatesTokenCount": 3,
+                    "totalTokenCount": 14,
+                },
+            }
+        )
+        _handle_after_model(
+            {
+                "model_call_id": "mc-preserve",
+                "isFinal": True,
+                "usageMetadata": {},
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.prompt"]["intValue"] == 7
+        assert attrs["llm.token_count.completion"]["intValue"] == 3
+        assert attrs["llm.token_count.total"]["intValue"] == 14
+
+    def test_partial_terminal_usage_updates_only_present_count(self, mock_resolve, state, captured_spans):
+        """Later partial usage updates only the counters explicitly present."""
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-partial")
+        state.set("model_mc-partial_start", "1000")
+        state.set("model_mc-partial_p_tokens", "7")
+        state.set("model_mc-partial_c_tokens", "2")
+        state.set("model_mc-partial_t_tokens", "13")
+
+        _handle_after_model(
+            {
+                "model_call_id": "mc-partial",
+                "isFinal": True,
+                "usageMetadata": {"candidatesTokenCount": 3},
+            }
+        )
+
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.prompt"]["intValue"] == 7
+        assert attrs["llm.token_count.completion"]["intValue"] == 3
+        assert attrs["llm.token_count.total"]["intValue"] == 13
+
+    def test_explicit_finality_flushes_even_with_zero_tokens(self, mock_resolve, state, captured_spans):
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        state.set("current_model_call_id", "mc-zero")
+        state.set("model_mc-zero_start", "1000")
+
+        _handle_after_model(
+            {
+                "model_call_id": "mc-zero",
+                "isFinal": True,
+                "usageMetadata": {
+                    "promptTokenCount": 0,
+                    "candidatesTokenCount": 0,
+                    "totalTokenCount": 0,
+                },
+            }
+        )
+
+        assert len(captured_spans) == 1
+        attrs = _get_span_attrs(captured_spans[0])
+        assert attrs["llm.token_count.total"]["intValue"] == 0
 
     def test_span_name_includes_model(self, mock_resolve, state, captured_spans):
         """Span name is 'LLM: {model_name}' when model is provided."""
@@ -602,9 +942,8 @@ class TestAfterModel:
         assert state.get("model_fallback-mc_start") is None
         assert state.get("current_model_call_id") is None
 
-    def test_after_agent_flushes_pending_call_with_zero_tokens(self, mock_resolve, state, captured_spans):
-        """A model call that never received a final chunk is flushed by AfterAgent
-        with whatever it accumulated -- including zero token counts."""
+    def test_after_agent_flushes_pending_call_without_fabricated_tokens(self, mock_resolve, state, captured_spans):
+        """AfterAgent flushes a pending call without inventing missing counters."""
         from tracing.gemini.hooks.handlers import _handle_after_agent
 
         state.set("current_trace_id", "a" * 32)
@@ -623,8 +962,9 @@ class TestAfterModel:
         assert len(captured_spans) == 2
         llm_attrs = _get_span_attrs(captured_spans[0])
         assert llm_attrs["openinference.span.kind"]["stringValue"] == "LLM"
-        assert llm_attrs["llm.token_count.prompt"]["intValue"] == 0
-        assert llm_attrs["llm.token_count.completion"]["intValue"] == 0
+        assert "llm.token_count.prompt" not in llm_attrs
+        assert "llm.token_count.completion" not in llm_attrs
+        assert "llm.token_count.total" not in llm_attrs
 
     def test_accumulates_text_from_candidates(self, mock_resolve, state, captured_spans):
         """Extracts text from nested candidates structure across chunks."""
@@ -661,6 +1001,9 @@ class TestAfterModel:
                 "model_call_id": "mc-1",
             }
         )
+        # This captured payload has no terminal marker. AfterAgent is the
+        # authoritative fallback boundary that flushes the buffered LLM span.
+        _handle_after_agent({"response": "done"})
         attrs = _get_span_attrs(captured_spans[0])
         assert attrs["output.value"]["stringValue"] == "Actual response content"
 
@@ -725,18 +1068,24 @@ class TestBeforeTool:
         assert val is not None
         assert int(val) > 0
 
-    def test_falls_back_to_tool_name(self, mock_resolve, state):
-        """Falls back to tool_name when tool_call_id is missing."""
-        _handle_before_tool({"tool_name": "run_shell_command"})
-        val = state.get("tool_run_shell_command_start")
-        assert val is not None
-        assert int(val) > 0
+    def test_fingerprints_tool_name_and_empty_input(self, mock_resolve, state):
+        """Without an upstream call ID, records a FIFO under the payload fingerprint."""
+        payload = {"tool_name": "run_shell_command"}
+        _handle_before_tool(payload)
+        key, has_call_id = handlers_mod._tool_pending_key(payload)
+        pending = json.loads(state.get(key))
+        assert has_call_id is False
+        assert len(pending) == 1
+        assert int(pending[0]) > 0
 
-    def test_falls_back_to_unknown(self, mock_resolve, state):
-        """Falls back to 'unknown' when both tool_call_id and tool_name are missing."""
-        _handle_before_tool({})
-        val = state.get("tool_unknown_start")
-        assert val is not None
+    def test_fingerprints_unknown_tool(self, mock_resolve, state):
+        """Missing tool metadata still uses the deterministic pending FIFO."""
+        payload = {}
+        _handle_before_tool(payload)
+        key, has_call_id = handlers_mod._tool_pending_key(payload)
+        pending = json.loads(state.get(key))
+        assert has_call_id is False
+        assert len(pending) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +1166,25 @@ class TestAfterTool:
         assert span["startTimeUnixNano"] == "1000000000000"
         # Start time key should be cleaned up
         assert state.get("tool_tc-1_start") is None
+
+    def test_overlapping_same_name_tools_correlate_by_input(self, mock_resolve, state, captured_spans, monkeypatch):
+        """Official Gemini payloads omit call IDs; overlapping calls retain distinct starts."""
+        state.set("current_trace_id", "a" * 32)
+        state.set("current_trace_span_id", "b" * 16)
+        timestamps = iter([1000, 2000, 3000, 4000, 5000])
+        monkeypatch.setattr("tracing.gemini.hooks.handlers.get_timestamp_ms", lambda: next(timestamps))
+
+        first = {"tool_name": "read_file", "tool_input": {"file_path": "/first"}}
+        second = {"tool_name": "read_file", "tool_input": {"file_path": "/second"}}
+        _handle_before_tool(first)
+        _handle_before_tool(second)
+        _handle_after_tool({**first, "tool_response": {"llmContent": "one"}})
+        _handle_after_tool({**second, "tool_response": {"llmContent": "two"}})
+
+        assert [_get_span(item)["startTimeUnixNano"] for item in captured_spans] == [
+            "1000000000",
+            "2000000000",
+        ]
 
     def test_session_and_project_attrs(self, mock_resolve, state, captured_spans):
         """TOOL span includes session.id and project.name."""
@@ -1180,6 +1548,62 @@ ENTRY_POINTS = [
 
 
 class TestEntryPoints:
+    def test_serializes_complete_handler_dispatch(self):
+        """Every wrapper holds a non-breaking per-session lock around its handler."""
+        input_data = {"session_id": "parallel-session", "prompt": "test"}
+        lock = mock.MagicMock()
+
+        def assert_locked(_payload):
+            lock.__enter__.assert_called_once_with()
+
+        with (
+            mock.patch("tracing.gemini.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.gemini.hooks.handlers._read_stdin", return_value=input_data),
+            mock.patch("tracing.gemini.hooks.handlers._handle_before_agent", side_effect=assert_locked),
+            mock.patch("tracing.gemini.hooks.handlers._print_response"),
+            mock.patch("tracing.gemini.hooks.handlers.FileLock", return_value=lock) as lock_cls,
+        ):
+            before_agent()
+
+        lock_cls.assert_called_once()
+        _, kwargs = lock_cls.call_args
+        assert kwargs == {"timeout": 5.0, "break_on_timeout": False}
+        assert lock_cls.call_args.args[0].name.startswith(".dispatch_")
+        lock.__exit__.assert_called_once()
+
+    def test_network_export_runs_after_dispatch_lock_release(self):
+        """Slow synchronous exporters must not consume the serialized state budget."""
+        held = False
+        exported = []
+
+        class TrackingLock:
+            def __enter__(self):
+                nonlocal held
+                held = True
+
+            def __exit__(self, *_args):
+                nonlocal held
+                held = False
+
+        def handler(_payload):
+            handlers_mod._send_span_async({"span": "queued"})
+
+        def export(span):
+            assert held is False
+            exported.append(span)
+
+        with (
+            mock.patch("tracing.gemini.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.gemini.hooks.handlers._read_stdin", return_value={}),
+            mock.patch("tracing.gemini.hooks.handlers._print_response"),
+            mock.patch("tracing.gemini.hooks.handlers.FileLock", return_value=TrackingLock()),
+            mock.patch("tracing.gemini.hooks.handlers.send_span", side_effect=export),
+            mock.patch.dict("os.environ", {"ARIZE_DISABLE_FORK": "true"}),
+        ):
+            handlers_mod._run_hook("test", handler)
+
+        assert exported == [{"span": "queued"}]
+
     @pytest.mark.parametrize("name,entry_fn,handler_name", ENTRY_POINTS)
     def test_happy_path_calls_handler(self, name, entry_fn, handler_name):
         """Entry point calls the corresponding _handle_* with parsed stdin JSON."""
@@ -1266,6 +1690,7 @@ class TestTurnFlow:
         _handle_before_model({"model_call_id": "mc-1", "messages": [{"role": "user", "content": "test"}]})
         _handle_after_model(
             {
+                "isFinal": True,
                 "model": "gemini-2.5-pro",
                 "response": {"content": "answer", "usage": {"prompt_tokens": 5, "candidates_tokens": 3}},
                 "model_call_id": "mc-1",
@@ -1375,7 +1800,7 @@ class TestSessionStartIntegration:
         _handle_session_start({"session_id": "sess-123", "cwd": "/tmp/proj"})
 
         # State file is keyed by the payload session_id (resolve_session key).
-        state_file = gemini_state_dir / "state_sess-123.json"
+        state_file = gemini_state_dir / "state_s_sess-123.json"
         assert state_file.exists()
 
         data = json.loads(state_file.read_text())
@@ -1396,7 +1821,7 @@ class TestSessionStartIntegration:
 
         _handle_session_start({})
 
-        state_file = gemini_state_dir / "state_env-sid.json"
+        state_file = gemini_state_dir / "state_s_env-sid.json"
         assert state_file.exists()
 
     def test_pid_fallback_when_both_missing(self, tmp_harness_dir, gemini_state_dir, monkeypatch, captured_spans_real):
@@ -1411,7 +1836,7 @@ class TestSessionStartIntegration:
 
         state_files = list(gemini_state_dir.glob("state_*.json"))
         assert len(state_files) == 1
-        key = state_files[0].stem.replace("state_", "", 1)
+        key = state_files[0].stem.replace("state_f_", "", 1)
         assert key.isdigit()
         assert int(key) > 0
 
@@ -1449,12 +1874,32 @@ class TestExtractTokensEdgeCases:
                 }
             }
         }
-        assert _extract_tokens(payload) == (0, 0)
+        assert _extract_tokens(payload) == (0, 0, 0)
+
+    def test_parses_each_counter_independently_and_preserves_authoritative_total(self):
+        payload = {
+            "usageMetadata": {
+                "promptTokenCount": "not-a-number",
+                "candidatesTokenCount": 4,
+                "totalTokenCount": 9,
+            }
+        }
+        assert _extract_tokens(payload) == (0, 4, 9)
+
+    def test_rejects_boolean_and_negative_counters_independently(self):
+        payload = {
+            "usageMetadata": {
+                "promptTokenCount": True,
+                "candidatesTokenCount": -3,
+                "totalTokenCount": 8,
+            }
+        }
+        assert _extract_tokens(payload) == (0, 0, 8)
 
     def test_pulls_from_top_level_usage_metadata(self):
         """Usage can also live at the top level of the payload."""
         payload = {"usage_metadata": {"prompt_token_count": 7, "candidates_token_count": 3}}
-        assert _extract_tokens(payload) == (7, 3)
+        assert _extract_tokens(payload) == (7, 3, 0)
 
 
 # ---------------------------------------------------------------------------

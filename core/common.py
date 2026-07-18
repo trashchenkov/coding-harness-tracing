@@ -820,9 +820,10 @@ class FileLock:
     - mkdir fallback: creates lock_path as a directory (matches bash behavior)
     """
 
-    def __init__(self, lock_path: Path, timeout: float = 3.0) -> None:
+    def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True) -> None:
         self.lock_path = Path(lock_path)
         self.timeout = timeout
+        self.break_on_timeout = break_on_timeout
         self._fd: Optional[IO[str]] = None
         self._method = _LOCK_IMPL
 
@@ -854,8 +855,11 @@ class FileLock:
                 return
             except (OSError, BlockingIOError):
                 if time.monotonic() >= deadline:
-                    # Force-acquire: close, remove, reopen
                     self._fd.close()
+                    self._fd = None
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
+                    # Force-acquire: remove and reopen the lock inode.
                     try:
                         self.lock_path.unlink(missing_ok=True)
                     except OSError:
@@ -887,6 +891,9 @@ class FileLock:
             except (OSError, IOError):
                 if time.monotonic() >= deadline:
                     self._fd.close()
+                    self._fd = None
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                     try:
                         self.lock_path.unlink(missing_ok=True)
                     except OSError:
@@ -916,6 +923,8 @@ class FileLock:
                 return
             except FileExistsError:
                 if time.monotonic() >= deadline:
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                     # Force-acquire: remove and recreate (matches bash lines 67-70)
                     try:
                         shutil.rmtree(self.lock_path)
@@ -962,19 +971,24 @@ class StateManager:
         If file exists but is corrupted, overwrite with empty dict.
         Matches bash init_state() at common.sh:49-59.
         """
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(self.state_dir, 0o700)
         if self.state_file is None:
             return
-        if not self.state_file.exists():
-            self._write({})
-        else:
-            # Validate existing file; overwrite if corrupted
-            try:
-                data = self._read()
-                if not isinstance(data, dict):
-                    self._write({})
-            except Exception:
+        with self._lock():
+            if self.state_file.exists() and os.name != "nt":
+                os.chmod(self.state_file, 0o600)
+            if not self.state_file.exists():
                 self._write({})
+            else:
+                # Validate existing file; overwrite if corrupted
+                try:
+                    data = self._read()
+                    if not isinstance(data, dict):
+                        self._write({})
+                except Exception:
+                    self._write({})
 
     def get(self, key: str) -> "str | None":
         """Read a value by key. Returns None if key missing or file missing.
@@ -1041,10 +1055,10 @@ class StateManager:
     def _lock(self) -> FileLock:
         """Return a FileLock for this state file."""
         if self._lock_path is not None:
-            return FileLock(self._lock_path)
+            return FileLock(self._lock_path, break_on_timeout=False)
         if self.state_file is None:
             raise RuntimeError("StateManager has neither lock_path nor state_file")
-        return FileLock(self.state_file.with_suffix(".lock"))
+        return FileLock(self.state_file.with_suffix(".lock"), break_on_timeout=False)
 
     def _read_safe(self) -> dict:
         """Read state file, return {} on any error (missing, corrupt, permission)."""
@@ -1069,10 +1083,19 @@ class StateManager:
         """Write dict to state file atomically via tmp+rename."""
         if self.state_file is None:
             return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         tmp = self.state_file.with_suffix(f".tmp.{os.getpid()}")
         try:
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                if os.name != "nt":
+                    os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    fd = -1
+                    f.write(json.dumps(data, indent=2))
+            finally:
+                if fd >= 0:
+                    os.close(fd)
             tmp.replace(self.state_file)
         except Exception:
             try:

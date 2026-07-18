@@ -224,6 +224,32 @@ class TestFileLock:
         released_event.set()
         t.join(timeout=5)
 
+    def test_timeout_without_breaking_preserves_original_holder(self, tmp_path):
+        """The opt-out mode times out without deleting another owner's lock."""
+        lock_path = tmp_path / "test.lock"
+        hold_event = threading.Event()
+        released_event = threading.Event()
+
+        def hold_forever():
+            with FileLock(lock_path, timeout=5.0):
+                hold_event.set()
+                released_event.wait(timeout=10)
+
+        t = threading.Thread(target=hold_forever, daemon=True)
+        t.start()
+        assert hold_event.wait(timeout=5)
+
+        start = time.monotonic()
+        with pytest.raises(TimeoutError, match="timed out acquiring lock"):
+            with FileLock(lock_path, timeout=0.3, break_on_timeout=False):
+                pytest.fail("contending lock must not enter the critical section")
+
+        assert time.monotonic() - start >= 0.2
+        assert t.is_alive()
+        released_event.set()
+        t.join(timeout=5)
+        assert not t.is_alive()
+
     def test_creates_parent_directories(self, tmp_path):
         """FileLock creates parent directories if missing."""
         lock_path = tmp_path / "deep" / "nested" / "dir" / "test.lock"
@@ -266,6 +292,31 @@ class TestStateManager:
         assert sm.state_file.exists()
         data = json.loads(sm.state_file.read_text())
         assert data == {}
+
+    def test_init_serializes_validation_and_creation(self, tmp_path):
+        """Initialization holds the state lock so it cannot erase a concurrent write."""
+        sm = self._make_sm(tmp_path)
+        lock = mock.MagicMock()
+        with mock.patch.object(sm, "_lock", return_value=lock):
+            sm.init_state()
+        lock.__enter__.assert_called_once_with()
+        lock.__exit__.assert_called_once()
+
+    def test_state_lock_never_breaks_live_owner_on_timeout(self, tmp_path):
+        """A timeout must drop the mutation rather than permit concurrent RMW writes."""
+        sm = self._make_sm(tmp_path)
+        assert sm._lock().break_on_timeout is False
+
+    def test_state_mutation_drops_lock_timeout_without_writing(self, tmp_path):
+        sm = self._make_sm(tmp_path)
+        sm.init_state()
+        lock = mock.MagicMock()
+        lock.__enter__.side_effect = TimeoutError("held")
+
+        with mock.patch.object(sm, "_lock", return_value=lock):
+            sm.set("contender", "must-not-write")
+
+        assert sm.get("contender") is None
 
     def test_init_recovers_corrupted(self, tmp_path):
         """init_state() recovers corrupted file."""

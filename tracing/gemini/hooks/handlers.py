@@ -6,11 +6,13 @@ in a try/except, and prints {} to stdout in finally.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 
 from core.common import (
+    FileLock,
     build_span,
     debug_dump,
     env,
@@ -26,6 +28,7 @@ from tracing.gemini.hooks.adapter import (
     SCOPE_NAME,
     SERVICE_NAME,
     check_requirements,
+    dispatch_lock_path,
     ensure_session_initialized,
     gc_stale_state_files,
     resolve_session,
@@ -63,6 +66,20 @@ def _get_robust(data: dict, *keys, default=None):
     return default
 
 
+def _iter_robust_values(data: dict, *keys):
+    """Yield every present snake/camel variant without first-key masking."""
+    seen = set()
+    for key in keys:
+        variants = [key]
+        if "_" in key:
+            parts = key.split("_")
+            variants.append(parts[0] + "".join(x.capitalize() for x in parts[1:]))
+        for variant in variants:
+            if variant in data and variant not in seen:
+                seen.add(variant)
+                yield data[variant]
+
+
 def _extract_text(obj) -> str:
     """Extract string content from various nested structures.
 
@@ -93,18 +110,149 @@ def _extract_text(obj) -> str:
     return str(obj)
 
 
-def _extract_tokens(input_json: dict) -> tuple[int, int]:
-    """Extract prompt and completion tokens from various usage schemas."""
-    resp = _get_robust(input_json, "llm_response", "response", "model_response") or {}
-    usage = _get_robust(resp, "usage_metadata", "usage") or _get_robust(input_json, "usage_metadata", "usage") or {}
+def _extract_response_text(value) -> str:
+    """Extract only recognized model-response content, ignoring metadata-only mappings."""
+    if value is None or value == {} or value == []:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_extract_response_text(item) for item in value)))
+    if isinstance(value, dict):
+        for key in ("content", "text", "parts", "candidates", "message"):
+            if key in value:
+                text = _extract_response_text(value[key])
+                if text:
+                    return text
+        return ""
+    return _extract_text(value)
 
-    prompt = _get_robust(usage, "prompt_token_count", "prompt_tokens", default=0)
-    completion = _get_robust(usage, "candidates_token_count", "candidates_tokens", "output_tokens", default=0)
 
+def _first_response_text(input_json: dict, *keys: str) -> str:
+    """Return the first alias containing recognized, non-empty response content."""
+    for value in _iter_robust_values(input_json, *keys):
+        text = _extract_response_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _response_aliases(input_json: dict):
+    """Yield mapping-valued model response aliases in contract priority order."""
+    seen = set()
+    for key in ("llm_response", "response", "model_response"):
+        for value in _iter_robust_values(input_json, key):
+            if isinstance(value, dict) and id(value) not in seen:
+                seen.add(id(value))
+                yield value
+
+
+def _usage_objects(input_json: dict):
+    """Yield all explicit usage mappings in response-alias priority order."""
+    for source in (*_response_aliases(input_json), input_json):
+        for usage in _iter_robust_values(source, "usage_metadata", "usage"):
+            if isinstance(usage, dict):
+                yield usage
+
+
+def _usage_object(input_json: dict) -> dict | None:
+    """Return the first explicit usage mapping, including an empty mapping."""
+    return next(_usage_objects(input_json), None)
+
+
+def _extract_token_updates(input_json: dict) -> tuple[int | None, int | None, int | None, int | None]:
+    """Resolve each valid token counter independently across response aliases."""
+    usages = list(_usage_objects(input_json))
+    if not usages:
+        return None, None, None, None
+
+    def _valid(*names: str) -> int | None:
+        for usage in usages:
+            for value in _iter_robust_values(usage, *names):
+                if type(value) is int and value >= 0:
+                    return value
+        return None
+
+    return (
+        _valid("prompt_token_count", "prompt_tokens"),
+        _valid("candidates_token_count", "candidates_tokens", "output_tokens"),
+        _valid("thoughts_token_count", "reasoning_tokens"),
+        _valid("total_token_count", "total_tokens"),
+    )
+
+
+def _extract_tokens(input_json: dict) -> tuple[int, int, int]:
+    """Extract prompt, completion (including reasoning), and authoritative total."""
+    prompt, candidates, reasoning, total = _extract_token_updates(input_json)
+    return prompt or 0, (candidates or 0) + (reasoning or 0), total or 0
+
+
+def _has_usage(input_json: dict) -> bool:
+    """Whether this event explicitly carries a usage object, including empty/zeros."""
+    return _usage_object(input_json) is not None
+
+
+def _is_model_final(input_json: dict) -> bool:
+    """Detect well-typed terminal markers consistently across response aliases."""
+    for source in (input_json, *_response_aliases(input_json)):
+        if any(value is True for value in _iter_robust_values(source, "is_final", "final", "done")):
+            return True
+        if any(
+            isinstance(value, str) and bool(value.strip()) for value in _iter_robust_values(source, "finish_reason")
+        ):
+            return True
+        for candidates in _iter_robust_values(source, "candidates"):
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                if any(
+                    isinstance(value, str) and bool(value.strip())
+                    for value in _iter_robust_values(candidate, "finish_reason")
+                ):
+                    return True
+    return False
+
+
+def _tool_pending_key(input_json: dict) -> tuple[str, bool]:
+    """Return a stable pending-call key and whether Gemini supplied a call ID."""
+    call_id = _get_robust(input_json, "tool_call_id")
+    if isinstance(call_id, str) and call_id:
+        return f"tool_{call_id}_start", True
+    tool_name = _get_robust(input_json, "tool_name", default="unknown")
+    tool_input = _get_robust(input_json, "tool_input", "tool_args", "args") or {}
+    canonical = json.dumps([tool_name, tool_input], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"tool_pending_{digest}", False
+
+
+def _append_tool_start(state, key: str, start_time: str) -> None:
+    """Append a start timestamp to a FIFO encoded in state."""
+    raw = state.get(key)
     try:
-        return int(prompt), int(completion)
-    except (ValueError, TypeError):
-        return 0, 0
+        pending = json.loads(raw) if raw else []
+    except (json.JSONDecodeError, TypeError):
+        pending = []
+    if not isinstance(pending, list):
+        pending = []
+    pending.append(start_time)
+    state.set(key, json.dumps(pending))
+
+
+def _pop_tool_start(state, key: str) -> str | None:
+    """Pop the oldest timestamp from a pending-call FIFO."""
+    raw = state.get(key)
+    try:
+        pending = json.loads(raw) if raw else []
+    except (json.JSONDecodeError, TypeError):
+        pending = []
+    if not isinstance(pending, list) or not pending:
+        return None
+    start_time = str(pending.pop(0))
+    if pending:
+        state.set(key, json.dumps(pending))
+    else:
+        state.delete(key)
+    return start_time
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +260,11 @@ def _extract_tokens(input_json: dict) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def _send_span_async(span_dict: dict) -> None:
-    """Send a span without blocking the hook process.
+_DEFERRED_SPANS: list[dict] | None = None
+
+
+def _export_span_async(span_dict: dict) -> None:
+    """Export a span, detaching the network send where fork is available.
 
     Gemini invokes hooks synchronously and waits for the subprocess to exit
     before resuming its own response stream. The slowest part of a hook is
@@ -172,6 +323,14 @@ def _send_span_async(span_dict: dict) -> None:
     os._exit(0)
 
 
+def _send_span_async(span_dict: dict) -> None:
+    """Queue spans during a serialized hook transaction; otherwise export now."""
+    if _DEFERRED_SPANS is not None:
+        _DEFERRED_SPANS.append(span_dict)
+        return
+    _export_span_async(span_dict)
+
+
 # ---------------------------------------------------------------------------
 # Model-call accumulation: Gemini fires AfterModel once per streaming chunk.
 # We coalesce all chunks for a single BeforeModel into one LLM span so Arize
@@ -179,7 +338,7 @@ def _send_span_async(span_dict: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-_MODEL_STATE_KEYS = ("start", "prompt", "response", "model", "p_tokens", "c_tokens")
+_MODEL_STATE_KEYS = ("start", "prompt", "response", "model", "p_tokens", "c_tokens", "r_tokens", "t_tokens")
 
 
 def _clear_model_state(state, model_call_id: str) -> None:
@@ -218,14 +377,30 @@ def _flush_pending_model_call(state) -> None:
     model_name = state.get(f"model_{model_call_id}_model") or ""
     prompt_str = state.get(f"model_{model_call_id}_prompt") or state.get("current_trace_prompt") or ""
     response_str = state.get(f"model_{model_call_id}_response") or ""
-    try:
-        p_tokens = int(state.get(f"model_{model_call_id}_p_tokens") or "0")
-    except ValueError:
-        p_tokens = 0
-    try:
-        c_tokens = int(state.get(f"model_{model_call_id}_c_tokens") or "0")
-    except ValueError:
-        c_tokens = 0
+    if response_str:
+        # Per-call state is deleted after emission, but a cancellation
+        # fail-safe still needs the latest visible output for the CHAIN root.
+        state.set("current_trace_response", response_str)
+
+    def _stored_counter(suffix: str) -> int | None:
+        raw = state.get(f"model_{model_call_id}_{suffix}_tokens")
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    p_tokens = _stored_counter("p")
+    candidate_tokens = _stored_counter("c")
+    reasoning_tokens = _stored_counter("r")
+    total_tokens = _stored_counter("t")
+    completion_tokens = (
+        (candidate_tokens or 0) + (reasoning_tokens or 0)
+        if candidate_tokens is not None or reasoning_tokens is not None
+        else None
+    )
 
     span_name = f"LLM: {model_name}" if model_name else "LLM"
     attrs = {
@@ -233,12 +408,17 @@ def _flush_pending_model_call(state) -> None:
         "project.name": project_name,
         "openinference.span.kind": "LLM",
         "llm.model_name": model_name,
-        "llm.token_count.prompt": p_tokens,
-        "llm.token_count.completion": c_tokens,
-        "llm.token_count.total": p_tokens + c_tokens,
         "input.value": redact_content(env.log_prompts, prompt_str),
         "output.value": redact_content(env.log_prompts, response_str),
     }
+    if p_tokens is not None:
+        attrs["llm.token_count.prompt"] = p_tokens
+    if completion_tokens is not None:
+        attrs["llm.token_count.completion"] = completion_tokens
+    if total_tokens is not None:
+        attrs["llm.token_count.total"] = total_tokens
+    if reasoning_tokens is not None:
+        attrs["llm.token_count.completion_details.reasoning"] = reasoning_tokens
     if user_id:
         attrs["user.id"] = user_id
 
@@ -283,13 +463,15 @@ def _close_pending_turn(state, reason: str) -> None:
     user_id = state.get("user_id") or ""
     start_time = state.get("current_trace_start_time") or str(get_timestamp_ms())
     prompt = state.get("current_trace_prompt") or ""
+    response = state.get("current_trace_response") or ""
 
     attrs = {
         "session.id": session_id,
         "openinference.span.kind": "CHAIN",
         "project.name": project_name,
         "input.value": redact_content(env.log_prompts, prompt),
-        "output.value": f"(closed by {reason} fail-safe)",
+        "output.value": redact_content(env.log_prompts, response) if response else f"(closed by {reason} fail-safe)",
+        "gemini.turn.close_reason": reason,
     }
     if user_id:
         attrs["user.id"] = user_id
@@ -312,6 +494,7 @@ def _close_pending_turn(state, reason: str) -> None:
     state.delete("current_trace_span_id")
     state.delete("current_trace_start_time")
     state.delete("current_trace_prompt")
+    state.delete("current_trace_response")
 
 
 def _handle_session_start(input_json: dict) -> None:
@@ -371,6 +554,7 @@ def _handle_before_agent(input_json: dict) -> None:
     state.set("current_trace_id", generate_trace_id())
     state.set("current_trace_span_id", generate_span_id())
     state.set("current_trace_start_time", str(get_timestamp_ms()))
+    state.delete("current_trace_response")
 
     # Extract prompt: real CLI uses flat 'prompt'
     prompt_obj = _get_robust(input_json, "prompt")
@@ -413,8 +597,11 @@ def _handle_after_agent(input_json: dict) -> None:
     user_id = state.get("user_id") or ""
 
     # Extract response: try prompt_response (CLI specific) then standard keys
-    response_obj = _get_robust(input_json, "prompt_response", "llm_response", "response", "model_response")
-    response_str = _extract_text(response_obj)
+    response_str = (
+        _first_response_text(input_json, "prompt_response", "llm_response", "response", "model_response")
+        or state.get("current_trace_response")
+        or ""
+    )
 
     attrs = {
         "session.id": session_id,
@@ -445,6 +632,7 @@ def _handle_after_agent(input_json: dict) -> None:
     state.delete("current_trace_span_id")
     state.delete("current_trace_start_time")
     state.delete("current_trace_prompt")
+    state.delete("current_trace_response")
 
 
 def _handle_before_model(input_json: dict) -> None:
@@ -477,15 +665,12 @@ def _handle_before_model(input_json: dict) -> None:
 def _handle_after_model(input_json: dict) -> None:
     """Handle after_model: accumulate one streaming chunk for the current call.
 
-    Gemini fires AfterModel once per chunk: early chunks carry text, the final
-    chunk carries usage tokens. Instead of emitting a span per chunk (the old
-    behavior produced 4-30+ near-empty LLM rows per turn in Arize), we
-    accumulate text + tokens + model_name in state and only emit a single
-    LLM span when the final chunk arrives -- detected by non-zero token
-    counts. Non-final chunks just append text and return.
-
-    Flush also fires from BeforeModel (next call), AfterAgent, and the
-    pending-turn fail-safe so nothing is left dangling.
+    Gemini may fire AfterModel for multiple streaming updates. Instead of
+    emitting a span per update (the old behavior produced 4-30+ near-empty
+    LLM rows per turn), accumulate text, usage, and model name in state.
+    Flush immediately only on an explicit terminal marker; BeforeModel,
+    AfterAgent, and the pending-turn fail-safe are authoritative fallback
+    boundaries when captured payloads omit one.
     """
     debug_dump("gemini_after_model", input_json)
     state = resolve_session(input_json)
@@ -516,23 +701,26 @@ def _handle_after_model(input_json: dict) -> None:
         if isinstance(messages, list) and messages:
             state.set(f"model_{model_call_id}_prompt", json.dumps(messages))
 
-    # Append this chunk's text to the response accumulator.
-    resp_obj = _get_robust(input_json, "llm_response", "response", "model_response")
-    chunk_text = ""
-    if isinstance(resp_obj, dict):
-        chunk_text = _get_robust(resp_obj, "text") or ""
-    if not chunk_text:
-        chunk_text = _extract_text(resp_obj)
-    if chunk_text and chunk_text != "null":
+    # Append this chunk's recognized model-response text to the accumulator.
+    chunk_text = _first_response_text(input_json, "llm_response", "response", "model_response")
+    if chunk_text:
         prior = state.get(f"model_{model_call_id}_response") or ""
         state.set(f"model_{model_call_id}_response", prior + chunk_text)
 
-    # Token counts usually arrive only on the final chunk. When we see them,
-    # store and flush as a single span for the whole call.
-    p_tokens, c_tokens = _extract_tokens(input_json)
-    if p_tokens or c_tokens:
-        state.set(f"model_{model_call_id}_p_tokens", str(p_tokens))
-        state.set(f"model_{model_call_id}_c_tokens", str(c_tokens))
+    # Usage may arrive before the stream's terminal event. Accumulate it, but
+    # close only on an explicit lifecycle marker; AfterAgent/BeforeModel are
+    # the fallback boundaries when Gemini omits one.
+    if _has_usage(input_json):
+        p_tokens, c_tokens, reasoning_tokens, total_tokens = _extract_token_updates(input_json)
+        if p_tokens is not None:
+            state.set(f"model_{model_call_id}_p_tokens", str(p_tokens))
+        if c_tokens is not None:
+            state.set(f"model_{model_call_id}_c_tokens", str(c_tokens))
+        if reasoning_tokens is not None:
+            state.set(f"model_{model_call_id}_r_tokens", str(reasoning_tokens))
+        if total_tokens is not None:
+            state.set(f"model_{model_call_id}_t_tokens", str(total_tokens))
+    if _is_model_final(input_json):
         _flush_pending_model_call(state)
 
 
@@ -541,8 +729,12 @@ def _handle_before_tool(input_json: dict) -> None:
     debug_dump("gemini_before_tool", input_json)
     state = resolve_session(input_json)
 
-    tool_id = _get_robust(input_json, "tool_call_id", "tool_name", default="unknown")
-    state.set(f"tool_{tool_id}_start", str(get_timestamp_ms()))
+    pending_key, has_call_id = _tool_pending_key(input_json)
+    start_time = str(get_timestamp_ms())
+    if has_call_id:
+        state.set(pending_key, start_time)
+    else:
+        _append_tool_start(state, pending_key, start_time)
 
 
 def _handle_after_tool(input_json: dict) -> None:
@@ -562,7 +754,7 @@ def _handle_after_tool(input_json: dict) -> None:
     state.increment("tool_count")
 
     tool_name = _get_robust(input_json, "tool_name", default="unknown")
-    tool_id = _get_robust(input_json, "tool_call_id") or tool_name
+    pending_key, has_call_id = _tool_pending_key(input_json)
 
     tool_args_raw = _get_robust(input_json, "tool_input", "tool_args", "args") or {}
     tool_input = json.dumps(tool_args_raw) if isinstance(tool_args_raw, (dict, list)) else str(tool_args_raw)
@@ -607,9 +799,13 @@ def _handle_after_tool(input_json: dict) -> None:
     else:
         tool_description = tool_input[:200]
 
-    start_time = state.get(f"tool_{tool_id}_start") or str(get_timestamp_ms())
+    if has_call_id:
+        start_time = state.get(pending_key)
+        state.delete(pending_key)
+    else:
+        start_time = _pop_tool_start(state, pending_key)
+    start_time = start_time or str(get_timestamp_ms())
     end_time = str(get_timestamp_ms())
-    state.delete(f"tool_{tool_id}_start")
 
     tool_input = redact_content(env.log_tool_content, tool_input)
     tool_output = redact_content(env.log_tool_content, tool_output)
@@ -663,108 +859,73 @@ def _handle_after_tool(input_json: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def session_start():
-    """Entry point for arize-hook-gemini-session-start."""
+def _run_hook(name: str, handler) -> None:
+    """Read one event, serialize state mutation, then export outside the lock."""
+    global _DEFERRED_SPANS
+
     input_json = {}
+    deferred_spans: list[dict] = []
+    _DEFERRED_SPANS = deferred_spans
     try:
         input_json = _read_stdin()
         if check_requirements():
-            _handle_session_start(input_json)
-    except Exception as e:
-        error(f"gemini session_start hook failed: {e}")
+            # Network export is deferred until this lock is released. The lock
+            # therefore protects only the short state transaction, leaving
+            # ample room inside Gemini's 30-second subprocess deadline.
+            with FileLock(dispatch_lock_path(input_json), timeout=5.0, break_on_timeout=False):
+                handler(input_json)
+    except TimeoutError:
+        error(f"gemini {name} hook timed out waiting for the session dispatch lock")
+    except Exception as exc:
+        error(f"gemini {name} hook failed: {exc}")
     finally:
+        _DEFERRED_SPANS = None
+        for span in deferred_spans:
+            try:
+                _export_span_async(span)
+            except Exception as exc:
+                error(f"gemini {name} hook failed to export span: {exc}")
         _print_response()
+
+
+def session_start():
+    """Entry point for arize-hook-gemini-session-start."""
+    _run_hook("session_start", _handle_session_start)
 
 
 def session_end():
     """Entry point for arize-hook-gemini-session-end."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_session_end(input_json)
-    except Exception as e:
-        error(f"gemini session_end hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("session_end", _handle_session_end)
 
 
 def before_agent():
     """Entry point for arize-hook-gemini-before-agent."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_before_agent(input_json)
-    except Exception as e:
-        error(f"gemini before_agent hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("before_agent", _handle_before_agent)
 
 
 def after_agent():
     """Entry point for arize-hook-gemini-after-agent."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_after_agent(input_json)
-    except Exception as e:
-        error(f"gemini after_agent hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("after_agent", _handle_after_agent)
 
 
 def before_model():
     """Entry point for arize-hook-gemini-before-model."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_before_model(input_json)
-    except Exception as e:
-        error(f"gemini before_model hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("before_model", _handle_before_model)
 
 
 def after_model():
     """Entry point for arize-hook-gemini-after-model."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_after_model(input_json)
-    except Exception as e:
-        error(f"gemini after_model hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("after_model", _handle_after_model)
 
 
 def before_tool():
     """Entry point for arize-hook-gemini-before-tool."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_before_tool(input_json)
-    except Exception as e:
-        error(f"gemini before_tool hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("before_tool", _handle_before_tool)
 
 
 def after_tool():
     """Entry point for arize-hook-gemini-after-tool."""
-    input_json = {}
-    try:
-        input_json = _read_stdin()
-        if check_requirements():
-            _handle_after_tool(input_json)
-    except Exception as e:
-        error(f"gemini after_tool hook failed: {e}")
-    finally:
-        _print_response()
+    _run_hook("after_tool", _handle_after_tool)
 
 
 def main() -> None:
