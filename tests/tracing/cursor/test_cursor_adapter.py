@@ -217,6 +217,7 @@ class TestStateCleanupGeneration:
 
         assert not (adapter.STATE_DIR / f"root_{safe}").exists()
         assert not list(adapter.STATE_DIR.glob(f"*{safe}*.stack.json"))
+        assert not list(adapter.STATE_DIR.glob(f".lock_*{safe}*"))
 
     def test_cleanup_no_files_no_error(self):
         adapter.state_cleanup_generation("gen-nonexistent")  # should not raise

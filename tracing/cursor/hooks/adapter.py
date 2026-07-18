@@ -186,13 +186,15 @@ def state_cleanup_generation(gen_id: str) -> None:
     for f in STATE_DIR.glob(f"*{safe}*.stack.json"):
         f.unlink(missing_ok=True)
 
-    # Lock dirs containing this generation ID
-    for d in STATE_DIR.glob(f".lock_*{safe}*"):
-        if d.is_dir():
+    # Lock paths containing this generation ID (FileLock uses regular files).
+    for lock_path in STATE_DIR.glob(f".lock_*{safe}*"):
+        if lock_path.is_dir():
             try:
-                d.rmdir()  # only works on empty dirs
+                lock_path.rmdir()  # only works on empty legacy lock dirs
             except OSError:
                 pass
+        else:
+            lock_path.unlink(missing_ok=True)
 
 
 # --- Requirements check ---
