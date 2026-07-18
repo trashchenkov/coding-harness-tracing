@@ -39,14 +39,33 @@ release_lock() {
 
 acquire_lock() {
     attempts=0
+    metadata_attempts=0
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        if [ -f "$LOCK_DIR/pid" ]; then
-            owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-            if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-                rm -rf "$LOCK_DIR"
-                continue
-            fi
-        fi
+        owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+        case "$owner" in
+            ''|*[!0-9]*)
+                # A process can be preempted in the tiny mkdir→pid window, so
+                # allow a grace period before reclaiming absent/bad metadata.
+                metadata_attempts=$((metadata_attempts + 1))
+                if [ "$metadata_attempts" -ge 10 ]; then
+                    # Re-read before removal: the owner may have published a
+                    # valid PID after our first read in this iteration.
+                    latest_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+                    case "$latest_owner" in
+                        ''|*[!0-9]*) rm -rf "$LOCK_DIR" ;;
+                    esac
+                    metadata_attempts=0
+                    continue
+                fi
+                ;;
+            *)
+                metadata_attempts=0
+                if ! kill -0 "$owner" 2>/dev/null; then
+                    rm -rf "$LOCK_DIR"
+                    continue
+                fi
+                ;;
+        esac
         attempts=$((attempts + 1))
         if [ "$attempts" -ge 300 ]; then
             echo "[arize] Timed out waiting for Cursor tracing bootstrap lock" >&2

@@ -6,6 +6,7 @@ symlink, and bootstrap script all cohere as described in the design spec
 (`docs/superpowers/specs/2026-06-08-cursor-marketplace-plugin-design.md`).
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -312,6 +313,34 @@ class TestRunHook:
         assert all(process.returncode == 0 for process in processes)
         assert [stdout for stdout, _ in results] == [b"{}", b"{}"]
         assert count_file.read_text() == "x"
+
+    @pytest.mark.parametrize("pid_contents", [None, "", "not-a-pid"])
+    def test_recovers_lock_with_missing_or_malformed_pid(self, tmp_path, pid_contents):
+        home = tmp_path / "home"
+        data_dir = home / ".arize" / "harness"
+        venv_bin = data_dir / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        pip = venv_bin / "pip"
+        pip.write_text("#!/bin/sh\nexit 0\n")
+        pip.chmod(0o755)
+        marker = data_dir / ".cursor-plugin.pyproject.sha256"
+        marker.write_text(hashlib.sha256(PYPROJECT.read_bytes()).hexdigest())
+        lock_dir = data_dir / ".cursor-plugin-bootstrap.lock"
+        lock_dir.mkdir()
+        if pid_contents is not None:
+            (lock_dir / "pid").write_text(pid_contents)
+
+        result = subprocess.run(
+            [str(RUN_HOOK)],
+            env={**os.environ, "HOME": str(home)},
+            input=b"{}",
+            capture_output=True,
+            timeout=4,
+        )
+
+        assert result.returncode == 0
+        assert result.stdout == b""
+        assert not lock_dir.exists()
 
     def test_fails_open_with_empty_stdout_when_bootstrap_fails(self):
         """If no Python is available, run-hook must exit 0 with empty stdout.
