@@ -378,6 +378,50 @@ class TestRunHook:
         assert second.stdout == b"NEW_ARTIFACT"
         assert marker.read_text().strip() == _install_source_hash(plugin_root)
 
+    def test_source_change_during_install_is_detected_on_next_invocation(self, tmp_path):
+        plugin_root = tmp_path / "plugin"
+        shutil.copytree(PLUGIN_DIR, plugin_root)
+        run_hook = plugin_root / "scripts" / "run-hook"
+        handlers = plugin_root / "hooks" / "handlers.py"
+        home = tmp_path / "home"
+        data_dir = home / ".arize" / "harness"
+        venv_bin = data_dir / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        count_file = tmp_path / "install-count"
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            'BIN_DIR=$(dirname "$0")\n'
+            f"if [ ! -f '{count_file}' ]; then\n"
+            f"  printf x > '{count_file}'\n"
+            f"  printf '\\n# source changed during install\\n' >> '{handlers}'\n"
+            "  printf '#!/bin/sh\\nprintf STALE_ARTIFACT\\n' > \"$BIN_DIR/arize-hook-cursor\"\n"
+            "else\n"
+            f"  printf x >> '{count_file}'\n"
+            "  printf '#!/bin/sh\\nprintf FRESH_ARTIFACT\\n' > \"$BIN_DIR/arize-hook-cursor\"\n"
+            "fi\n"
+            'chmod +x "$BIN_DIR/arize-hook-cursor"\n'
+        )
+        pip.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+        )
+        python.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        first = subprocess.run([str(run_hook)], env=env, input=b"{}", capture_output=True, timeout=10)
+        second = subprocess.run([str(run_hook)], env=env, input=b"{}", capture_output=True, timeout=10)
+
+        marker = data_dir / ".cursor-plugin.pyproject.sha256"
+        assert first.returncode == second.returncode == 0
+        assert first.stdout == b"STALE_ARTIFACT"
+        assert second.stdout == b"FRESH_ARTIFACT"
+        assert count_file.read_text() == "xx"
+        assert marker.read_text().strip() == _install_source_hash(plugin_root)
+
     def test_terminating_signal_does_not_publish_marker_or_execute_artifact(self, tmp_path):
         plugin_root = tmp_path / "plugin"
         shutil.copytree(PLUGIN_DIR, plugin_root)

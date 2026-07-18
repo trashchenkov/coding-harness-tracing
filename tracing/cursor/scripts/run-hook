@@ -186,16 +186,24 @@ bootstrap() {
     fi
 
     echo "[arize] Installing cursor-tracing from $PLUGIN_ROOT..." >&2
+    # Capture the exact source revision selected for this install. If the live
+    # plugin tree changes while pip is running, publishing this pre-install
+    # fingerprint guarantees the next invocation detects that update.
+    install_hash=$(compute_source_hash 2>/dev/null) || {
+        echo "[arize] Failed to fingerprint Cursor tracing source" >&2
+        rm -f "$MARKER"
+        return 1
+    }
     if ! "$PIP" install --quiet "$PLUGIN_ROOT" >&2; then
         echo "[arize] pip install failed" >&2
         rm -f "$MARKER"
         return 1
     fi
 
-    # Save the complete installable-source fingerprint. This also migrates
-    # pyproject-only markers written by older plugin releases.
-    if ! compute_source_hash > "$MARKER"; then
-        echo "[arize] Failed to fingerprint installed Cursor tracing source" >&2
+    # Publish only the fingerprint selected before installation. This also
+    # migrates pyproject-only markers written by older plugin releases.
+    if ! printf '%s\n' "$install_hash" > "$MARKER"; then
+        echo "[arize] Failed to save installed Cursor tracing fingerprint" >&2
         rm -f "$MARKER"
         return 1
     fi
