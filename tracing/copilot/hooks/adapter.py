@@ -93,7 +93,7 @@ def _is_pid_alive(pid: int) -> bool:
             return False
 
 
-def resolve_session(input_json: dict) -> StateManager:
+def resolve_session(input_json: dict, *, initialize: bool = True) -> StateManager:
     """Resolve the per-session state file from hook input JSON.
 
     The hook payload always carries `session_id` (snake_case). Use it directly.
@@ -114,7 +114,8 @@ def resolve_session(input_json: dict) -> StateManager:
         state_file=state_file,
         lock_path=lock_path,
     )
-    sm.init_state()
+    if initialize:
+        sm.init_state()
     return sm
 
 

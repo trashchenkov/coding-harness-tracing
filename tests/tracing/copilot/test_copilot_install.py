@@ -23,7 +23,7 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 
 class TestCopilotEntryPoints:
-    """Verify all 7 Copilot entry points (6 hooks + 1 setup) in pyproject.toml."""
+    """Verify all 8 Copilot entry points (7 hooks + 1 setup) in pyproject.toml."""
 
     @pytest.fixture(autouse=True)
     def _load_pyproject(self):
@@ -47,19 +47,23 @@ class TestCopilotEntryPoints:
     def test_subagent_stop_entry_point(self):
         assert 'arize-hook-copilot-subagent-stop = "tracing.copilot.hooks.handlers:subagent_stop"' in self.text
 
+    def test_session_end_entry_point(self):
+        assert 'arize-hook-copilot-session-end = "tracing.copilot.hooks.handlers:session_end"' in self.text
+
     def test_setup_entry_point(self):
         assert 'arize-setup-copilot = "core.setup.copilot:main"' in self.text
 
-    def test_exactly_6_hook_entry_points(self):
-        """There should be exactly 6 copilot hook entry points."""
+    def test_exactly_7_hook_entry_points(self):
+        """There should be exactly 7 copilot hook entry points."""
         count = self.text.count("arize-hook-copilot-")
-        assert count == 6, f"Expected 6 copilot hook entries, got {count}"
+        assert count == 7, f"Expected 7 copilot hook entries, got {count}"
 
     def test_entry_points_importable(self):
         """All referenced handler functions should be importable."""
         from tracing.copilot.hooks.handlers import (
             post_tool_use,
             pre_tool_use,
+            session_end,
             session_start,
             stop,
             subagent_stop,
@@ -73,5 +77,6 @@ class TestCopilotEntryPoints:
             post_tool_use,
             stop,
             subagent_stop,
+            session_end,
         ]:
             assert callable(fn)

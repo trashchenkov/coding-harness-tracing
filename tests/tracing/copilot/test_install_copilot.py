@@ -136,12 +136,11 @@ class TestInstallFreshWritesFlatHarnessEntry:
         assert (hooks_dir / "hooks.json").is_file()
 
     def test_hooks_json_structure(self, hooks_dir, monkeypatch):
-        """hooks.json must follow the VS Code Copilot Chat schema:
-        {"hooks": {"<EventName>": [{"type": "command", "command": "<cmd>"}]}}
-        """
+        """hooks.json uses the canonical Copilot CLI v1 compatibility schema."""
         _mock_prompts(monkeypatch)
         install()
         data = json.loads((hooks_dir / "hooks.json").read_text())
+        assert data["version"] == 1
         assert set(data["hooks"].keys()) == {
             "SessionStart",
             "UserPromptSubmit",
@@ -149,6 +148,7 @@ class TestInstallFreshWritesFlatHarnessEntry:
             "PostToolUse",
             "Stop",
             "SubagentStop",
+            "SessionEnd",
         }
         for event, entries in data["hooks"].items():
             assert len(entries) == 1

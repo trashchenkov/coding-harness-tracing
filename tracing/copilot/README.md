@@ -1,6 +1,6 @@
 # GitHub Copilot Tracing
 
-Automatic [OpenInference](https://github.com/Arize-ai/openinference) tracing for GitHub Copilot in VS Code. Spans are exported to [Arize AX](https://arize.com) or [Phoenix](https://github.com/Arize-ai/phoenix).
+Automatic [OpenInference](https://github.com/Arize-ai/openinference) tracing for GitHub Copilot in VS Code and the standalone Copilot CLI. Spans are exported to [Arize AX](https://arize.com) or [Phoenix](https://github.com/Arize-ai/phoenix).
 
 ## Setup
 The installer prompts for your backend (Phoenix or Arize AX) and project name, writes credentials to `~/.arize/harness/config.json`, and registers Copilot Chat hooks at `.github/hooks/hooks.json`.
@@ -83,7 +83,7 @@ install.bat uninstall copilot
 | Phoenix endpoint | `http://localhost:6006` |
 | Arize AX endpoint | `otlp.arize.com:443` |
 | Hook config file | `.github/hooks/hooks.json` |
-| Hook events registered | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop` |
+| Hook events registered | `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, `SessionEnd` |
 | State directory | `~/.arize/harness/state/copilot/` |
 | Log file | `~/.arize/harness/logs/copilot.log` |
 
@@ -91,6 +91,7 @@ install.bat uninstall copilot
 
 Use GitHub Copilot Chat in VS Code (or the Copilot CLI) inside the workspace that contains `.github/hooks/hooks.json`. The hooks fire on `SessionStart`, `UserPromptSubmit`, tool invocations, and `Stop`.
 
+- Copilot CLI only loads repository hooks after the workspace has been trusted; an untrusted folder can run normally while silently skipping `.github/hooks/*.json`.
 - Errors land in `~/.arize/harness/logs/copilot.log` always; set `export ARIZE_VERBOSE=true` before launching VS Code / Copilot CLI to also see routine hook activity.
 - Confirm spans appear in your configured project in Arize AX or Phoenix.
 - The hooks file is per-workspace — repeat the install in each repo where you want Copilot tracing.

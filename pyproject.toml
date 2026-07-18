@@ -45,6 +45,7 @@ arize-hook-copilot-pre-tool = "tracing.copilot.hooks.handlers:pre_tool_use"
 arize-hook-copilot-post-tool = "tracing.copilot.hooks.handlers:post_tool_use"
 arize-hook-copilot-stop = "tracing.copilot.hooks.handlers:stop"
 arize-hook-copilot-subagent-stop = "tracing.copilot.hooks.handlers:subagent_stop"
+arize-hook-copilot-session-end = "tracing.copilot.hooks.handlers:session_end"
 # Gemini hooks
 arize-hook-gemini-session-start = "tracing.gemini.hooks.handlers:session_start"
 arize-hook-gemini-session-end = "tracing.gemini.hooks.handlers:session_end"

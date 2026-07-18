@@ -8,7 +8,7 @@ Verifies:
 5. .pre-commit-config.yaml uses underscore paths
 6. All entry-point target modules and functions exist and are importable
 7. Installed entry-point scripts reference new module paths
-8. Copilot entry points included in pyproject.toml (all 8 hooks)
+8. Copilot entry points included in pyproject.toml (all 7 hooks)
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ EXPECTED_HARNESS_ENTRY_POINTS = {
     "arize-hook-copilot-post-tool": "tracing.copilot.hooks.handlers:post_tool_use",
     "arize-hook-copilot-stop": "tracing.copilot.hooks.handlers:stop",
     "arize-hook-copilot-subagent-stop": "tracing.copilot.hooks.handlers:subagent_stop",
+    "arize-hook-copilot-session-end": "tracing.copilot.hooks.handlers:session_end",
     # Gemini hooks
     "arize-hook-gemini-session-start": "tracing.gemini.hooks.handlers:session_start",
     "arize-hook-gemini-session-end": "tracing.gemini.hooks.handlers:session_end",

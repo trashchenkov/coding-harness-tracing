@@ -73,6 +73,7 @@ def _install_hooks(hooks_dir: Path) -> None:
         return
 
     data = _read_json(filepath)
+    data.setdefault("version", 1)
     hooks_map: dict = data.setdefault("hooks", {})
 
     for event, entry_point in HOOK_EVENTS.items():

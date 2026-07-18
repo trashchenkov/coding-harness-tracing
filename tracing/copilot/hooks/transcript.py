@@ -72,6 +72,13 @@ def parse_transcript(path: str | Path) -> dict[str, Any]:
                     new_model = data.get("newModel", "")
                     if new_model:
                         summary["model_name"] = new_model
+                elif kind == "assistant.message":
+                    content = data.get("content", "")
+                    if isinstance(content, str) and content:
+                        summary["output_text"] = content
+                    model = data.get("model", "")
+                    if isinstance(model, str) and model:
+                        summary["model_name"] = model
                 elif kind == "hook.start":
                     hook_type = data.get("hookType", "")
                     inp = data.get("input") or {}

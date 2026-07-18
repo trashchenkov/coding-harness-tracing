@@ -6,6 +6,7 @@ and delegates to the corresponding _handle_* implementation.
 """
 import json
 import sys
+import time
 
 from core.common import (
     build_span,
@@ -244,16 +245,24 @@ def _handle_stop(input_json: dict) -> None:
     transcript_path = input_json.get("transcript_path", "")
     summary = parse_transcript(transcript_path) if transcript_path else {}
 
+    # Copilot can invoke Stop before the final assistant.message has become
+    # visible to a separate hook process. Retry briefly rather than emitting a
+    # permanently empty output attribute for an otherwise complete turn.
+    if transcript_path:
+        for _ in range(2):
+            if summary.get("output_text"):
+                break
+            time.sleep(0.05)
+            summary = parse_transcript(transcript_path)
+
     model_name = summary.get("model_name", "")
-    # TODO(transcript): extract assistant turn text once events.jsonl assistant
-    # event shape is captured. Until then, output_text is empty.
     output_text = summary.get("output_text", "")
     tool_count = state.get("tool_count") or "0"
 
     end_time = str(get_timestamp_ms())
 
     user_prompt = redact_content(env.log_prompts, user_prompt)
-    output_text = redact_content(env.log_tool_content, output_text)
+    output_text = redact_content(env.log_prompts, output_text)
 
     attrs = {
         "session.id": session_id,
@@ -301,8 +310,12 @@ def _handle_subagent_stop(input_json: dict) -> None:
     if session_id is None:
         return
 
+    # Copilot CLI PascalCase compatibility payloads use agent_name and
+    # agent_display_name; VS Code uses agent_id and agent_type. Preserve both.
     agent_id = input_json.get("agent_id", "")
     agent_type = input_json.get("agent_type", "")
+    agent_name = input_json.get("agent_name", "") or agent_id
+    agent_display_name = input_json.get("agent_display_name", "")
     transcript_path = input_json.get("transcript_path", "")
 
     summary = parse_transcript(transcript_path) if transcript_path else {}
@@ -316,14 +329,22 @@ def _handle_subagent_stop(input_json: dict) -> None:
         "session.id": session_id,
         "openinference.span.kind": "CHAIN",
         "project.name": project_name,
-        "metadata": json.dumps({"agent_type": agent_type, "agent_id": agent_id}),
+        "metadata": json.dumps(
+            {
+                "agent_type": agent_type,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_display_name": agent_display_name,
+            }
+        ),
     }
     if model_name:
         attrs["llm.model_name"] = model_name
     if user_id:
         attrs["user.id"] = user_id
 
-    span_name = f"Subagent: {agent_id}" if agent_id else "Subagent"
+    display_name = agent_display_name or agent_name
+    span_name = f"Subagent: {display_name}" if display_name else "Subagent"
 
     span = build_span(
         span_name,
@@ -338,6 +359,29 @@ def _handle_subagent_stop(input_json: dict) -> None:
         SCOPE_NAME,
     )
     send_span(span)
+
+
+def _handle_session_end(input_json: dict) -> None:
+    """Clean up per-session state after Copilot reports SessionEnd."""
+    session_id = input_json.get("session_id")
+    if not session_id:
+        return
+    state = resolve_session(input_json, initialize=False)
+
+    reason = input_json.get("reason", "")
+    log(f"Session end: session_id={session_id}, reason={reason}")
+
+    if state.state_file is not None:
+        state.state_file.unlink(missing_ok=True)
+    lock_path = state._lock_path
+    if lock_path is not None:
+        if lock_path.is_dir():
+            try:
+                lock_path.rmdir()
+            except OSError:
+                pass
+        else:
+            lock_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -415,3 +459,15 @@ def subagent_stop():
         error(f"copilot subagent_stop hook failed: {e}")
     finally:
         _print_response("SubagentStop")
+
+
+def session_end():
+    """Entry point for arize-hook-copilot-session-end."""
+    try:
+        input_json = _read_stdin("session_end")
+        if check_requirements():
+            _handle_session_end(input_json)
+    except Exception as e:
+        error(f"copilot session_end hook failed: {e}")
+    finally:
+        _print_response("SessionEnd")

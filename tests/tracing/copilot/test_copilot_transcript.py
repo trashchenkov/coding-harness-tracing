@@ -12,6 +12,28 @@ def _write_jsonl(path, events):
 
 
 class TestParseTranscriptHappyPath:
+    def test_extracts_latest_assistant_message_from_copilot_cli_1_0_71(self, tmp_path):
+        """Use the assistant.message shape observed from official CLI 1.0.71."""
+        f = tmp_path / "events.jsonl"
+        _write_jsonl(
+            f,
+            [
+                {
+                    "type": "assistant.message",
+                    "data": {"model": "gpt-5-mini", "content": "first answer"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"model": "gpt-oss:120b-cloud", "content": "final answer"},
+                },
+            ],
+        )
+
+        summary = parse_transcript(f)
+
+        assert summary["output_text"] == "final answer"
+        assert summary["model_name"] == "gpt-oss:120b-cloud"
+
     def test_extracts_model_from_session_model_change(self, tmp_path):
         f = tmp_path / "events.jsonl"
         _write_jsonl(
@@ -187,7 +209,7 @@ class TestParseTranscriptReturnShape:
             "events_seen",
         }
 
-    def test_output_text_always_empty_string(self, tmp_path):
+    def test_output_text_empty_when_no_assistant_message(self, tmp_path):
         f = tmp_path / "events.jsonl"
         _write_jsonl(
             f,
