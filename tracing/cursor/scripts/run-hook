@@ -102,12 +102,42 @@ find_python() {
     return 1
 }
 
+compute_source_hash() {
+    "$PYTHON_CMD" - "$PLUGIN_ROOT" <<'PY'
+import hashlib
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+files = [os.path.join(root, "pyproject.toml")]
+seen_dirs = set()
+for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+    real_dir = os.path.realpath(dirpath)
+    if real_dir in seen_dirs:
+        dirnames[:] = []
+        continue
+    seen_dirs.add(real_dir)
+    dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+    files.extend(os.path.join(dirpath, name) for name in sorted(filenames) if name.endswith(".py"))
+
+digest = hashlib.sha256()
+for path in sorted(set(files), key=lambda value: os.path.relpath(value, root)):
+    relative = os.path.relpath(path, root).replace(os.sep, "/")
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    with open(path, "rb") as source:
+        digest.update(source.read())
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
 # --- Check if (re)install is needed ---
 needs_install() {
     [ ! -d "$VENV_DIR" ] && return 0
     [ ! -f "$MARKER" ] && return 0
-    # Compare pyproject.toml hash
-    current=$("$PYTHON_CMD" -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$PLUGIN_ROOT/pyproject.toml" 2>/dev/null) || return 0
+    # Compare the complete installable source artifact, not only package metadata.
+    current=$(compute_source_hash 2>/dev/null) || return 0
     stored=$(cat "$MARKER" 2>/dev/null) || return 0
     [ "$current" != "$stored" ]
 }
@@ -161,9 +191,13 @@ bootstrap() {
         return 1
     fi
 
-    # Save hash marker
-    "$PYTHON_CMD" -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" \
-        "$PLUGIN_ROOT/pyproject.toml" > "$MARKER"
+    # Save the complete installable-source fingerprint. This also migrates
+    # pyproject-only markers written by older plugin releases.
+    if ! compute_source_hash > "$MARKER"; then
+        echo "[arize] Failed to fingerprint installed Cursor tracing source" >&2
+        rm -f "$MARKER"
+        return 1
+    fi
 
     echo "[arize] Cursor tracing venv ready" >&2
     release_lock

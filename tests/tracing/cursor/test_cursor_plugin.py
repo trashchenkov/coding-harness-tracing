@@ -39,6 +39,28 @@ CORE_SYMLINK = PLUGIN_DIR / "core"
 RUN_HOOK = PLUGIN_DIR / "scripts" / "run-hook"
 
 
+def _install_source_hash(root=PLUGIN_DIR):
+    files = [root / "pyproject.toml"]
+    seen_dirs = set()
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        real_dir = os.path.realpath(dirpath)
+        if real_dir in seen_dirs:
+            dirnames[:] = []
+            continue
+        seen_dirs.add(real_dir)
+        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+        files.extend(Path(dirpath) / name for name in sorted(filenames) if name.endswith(".py"))
+
+    digest = hashlib.sha256()
+    for path in sorted(set(files), key=lambda value: os.path.relpath(value, root)):
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 # --- marketplace.json ---
 
 
@@ -290,6 +312,7 @@ class TestRunHook:
             '  /usr/bin/chmod +x "$3/bin/pip"\n'
             "  exit 0\n"
             "fi\n"
+            'if [ "$1" = - ]; then exec /usr/bin/python3 "$@"; fi\n'
             "exit 1\n"
         )
         python.chmod(0o755)
@@ -314,6 +337,47 @@ class TestRunHook:
         assert [stdout for stdout, _ in results] == [b"{}", b"{}"]
         assert count_file.read_text() == "x"
 
+    def test_reinstalls_when_installable_source_changes(self, tmp_path):
+        plugin_root = tmp_path / "plugin"
+        shutil.copytree(PLUGIN_DIR, plugin_root)
+        run_hook = plugin_root / "scripts" / "run-hook"
+        home = tmp_path / "home"
+        venv_bin = home / ".arize" / "harness" / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        entry_point = venv_bin / "arize-hook-cursor"
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            'BIN_DIR=$(dirname "$0")\n'
+            "printf '#!/bin/sh\\nprintf NEW_ARTIFACT\\n' > \"$BIN_DIR/arize-hook-cursor\"\n"
+            'chmod +x "$BIN_DIR/arize-hook-cursor"\n'
+        )
+        pip.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+        )
+        python.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        first = subprocess.run([str(run_hook)], env=env, input=b"{}", capture_output=True, timeout=10)
+        assert first.returncode == 0
+        assert first.stdout == b"NEW_ARTIFACT"
+        marker = home / ".arize" / "harness" / ".cursor-plugin.pyproject.sha256"
+        assert marker.read_text().strip() == _install_source_hash(plugin_root)
+
+        entry_point.write_text("#!/bin/sh\nprintf OLD_ARTIFACT\n")
+        entry_point.chmod(0o755)
+        handlers = plugin_root / "hooks" / "handlers.py"
+        handlers.write_text(handlers.read_text() + "\n# source update\n")
+
+        second = subprocess.run([str(run_hook)], env=env, input=b"{}", capture_output=True, timeout=10)
+        assert second.returncode == 0
+        assert second.stdout == b"NEW_ARTIFACT"
+        assert marker.read_text().strip() == _install_source_hash(plugin_root)
+
     @pytest.mark.parametrize("pid_contents", [None, "", "not-a-pid"])
     def test_recovers_lock_with_missing_or_malformed_pid(self, tmp_path, pid_contents):
         home = tmp_path / "home"
@@ -324,7 +388,7 @@ class TestRunHook:
         pip.write_text("#!/bin/sh\nexit 0\n")
         pip.chmod(0o755)
         marker = data_dir / ".cursor-plugin.pyproject.sha256"
-        marker.write_text(hashlib.sha256(PYPROJECT.read_bytes()).hexdigest())
+        marker.write_text(_install_source_hash())
         lock_dir = data_dir / ".cursor-plugin-bootstrap.lock"
         lock_dir.mkdir()
         if pid_contents is not None:
