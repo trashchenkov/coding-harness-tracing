@@ -1611,14 +1611,16 @@ class TestDeferredStatePrivacy:
         )
 
         monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
         after_payload = {
             "conversation_id": "privacy-conv",
             "generation_id": "privacy-gen",
             "command": command,
-            "output": "done",
+            "output": "SHELL_OUTPUT_SECRET",
             "exit_code": "0",
         }
         _dispatch("afterShellExecution", after_payload)
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
         _dispatch("afterShellExecution", after_payload)
 
         shell_payloads = [
@@ -1631,11 +1633,14 @@ class TestDeferredStatePrivacy:
             shell_span = shell_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
             attrs = {item["key"]: item["value"]["stringValue"] for item in shell_span["attributes"]}
             assert attrs["input.value"].startswith("<redacted")
+            assert attrs["output.value"].startswith("<redacted")
             assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
+            assert "SHELL_OUTPUT_SECRET" not in json.dumps(shell_payload)
 
     def test_subagent_creation_redaction_is_irreversible_when_stop_repeats_task(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "false")
         task = "SUBAGENT_IRREVERSIBLE_SECRET"
         common = {
             "conversation_id": "privacy-conv",
@@ -1646,20 +1651,81 @@ class TestDeferredStatePrivacy:
         _dispatch("subagentStart", common)
 
         monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
-        _dispatch(
-            "subagentStop",
-            {**common, "status": "completed", "summary": "allowed summary"},
-        )
+        stop_payload = {**common, "status": "completed", "summary": "SUBAGENT_SUMMARY_SECRET"}
+        _dispatch("subagentStop", stop_payload)
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "true")
+        _dispatch("subagentStop", stop_payload)
 
-        subagent_payload = next(
+        subagent_payloads = [
             payload
             for payload in captured_spans
             if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Subagent: explore"
-        )
-        subagent_span = subagent_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-        attrs = {item["key"]: item["value"]["stringValue"] for item in subagent_span["attributes"]}
-        assert attrs["input.value"].startswith("<redacted")
-        assert task not in json.dumps(subagent_payload)
+        ]
+        assert len(subagent_payloads) == 2
+        for subagent_payload in subagent_payloads:
+            subagent_span = subagent_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            attrs = {item["key"]: item["value"]["stringValue"] for item in subagent_span["attributes"]}
+            assert attrs["input.value"].startswith("<redacted")
+            assert attrs["output.value"].startswith("<redacted")
+            assert task not in json.dumps(subagent_payload)
+            assert "SUBAGENT_SUMMARY_SECRET" not in json.dumps(subagent_payload)
+
+    def test_generic_tool_creation_redaction_survives_duplicate_post(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        tool_input = {"q": "GENERIC_DUPLICATE_SECRET"}
+        common = {
+            "conversation_id": "privacy-conv",
+            "generation_id": "privacy-gen",
+            "tool_use_id": "tool-privacy-1",
+            "tool_name": "browser",
+            "tool_input": tool_input,
+        }
+        _dispatch("preToolUse", common)
+
+        post_payload = {**common, "tool_output": "GENERIC_OUTPUT_SECRET"}
+        _dispatch("postToolUse", post_payload)
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch("postToolUse", post_payload)
+
+        tool_payloads = [
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Tool: browser"
+        ]
+        assert len(tool_payloads) == 2
+        for tool_payload in tool_payloads:
+            tool_span = tool_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            attrs = {item["key"]: item["value"]["stringValue"] for item in tool_span["attributes"]}
+            assert attrs["input.value"].startswith("<redacted")
+            assert attrs["output.value"].startswith("<redacted")
+            assert "GENERIC_DUPLICATE_SECRET" not in json.dumps(tool_payload)
+            assert "GENERIC_OUTPUT_SECRET" not in json.dumps(tool_payload)
+
+    def test_model_output_redaction_survives_duplicate_response(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "false")
+        common = {"conversation_id": "privacy-conv", "generation_id": "privacy-gen"}
+        _dispatch("beforeSubmitPrompt", {**common, "prompt": "allowed prompt"})
+        response_payload = {**common, "text": "MODEL_DUPLICATE_SECRET", "model": "cursor-model"}
+        _dispatch("afterAgentResponse", response_payload)
+
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "true")
+        _dispatch("afterAgentResponse", response_payload)
+        _dispatch("stop", common)
+
+        llm_payloads = [
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Agent Response"
+        ]
+        assert len(llm_payloads) == 2
+        for llm_payload in llm_payloads:
+            llm_span = llm_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            attrs = {item["key"]: item["value"]["stringValue"] for item in llm_span["attributes"]}
+            assert attrs["output.value"].startswith("<redacted")
+            assert "MODEL_DUPLICATE_SECRET" not in json.dumps(llm_payload)
 
     def test_stop_reapplies_current_prompt_and_model_output_policy(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
@@ -1750,22 +1816,29 @@ class TestDeferredStatePrivacy:
         )
 
         monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
-        _dispatch(
-            "afterMCPExecution",
-            {
-                "conversation_id": "privacy-conv",
-                "generation_id": "privacy-gen",
-                "tool_name": "search",
-                "result": "MCP_OUTPUT_TERMINAL_SECRET",
-            },
-        )
+        after_payload = {
+            "conversation_id": "privacy-conv",
+            "generation_id": "privacy-gen",
+            "tool_name": "search",
+            "result": "MCP_OUTPUT_TERMINAL_SECRET",
+        }
+        _dispatch("afterMCPExecution", after_payload)
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch("afterMCPExecution", after_payload)
 
-        payload = captured_spans[-1]
-        span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-        attrs = {item["key"]: item["value"]["stringValue"] for item in span["attributes"]}
-        assert attrs["input.value"].startswith("<redacted")
-        assert attrs["output.value"].startswith("<redacted")
-        assert "MCP_TERMINAL_SECRET" not in json.dumps(payload)
+        payloads = [
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "MCP: search"
+        ]
+        assert len(payloads) == 2
+        for payload in payloads:
+            span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            attrs = {item["key"]: item["value"]["stringValue"] for item in span["attributes"]}
+            assert attrs["input.value"].startswith("<redacted")
+            assert attrs["output.value"].startswith("<redacted")
+            assert "MCP_TERMINAL_SECRET" not in json.dumps(payload)
+            assert "MCP_OUTPUT_TERMINAL_SECRET" not in json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------

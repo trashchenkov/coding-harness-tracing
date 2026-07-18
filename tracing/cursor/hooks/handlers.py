@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import sys
+from typing import Optional, Tuple
 
 from core.common import build_span, env, error, get_timestamp_ms, log, redact_content
 from core.common import send_span as _send_span_to_backend
@@ -131,11 +132,25 @@ def _json_string(value) -> str:
     return str(value)
 
 
-def _redact_deferred(allowed: bool, content: str, already_redacted: bool = False) -> str:
-    """Apply the terminal policy to explicitly classified persisted content."""
-    if already_redacted:
-        return content or ""
-    return redact_content(allowed, content)
+def _redact_deferred(allowed_now: bool, value: str, was_redacted: bool) -> str:
+    """Re-apply current policy without ever reversing creation-time redaction."""
+    if was_redacted:
+        return value or ""
+    return redact_content(allowed_now, value)
+
+
+def _redact_terminal_field(privacy_key: str, field: str, raw_value: str, allowed_now: bool) -> tuple[str, bool]:
+    """Retain a terminal payload field's first-delivery privacy decision."""
+    privacy_state = state_pop(privacy_key) or {}
+    redacted_field = f"{field}_redacted"
+    was_redacted = bool(privacy_state.get(redacted_field, False))
+    source = privacy_state.get(field, "") if was_redacted else raw_value
+    value = _redact_deferred(allowed_now, source, was_redacted)
+    is_redacted = was_redacted or not allowed_now
+    privacy_state[field] = value if is_redacted else ""
+    privacy_state[redacted_field] = is_redacted
+    state_push(privacy_key, privacy_state)
+    return value, is_redacted
 
 
 def _resolve_user_id(input_json: dict) -> str:
@@ -302,7 +317,7 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     parent = gen_root_span_get(gen_id)
 
     # "text" is the documented field; fall back to "response"/"output" for compat
-    response = _jq_str(input_json, "text", "response", "output")
+    raw_response = _jq_str(input_json, "text", "response", "output")
     # "model" is a base field on all hook events
     model = _jq_str(input_json, "model", "model_name")
 
@@ -311,11 +326,29 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     prompt = root_state.get("prompt", "") if root_state else ""
     deferred_root = root_state.get("deferred_root", True) if root_state else True
 
-    # Prompt and model output have independent privacy controls.
+    # Prompt and model output have independent privacy controls. A response hash
+    # identifies duplicate delivery without persisting raw model content.
     prompt_was_redacted = bool(root_state and root_state.get("prompt_redacted", False))
     prompt = _redact_deferred(env.log_prompts, prompt, prompt_was_redacted)
-    response_allowed = env.log_model_outputs
-    response = redact_content(response_allowed, response)
+    response_privacy_key = ""
+    response_privacy = None
+    if safe_gen:
+        response_hash = hashlib.sha256(raw_response.encode("utf-8")).hexdigest()[:24]
+        response_privacy_key = f"llm_privacy_{safe_gen}_{response_hash}"
+        response_privacy = state_pop(response_privacy_key)
+    if response_privacy:
+        response_source = response_privacy.get("output", "")
+        response_was_redacted = bool(response_privacy.get("output_redacted", False))
+    else:
+        response_source = raw_response
+        response_was_redacted = False
+    response = _redact_deferred(env.log_model_outputs, response_source, response_was_redacted)
+    response_is_redacted = response_was_redacted or not env.log_model_outputs
+    if response_privacy_key:
+        state_push(
+            response_privacy_key,
+            {"output": response if response_is_redacted else "", "output_redacted": response_is_redacted},
+        )
     prompt_is_redacted = prompt_was_redacted or not env.log_prompts
 
     user_id = _resolve_user_id(input_json)
@@ -359,7 +392,7 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
         "input": prompt,
         "output": response,
         "input_redacted": prompt_is_redacted,
-        "output_redacted": not response_allowed,
+        "output_redacted": response_is_redacted,
         "model": model,
         "conversation_id": conversation_id,
         "user_id": user_id,
@@ -483,13 +516,10 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     # Keep raw-content-free privacy provenance for duplicate terminal
     # deliveries. A redaction marker may be retained; the command may not.
     if privacy_key:
-        state_push(
-            privacy_key,
-            {
-                "command_redacted": command_was_redacted,
-                "command": command if command_was_redacted else "",
-            },
-        )
+        privacy_record = dict(privacy_state or {})
+        privacy_record["command_redacted"] = command_was_redacted
+        privacy_record["command"] = command if command_was_redacted else ""
+        state_push(privacy_key, privacy_record)
     start_ms = start_ms or str(now_ms)
 
     # Use the after-event command only when creation-time state did not redact
@@ -498,11 +528,15 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     if after_cmd and not command_was_redacted:
         command = after_cmd
 
-    output = _jq_str(input_json, "output", "stdout", "result")
+    raw_output = _jq_str(input_json, "output", "stdout", "result")
+    output = (
+        _redact_terminal_field(privacy_key, "output", raw_output, env.log_tool_content)[0]
+        if privacy_key
+        else redact_content(env.log_tool_content, raw_output)
+    )
     exit_code = _jq_str(input_json, "exit_code", "exitCode")
 
     command = _redact_deferred(env.log_tool_details, command, command_was_redacted)
-    output = redact_content(env.log_tool_content, output)
 
     user_id = _resolve_user_id(input_json)
 
@@ -546,9 +580,12 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
     mcp_url = _jq_str(input_json, "url", "server_url", "serverUrl")
     mcp_cmd = _jq_str(input_json, "command")
     tool_content_allowed = env.log_tool_content
+    state_key = f"mcp_{sanitize(gen_id)}"
+    while state_pop(f"{state_key}_privacy"):
+        pass
 
     state_push(
-        f"mcp_{sanitize(gen_id)}",
+        state_key,
         {
             "tool_name": tool_name,
             "tool_input": redact_content(tool_content_allowed, tool_input),
@@ -567,20 +604,16 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     """Merge with before state, create TOOL span. Replaces bash lines 262-312."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
-    popped = state_pop(f"mcp_{sanitize(gen_id)}") if gen_id else None
+    state_key = f"mcp_{sanitize(gen_id)}" if gen_id else ""
+    popped = state_pop(state_key) if state_key else None
 
     if popped:
         start_ms = popped.get("start_ms", "")
         tool_name = popped.get("tool_name", "")
-        tool_input = _redact_deferred(
-            env.log_tool_content,
-            popped.get("tool_input", ""),
-            bool(popped.get("tool_input_redacted", False)),
-        )
     else:
         start_ms = ""
         tool_name = ""
-        tool_input = ""
+    tool_input, _ = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
     start_ms = start_ms or str(now_ms)
 
     # Override tool name from after-event if present
@@ -589,7 +622,12 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
         tool_name = after_tool
     tool_name = tool_name or "unknown"
 
-    result = redact_content(env.log_tool_content, _jq_str(input_json, "result", "output", "result_json"))
+    raw_result = _jq_str(input_json, "result", "output", "result_json")
+    result = (
+        _redact_terminal_field(f"{state_key}_privacy", "result", raw_result, env.log_tool_content)[0]
+        if state_key
+        else redact_content(env.log_tool_content, raw_result)
+    )
 
     user_id = _resolve_user_id(input_json)
 
@@ -1047,14 +1085,39 @@ def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
     return f"tool_{sanitize(gen_id)}_{sanitize(tool_use_id)}"
 
 
+def _tool_input_with_privacy_provenance(state_key: str, popped: Optional[dict]) -> Tuple[str, bool]:
+    """Resolve tool input while retaining content-free duplicate-delivery provenance."""
+    privacy_key = f"{state_key}_privacy"
+    privacy_state = state_pop(privacy_key)
+    privacy_record = dict(privacy_state or {})
+    if popped:
+        source = popped.get("tool_input", "")
+        was_redacted = bool(popped.get("tool_input_redacted", False))
+    elif privacy_state:
+        source = privacy_state.get("tool_input", "")
+        was_redacted = bool(privacy_state.get("tool_input_redacted", False))
+    else:
+        return "", False
+
+    tool_input = _redact_deferred(env.log_tool_content, source, was_redacted)
+    is_redacted = was_redacted or not env.log_tool_content
+    privacy_record["tool_input"] = tool_input if is_redacted else ""
+    privacy_record["tool_input_redacted"] = is_redacted
+    state_push(privacy_key, privacy_record)
+    return tool_input, is_redacted
+
+
 def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Capture generic tool input before execution, keyed by tool_use_id."""
     tool_use_id = _jq_str(input_json, "tool_use_id")
     if not tool_use_id:
         return
     tool_content_allowed = env.log_tool_content
+    state_key = _tool_state_key(gen_id, tool_use_id)
+    while state_pop(f"{state_key}_privacy"):
+        pass
     state_push(
-        _tool_state_key(gen_id, tool_use_id),
+        state_key,
         {
             "start_ms": now_ms,
             "tool_name": _jq_str(input_json, "tool_name"),
@@ -1069,7 +1132,8 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     """TOOL span for a successful generic tool call."""
     tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
     tool_use_id = _jq_str(input_json, "tool_use_id")
-    popped = state_pop(_tool_state_key(gen_id, tool_use_id)) if tool_use_id else None
+    state_key = _tool_state_key(gen_id, tool_use_id) if tool_use_id else ""
+    popped = state_pop(state_key) if state_key else None
 
     # Dedicated hooks provide richer fields. Still pop generic state so a host
     # emitting both APIs does not leave dangling files.
@@ -1079,24 +1143,26 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
     sid = span_id_16()
     parent = gen_root_span_get(gen_id) if gen_id else ""
-    tool_input = (
-        _redact_deferred(
-            env.log_tool_content,
-            popped.get("tool_input", ""),
-            bool(popped.get("tool_input_redacted", False)),
-        )
-        if popped
-        else ""
-    )
-    if not tool_input:
+    tool_input, input_is_redacted = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+    if not tool_input and not input_is_redacted:
         raw_input = input_json.get("tool_input")
         if raw_input is None:
             raw_input = _jq_str(input_json, "toolInput", "input", "arguments", "args")
-        tool_input = redact_content(env.log_tool_content, _json_string(raw_input))
+        serialized_input = _json_string(raw_input)
+        tool_input = (
+            _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+            if state_key
+            else redact_content(env.log_tool_content, serialized_input)
+        )
     raw_output = input_json.get("tool_output")
     if raw_output is None:
         raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
-    output = redact_content(env.log_tool_content, _json_string(raw_output))
+    serialized_output = _json_string(raw_output)
+    output = (
+        _redact_terminal_field(f"{state_key}_privacy", "tool_output", serialized_output, env.log_tool_content)[0]
+        if state_key
+        else redact_content(env.log_tool_content, serialized_output)
+    )
     duration = _to_int(input_json.get("duration"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
 
@@ -1136,19 +1202,22 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     """Emit a TOOL span for failures, timeouts, denial, or interruption."""
     tool_name = _jq_str(input_json, "tool_name") or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
-    popped = state_pop(_tool_state_key(gen_id, tool_use_id)) if tool_use_id else None
-    tool_input = (
-        _redact_deferred(
-            env.log_tool_content,
-            popped.get("tool_input", ""),
-            bool(popped.get("tool_input_redacted", False)),
+    state_key = _tool_state_key(gen_id, tool_use_id) if tool_use_id else ""
+    popped = state_pop(state_key) if state_key else None
+    tool_input, input_is_redacted = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+    if not tool_input and not input_is_redacted:
+        serialized_input = _json_string(input_json.get("tool_input"))
+        tool_input = (
+            _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+            if state_key
+            else redact_content(env.log_tool_content, serialized_input)
         )
-        if popped
-        else ""
+    raw_error = _jq_str(input_json, "error_message")
+    error_message = (
+        _redact_terminal_field(f"{state_key}_privacy", "error_message", raw_error, env.log_tool_content)[0]
+        if state_key
+        else redact_content(env.log_tool_content, raw_error)
     )
-    if not tool_input:
-        tool_input = redact_content(env.log_tool_content, _json_string(input_json.get("tool_input")))
-    error_message = redact_content(env.log_tool_content, _jq_str(input_json, "error_message"))
     failure_type = _jq_str(input_json, "failure_type")
     duration = _to_int(input_json.get("duration"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
@@ -1202,8 +1271,11 @@ def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms
     subagent_id = _jq_str(input_json, "subagent_id")
     subagent_type = _jq_str(input_json, "subagent_type")
     raw_task = _jq_str(input_json, "task")
+    state_key = _subagent_state_key(gen_id, subagent_type, raw_task)
+    while state_pop(f"{state_key}_privacy"):
+        pass
     state_push(
-        _subagent_state_key(gen_id, subagent_type, raw_task),
+        state_key,
         {
             "start_ms": now_ms,
             "task": redact_content(env.log_prompts, raw_task),
@@ -1219,7 +1291,10 @@ def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms)
     """Emit one CHAIN span for a completed, failed, or aborted subagent."""
     raw_task = _jq_str(input_json, "task")
     stop_type = _jq_str(input_json, "subagent_type")
-    popped = state_pop(_subagent_state_key(gen_id, stop_type, raw_task))
+    state_key = _subagent_state_key(gen_id, stop_type, raw_task)
+    popped = state_pop(state_key)
+    privacy_key = f"{state_key}_privacy"
+    privacy_state = state_pop(privacy_key)
     subagent_id = (popped or {}).get("subagent_id", "") or _jq_str(input_json, "subagent_id")
     duration = _to_int(input_json.get("duration_ms"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
@@ -1227,11 +1302,20 @@ def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms)
     if popped:
         task_source = popped.get("task", "")
         task_was_redacted = bool(popped.get("task_redacted", False))
+    elif privacy_state:
+        task_source = privacy_state.get("task", "")
+        task_was_redacted = bool(privacy_state.get("task_redacted", False))
     else:
         task_source = raw_task
         task_was_redacted = False
     task = _redact_deferred(env.log_prompts, task_source, task_was_redacted)
-    summary = redact_content(env.log_model_outputs, _jq_str(input_json, "summary", "error_message"))
+    task_is_redacted = task_was_redacted or not env.log_prompts
+    privacy_record = dict(privacy_state or {})
+    privacy_record["task"] = task if task_is_redacted else ""
+    privacy_record["task_redacted"] = task_is_redacted
+    state_push(privacy_key, privacy_record)
+    raw_summary = _jq_str(input_json, "summary", "error_message")
+    summary = _redact_terminal_field(privacy_key, "summary", raw_summary, env.log_model_outputs)[0]
     attrs = {
         "openinference.span.kind": "CHAIN",
         "input.value": task,
