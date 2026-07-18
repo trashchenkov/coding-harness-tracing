@@ -9,30 +9,32 @@ single JSON object of the form:
       "sessionId": "abc123",
       "...": "type-specific fields" }
 
-Unlike opencode, omp's lifecycle events fire EXACTLY ONCE each and already
-carry final, structured data (the prompt, the completed AssistantMessage with
-inline usage + model, and that turn's toolResults). So this handler is a small
-state machine keyed by session id — structurally like the gemini handler — and
-needs NO message-id / callID dedup.
+OMP's lifecycle events normally fire once and carry final structured data, but
+the handler maintains defensive replay markers and stable span IDs so retried
+payloads remain idempotent.
 
 Span tree (one trace per agent run):
     Turn (CHAIN, root)             <- before_agent_start opens it, agent_end closes it
       |- LLM: <model> (LLM)        <- one per turn_end
-      \- <tool> (TOOL)             <- one per ToolResultMessage, child of the Turn root
+          \- <tool> (TOOL)         <- child of its requesting LLM when matched
 
 Tests are modelled after tests/tracing/opencode/test_opencode_hook.py.
 """
+
 from __future__ import annotations
 
 import io
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import tracing.omp.hooks.handlers as handlers_module
 from core.common import StateManager
 
 # Force synchronous send_span path in any handler that spawns a fork.
@@ -50,6 +52,7 @@ from tracing.omp.hooks.handlers import (  # noqa: E402
     _send_span_async,
     _text_of_content,
     _tool_calls,
+    _tool_identity,
     _user_prompt,
     main,
 )
@@ -319,10 +322,13 @@ class TestTurnEndBasic:
         assert state.get("current_trace_span_id") is not None
         # Lazily opened trace has an empty prompt.
         assert state.get("current_trace_prompt") == ""
-        # The child spans still got emitted under the lazily-opened root.
-        for s in captured_spans:
-            assert _get_span(s)["traceId"] == state.get("current_trace_id")
-            assert _get_span(s)["parentSpanId"] == state.get("current_trace_span_id")
+        # The LLM hangs off the lazily-opened root; matched tools hang off it.
+        llm = _get_span(_by_kind(captured_spans, "LLM")[0])
+        assert llm["traceId"] == state.get("current_trace_id")
+        assert llm["parentSpanId"] == state.get("current_trace_span_id")
+        for tool in _by_kind(captured_spans, "TOOL"):
+            assert _get_span(tool)["traceId"] == state.get("current_trace_id")
+            assert _get_span(tool)["parentSpanId"] == llm["spanId"]
 
 
 class TestTurnEndLLMSpan:
@@ -420,15 +426,14 @@ class TestTurnEndToolSpans:
         bash = next(s for s in _by_kind(captured_spans, "TOOL") if _name(s) == "bash")
         assert _get_attrs(bash)["tool.name"]["stringValue"] == "bash"
 
-    def test_tools_are_children_of_turn_root_not_llm(self, mock_resolve, mock_ensure, state, captured_spans):
-        """TOOL spans hang off the Turn root span id, NOT the LLM span."""
-        trace_id, span_id = _run_basic_turn(state)
+    def test_tools_are_children_of_requesting_llm(self, mock_resolve, mock_ensure, state, captured_spans):
+        """ToolCall.id ↔ ToolResultMessage.toolCallId proves TOOL → LLM."""
+        trace_id, _span_id = _run_basic_turn(state)
         llm_span_id = _get_span(_by_kind(captured_spans, "LLM")[0])["spanId"]
         for tool in _by_kind(captured_spans, "TOOL"):
             span = _get_span(tool)
             assert span["traceId"] == trace_id
-            assert span["parentSpanId"] == span_id
-            assert span["parentSpanId"] != llm_span_id
+            assert span["parentSpanId"] == llm_span_id
 
     def test_tool_timing_from_result_timestamp(self, mock_resolve, mock_ensure, state, captured_spans):
         """TOOL span end uses ToolResultMessage.timestamp (bash result = 5100ms)."""
@@ -559,6 +564,221 @@ class TestErrorTool:
 
 
 # ---------------------------------------------------------------------------
+# High-fidelity parentage, replay, and continuation contracts
+# ---------------------------------------------------------------------------
+
+
+class TestHighFidelityTurnTopology:
+    def test_tools_are_children_of_requesting_llm(self, mock_resolve, mock_ensure, state, captured_spans):
+        _run_basic_turn(state)
+        llm_span = _get_span(_by_kind(captured_spans, "LLM")[0])
+        tools = _by_kind(captured_spans, "TOOL")
+
+        assert len(tools) == 2
+        assert all(_get_span(tool)["parentSpanId"] == llm_span["spanId"] for tool in tools)
+        assert all(_get_attrs(tool)["tracing.parentage"]["stringValue"] == "assistant_tool_call" for tool in tools)
+
+    def test_turn_end_replay_is_idempotent(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        _handle_turn_end(payload)
+        first_ids = [_get_span(span)["spanId"] for span in captured_spans]
+
+        _handle_turn_end(payload)
+
+        assert [_get_span(span)["spanId"] for span in captured_spans] == first_ids
+
+    def test_unmatched_tool_result_uses_turn_fallback(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        payload["toolResults"][0]["toolCallId"] = "call_unmatched"
+        _handle_turn_end(payload)
+
+        unmatched = next(
+            tool
+            for tool in _by_kind(captured_spans, "TOOL")
+            if _get_attrs(tool)["tool.call_id"]["stringValue"] == "call_unmatched"
+        )
+        assert _get_span(unmatched)["parentSpanId"] == state.get("current_trace_span_id")
+        assert _get_attrs(unmatched)["tracing.parentage"]["stringValue"] == "turn_fallback"
+
+    def test_span_identity_is_stable_across_reconcile_attempts(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        _handle_turn_end(payload)
+        first_llm = _get_span(_by_kind(captured_spans, "LLM")[0])["spanId"]
+        first_tools = {
+            _get_attrs(s)["tool.call_id"]["stringValue"]: _get_span(s)["spanId"]
+            for s in _by_kind(captured_spans, "TOOL")
+        }
+
+        # Remove only emitted markers to exercise the reserved stable IDs without
+        # weakening the replay-idempotency contract above.
+        root_span_id = state.get("current_trace_span_id")
+        turn_identity = f"{root_span_id}:0"
+        state.delete(f"emitted_turn_{turn_identity}")
+        for result_index, call_id in enumerate(first_tools):
+            state.delete(f"emitted_tool_{_tool_identity(turn_identity, call_id, result_index)}")
+        _handle_turn_end(payload)
+
+        llms = _by_kind(captured_spans, "LLM")
+        tools = _by_kind(captured_spans, "TOOL")
+        assert _get_span(llms[-1])["spanId"] == first_llm
+        assert {_get_attrs(s)["tool.call_id"]["stringValue"]: _get_span(s)["spanId"] for s in tools[-2:]} == first_tools
+
+    def test_tool_without_call_id_is_scoped_to_its_turn(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        payload["toolResults"] = [payload["toolResults"][0]]
+        payload["toolResults"][0].pop("toolCallId")
+
+        payload["turnIndex"] = 0
+        _handle_turn_end(payload)
+        payload["turnIndex"] = 1
+        _handle_turn_end(payload)
+
+        assert len(_by_kind(captured_spans, "TOOL")) == 2
+
+    def test_reused_tool_call_id_is_scoped_to_its_turn(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        first = _load_fixture("turn_end_basic.json")
+        first["toolResults"] = [first["toolResults"][0]]
+        first["message"]["content"] = [first["message"]["content"][0]]
+        first["message"]["content"][0]["id"] = "same"
+        first["toolResults"][0]["toolCallId"] = "same"
+        _handle_turn_end(first)
+
+        second = json.loads(json.dumps(first))
+        second["turnIndex"] = 1
+        _handle_turn_end(second)
+
+        assert len(_by_kind(captured_spans, "LLM")) == 2
+        assert len(_by_kind(captured_spans, "TOOL")) == 2
+
+    def test_malformed_turn_index_is_bounded_and_does_not_bloat_state(
+        self, mock_resolve, mock_ensure, state, captured_spans
+    ):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        payload["turnIndex"] = "x" * 5000
+        _handle_turn_end(payload)
+
+        llm = _by_kind(captured_spans, "LLM")[0]
+        identity = _get_attrs(llm)["tracing.turn_identity"]["stringValue"]
+        assert len(identity) <= 1024
+        assert "x" * 100 not in identity
+        assert state.state_file.stat().st_size < 5000
+
+    def test_dispatch_lock_path_is_contained_for_unsafe_session_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(handlers_module, "STATE_DIR", tmp_path)
+        path = handlers_module._dispatch_lock_path({"sessionId": "../../../escaped/session" + ("x" * 5000)})
+        assert path.parent == tmp_path
+        assert path.name.startswith(".dispatch_h_")
+        assert len(path.name) < 100
+
+    def test_malformed_containers_and_counters_degrade_safely(self, mock_resolve, mock_ensure, state, captured_spans):
+        _handle_before_agent_start(_load_fixture("before_agent_start.json"))
+        payload = _load_fixture("turn_end_basic.json")
+        payload["message"]["content"] = 42
+        payload["message"]["usage"] = {
+            "input": True,
+            "output": -2,
+            "cacheRead": "4",
+            "cacheWrite": None,
+            "totalTokens": -9,
+            "cost": {"total": -1},
+        }
+        payload["message"]["timestamp"] = False
+        payload["message"]["duration"] = -10
+        payload["toolResults"] = 42
+
+        _handle_turn_end(payload)
+
+        llm = _by_kind(captured_spans, "LLM")[0]
+        attrs = _get_attrs(llm)
+        assert attrs["llm.token_count.prompt"]["intValue"] == 0
+        assert attrs["llm.token_count.completion"]["intValue"] == 0
+        assert attrs["llm.token_count.total"]["intValue"] == 0
+        assert "llm.cost" not in attrs
+        span = _get_span(llm)
+        assert span["startTimeUnixNano"] == span["endTimeUnixNano"]
+        assert _by_kind(captured_spans, "TOOL") == []
+
+    def test_exported_content_and_metadata_are_bounded(self, mock_resolve, mock_ensure, state, captured_spans):
+        huge = "x" * 70000
+        _handle_before_agent_start({"type": "before_agent_start", "sessionId": "s", "prompt": huge})
+        payload = _load_fixture("turn_end_basic.json")
+        payload["message"]["model"] = huge
+        payload["message"]["provider"] = huge
+        payload["message"]["responseId"] = huge
+        payload["message"]["content"] = [
+            {"type": "text", "text": huge},
+            {"type": "toolCall", "id": "call_1", "name": huge, "arguments": {"value": huge}},
+        ]
+        payload["toolResults"] = [
+            {
+                "role": "toolResult",
+                "toolCallId": "call_1",
+                "toolName": huge,
+                "content": [{"type": "text", "text": huge}],
+                "isError": False,
+                "timestamp": 5100,
+            }
+        ]
+
+        _handle_turn_end(payload)
+
+        llm_attrs = _get_attrs(_by_kind(captured_spans, "LLM")[0])
+        tool_attrs = _get_attrs(_by_kind(captured_spans, "TOOL")[0])
+        for key in ("input.value", "output.value"):
+            assert len(llm_attrs[key]["stringValue"]) <= 65536
+            assert len(tool_attrs[key]["stringValue"]) <= 65536
+            assert "<truncated " in llm_attrs[key]["stringValue"]
+            assert "<truncated " in tool_attrs[key]["stringValue"]
+        for value in (
+            llm_attrs["llm.model_name"]["stringValue"],
+            llm_attrs["llm.provider"]["stringValue"],
+            llm_attrs["llm.response_id"]["stringValue"],
+            tool_attrs["tool.name"]["stringValue"],
+        ):
+            assert len(value) <= 1024
+            assert "<truncated " in value
+
+    def test_same_turn_index_in_new_run_gets_new_span_ids(self, mock_resolve, mock_ensure, state, captured_spans):
+        start = _load_fixture("before_agent_start.json")
+        turn = _load_fixture("turn_end_basic.json")
+        end = _load_fixture("agent_end.json")
+
+        _handle_before_agent_start(start)
+        _handle_turn_end(turn)
+        first_llm_id = _get_span(_by_kind(captured_spans, "LLM")[-1])["spanId"]
+        first_tool_ids = {_get_span(span)["spanId"] for span in _by_kind(captured_spans, "TOOL")}
+        _handle_agent_end(end)
+
+        _handle_before_agent_start(start)
+        _handle_turn_end(turn)
+        second_llm_id = _get_span(_by_kind(captured_spans, "LLM")[-1])["spanId"]
+        second_tool_ids = {_get_span(span)["spanId"] for span in _by_kind(captured_spans, "TOOL")} - first_tool_ids
+
+        assert second_llm_id != first_llm_id
+        assert len(second_tool_ids) == 2
+        assert second_tool_ids.isdisjoint(first_tool_ids)
+
+
+class TestAgentContinuation:
+    def test_will_continue_does_not_close_trace(self, mock_resolve, mock_ensure, state, captured_spans):
+        _run_basic_turn(state)
+        trace_id = state.get("current_trace_id")
+        payload = _load_fixture("agent_end.json")
+        payload["willContinue"] = True
+
+        _handle_agent_end(payload)
+
+        assert _by_kind(captured_spans, "CHAIN") == []
+        assert state.get("current_trace_id") == trace_id
+
+
+# ---------------------------------------------------------------------------
 # agent_end — emits the Turn CHAIN root and clears state
 # ---------------------------------------------------------------------------
 
@@ -611,8 +831,8 @@ class TestAgentEnd:
 
     def test_output_prefers_messages_over_stale_accumulator(self, mock_resolve, mock_ensure, state, captured_spans):
         """The final answer fires its own turn_end AND lands in agent_end.messages.
-        Because each event runs in a separate detached process racing on shared
-        state, agent_end must read its own messages payload, not the accumulator."""
+        The payload is authoritative even if the state accumulator is stale, so
+        agent_end must read its own messages payload first."""
         _handle_before_agent_start(_load_fixture("before_agent_start.json"))
         # Simulate a stale accumulator: a prior turn's text is what a racing
         # turn_end would have left behind when agent_end's process reads state.
@@ -943,6 +1163,42 @@ class TestMainEntryPoint:
             ),
         ):
             main()  # must not raise
+
+    def test_same_session_dispatch_is_serialized(self, monkeypatch, tmp_path):
+        """Detached handlers for one session must not overlap state transactions."""
+        payload = {"type": "turn_end", "sessionId": "same", "message": {}, "toolResults": []}
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+        both_started = threading.Barrier(2, timeout=5)
+
+        def slow_handler(_payload):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.15)
+            with guard:
+                active -= 1
+
+        def run_one():
+            both_started.wait()
+            main()
+
+        monkeypatch.setattr("tracing.omp.hooks.handlers.STATE_DIR", tmp_path)
+        with (
+            mock.patch("tracing.omp.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.omp.hooks.handlers._read_stdin", return_value=payload),
+            mock.patch("tracing.omp.hooks.handlers._handle_turn_end", side_effect=slow_handler),
+        ):
+            threads = [threading.Thread(target=run_one) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+        assert max_active == 1
 
     def test_no_system_exit_on_unknown(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")

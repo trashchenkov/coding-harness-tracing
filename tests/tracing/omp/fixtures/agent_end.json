@@ -7,9 +7,18 @@
       "content": [{ "type": "text", "text": "fallback final answer" }],
       "provider": "anthropic",
       "model": "claude-sonnet-4",
-      "usage": { "input": 5, "output": 8, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 13, "cost": { "total": 0.0001 } },
-      "stopReason": "end_turn",
+      "api": "messages",
+      "usage": {
+        "input": 5,
+        "output": 8,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 13,
+        "cost": { "input": 0.00003, "output": 0.00007, "cacheRead": 0, "cacheWrite": 0, "total": 0.0001 }
+      },
+      "stopReason": "stop",
       "timestamp": 6000
     }
-  ]
+  ],
+  "willContinue": false
 }

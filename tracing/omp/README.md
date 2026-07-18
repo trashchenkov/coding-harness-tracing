@@ -10,7 +10,7 @@ One trace per **agent run** — one user prompt → the agent's internal turn/to
 |------|------|-------|
 | `Turn` | CHAIN | Root span. `input.value` is the user prompt (from `before_agent_start`); `output.value` is the final assistant message's text. One per agent run. |
 | `LLM: <model>` | LLM | Child of `Turn`. One per `turn_end` (one per model call in the loop). Carries `llm.model_name`, `llm.provider`, prompt/completion/reasoning token counts, cache read/write tokens, and `llm.cost`. |
-| `<tool>` | TOOL | Child of `Turn`. One per `ToolResultMessage` in a `turn_end`, paired with its originating `ToolCall` by id. Records `tool.name`, redacted input args + output, and tool-specific attributes. Errors are recorded with span status. |
+| `<tool>` | TOOL | Child of the `LLM` span that requested it. One per `ToolResultMessage` in a `turn_end`, paired with its originating `ToolCall` by id. Records `tool.name`, input args + output subject to the content flags below, and tool-specific attributes. Errors are recorded with span status. |
 
 Token usage **is** captured — omp surfaces cumulative `usage` (input/output/reasoning tokens, cache read/write, and cost) inline on each assistant message, unlike vendors that withhold it from local surfaces.
 
@@ -18,12 +18,26 @@ Timestamps come from omp's own millisecond clocks where present (`AssistantMessa
 
 ## Architecture
 
-omp loads its extensions **in-process** inside its Bun runtime ([hook docs](https://omp.sh/docs/hooks)) — there is no per-event subprocess and no host-spawned hook. Unlike opencode, omp exposes rich, **once-fired** lifecycle events that already carry final, structured data, so the integration is a straightforward stateful event-forward (no snapshot reconciliation, no dedup). It is split into two pieces:
+OMP loads its extensions **in-process** inside its Bun runtime ([hook docs](https://omp.sh/docs/hooks)). Unlike snapshot-based integrations, OMP exposes rich, normally once-fired lifecycle events that already carry final structured data. The integration is split into two pieces:
 
-1. **TypeScript hook shim** (`~/.omp/extensions/arize-tracing.ts`). A dumb bridge. On a small whitelist of lifecycle events — `before_agent_start` (carries the prompt), `turn_end` (carries the completed `AssistantMessage` with inline token usage + model, plus that turn's `toolResults`), `agent_end` (run finished), and `session_shutdown` — it spawns `arize-hook-omp` detached and pipes the event payload to stdin. The shim contains no tracing logic and never blocks omp's event loop.
-2. **Python event handler** (`arize-hook-omp`). A small state machine keyed by session id. It dispatches on `payload["type"]`, accumulates per-session state, and emits `Turn`/`LLM`/`TOOL` spans on receipt. Pairs each `ToolCall` with its `ToolResultMessage` by id to build TOOL spans with both input args and output.
+1. **TypeScript hook shim** (`~/.omp/extensions/arize-tracing.ts`). A dumb bridge. On a small whitelist of lifecycle events — `before_agent_start` (carries the prompt), `turn_end` (carries the completed `AssistantMessage` with inline token usage + model, plus that turn's `toolResults`), `agent_end` (run finished), and `session_shutdown` — it spawns `arize-hook-omp`, pipes the event payload to stdin, and awaits dispatcher completion for at most 1.5 seconds. This preserves lifecycle state ordering while staying below OMP's 2-second shutdown hook deadline.
+2. **Python event handler** (`arize-hook-omp`). A small state machine keyed by session id. It dispatches on `payload["type"]`, accumulates per-session state, and emits `Turn`/`LLM`/`TOOL` spans on receipt. It pairs each `ToolCall` with its `ToolResultMessage` by id to build TOOL spans with both input args and output.
 
-Because omp's lifecycle events fire exactly once each and carry final data, there is no message-id or callID dedup — spans are emitted as events arrive.
+The handler derives stable LLM and TOOL span IDs from the current root span, validated `turnIndex`, and a hash of the tool call id. TOOL replay identity is turn-scoped, so providers may reuse a call id in a later turn without losing a span. Persisted replay markers suppress duplicate exports when an event is retried. A separate per-session dispatch lock serializes the full check → emit → mark transaction across dispatcher processes while leaving different sessions independent. Session IDs that are unsafe or oversized for filenames are represented by stable SHA-256 filesystem tokens. Lock timeout fails soft without deleting another process's live lock.
+
+`agent_end` carries omp's authoritative `willContinue` flag. When it is true, the handler keeps the current trace open for the next internal loop; only a terminal `agent_end` or `session_shutdown` closes the root span and clears active trace state.
+
+## Content controls
+
+Structural telemetry remains available when content logging is disabled:
+
+| Environment variable | When `false` |
+|----------------------|--------------|
+| `ARIZE_LOG_PROMPTS` | Redacts user/assistant text while retaining span topology, model and usage metadata. |
+| `ARIZE_LOG_TOOL_DETAILS` | Omits tool-specific detail attributes such as file paths and command fields. |
+| `ARIZE_LOG_TOOL_CONTENT` | Redacts tool arguments and results while retaining tool name, call id, timing and status. |
+
+All three default to `true`; set them explicitly for privacy-sensitive environments.
 
 ## Setup
 
@@ -111,7 +125,7 @@ Uninstall removes the shim's path from the `extensions` array in `~/.omp/agent/s
 | Hook file | `~/.omp/extensions/arize-tracing.ts` |
 | Registration | absolute path in `extensions` array of `~/.omp/agent/settings.json` |
 | Lifecycle events forwarded | `before_agent_start`, `turn_end`, `agent_end`, `session_shutdown` |
-| Span tree | `Turn` (CHAIN) → `LLM` / `TOOL` |
+| Span tree | `Turn` (CHAIN) → `LLM` → requesting `TOOL`; additional LLM cycles remain children of `Turn` |
 | Trace granularity | one trace per agent run |
 | State directory | `~/.arize/harness/state/omp/` |
 | Log file | `~/.arize/harness/logs/omp.log` |

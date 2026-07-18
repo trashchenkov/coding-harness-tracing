@@ -1,7 +1,7 @@
 {
   "type": "turn_end",
   "sessionId": "s_err",
-  "turnIndex": 0,
+  "turnIndex": 1,
   "message": {
     "role": "assistant",
     "content": [
@@ -19,7 +19,7 @@
       "totalTokens": 15,
       "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
     },
-    "stopReason": "tool_use",
+    "stopReason": "toolUse",
     "timestamp": 3000
   },
   "toolResults": [

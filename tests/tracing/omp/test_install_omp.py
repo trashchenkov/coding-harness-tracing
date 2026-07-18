@@ -199,6 +199,23 @@ class TestInstallCopiesShim:
         install()
         assert plugin_file.read_text(encoding="utf-8") == plugin_source_text
 
+    def test_plugin_forwards_agent_end_continuation(self, plugin_source_text):
+        """AgentEndEvent.willContinue must reach the Python lifecycle handler."""
+        assert "willContinue: event.willContinue" in plugin_source_text
+
+    def test_plugin_uses_current_omp_extension_types(self, plugin_source_text):
+        assert "ExtensionAPI" in plugin_source_text
+        assert "ExtensionContext" in plugin_source_text
+        assert "HookAPI" not in plugin_source_text
+        assert "HookContext" not in plugin_source_text
+
+    def test_plugin_awaits_ordered_child_completion(self, plugin_source_text):
+        assert "function forward(payload: unknown): Promise<void>" in plugin_source_text
+        assert plugin_source_text.count("await forward(") == 4
+        assert "detached: true" not in plugin_source_text
+        assert ".unref()" not in plugin_source_text
+        assert 'child.stdin?.on("error"' in plugin_source_text
+
     def test_plugin_file_has_arize_header_marker(self, plugin_file, monkeypatch):
         """The shim's first line must carry the Arize header marker (basis for uninstall guard)."""
         _mock_prompts(monkeypatch)

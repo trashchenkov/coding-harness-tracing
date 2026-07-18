@@ -12,6 +12,7 @@ omp also differs from opencode in project-name derivation: there is no
 snapshot/message payload to mine, so the chain is simply
 ``env.project_name`` -> ``os.path.basename(os.getcwd())`` -> ``HARNESS_NAME``.
 """
+
 from __future__ import annotations
 
 import json
@@ -99,24 +100,24 @@ class TestResolveSession:
     def test_uses_session_id_from_payload(self, omp_state_dir, disable_env_vars):
         """sessionId in input_json is used as the state file key."""
         sm = adapter.resolve_session({"sessionId": "abc123"})
-        assert sm.state_file == omp_state_dir / "state_abc123.json"
+        assert sm.state_file == omp_state_dir / "state_s_abc123.json"
         assert sm.state_file.exists()
 
     def test_unknown_fallback_when_missing(self, omp_state_dir, disable_env_vars):
         """Missing sessionId -> per-process 'unknown-<pid>' key."""
         sm = adapter.resolve_session({})
-        assert sm.state_file == omp_state_dir / f"state_unknown-{os.getpid()}.json"
+        assert sm.state_file == omp_state_dir / f"state_f_{os.getpid()}.json"
         assert sm.state_file.exists()
 
     def test_unknown_fallback_when_empty(self, omp_state_dir, disable_env_vars):
         """Empty sessionId -> per-process 'unknown-<pid>' key."""
         sm = adapter.resolve_session({"sessionId": ""})
-        assert sm.state_file == omp_state_dir / f"state_unknown-{os.getpid()}.json"
+        assert sm.state_file == omp_state_dir / f"state_f_{os.getpid()}.json"
 
     def test_unknown_fallback_when_none(self, omp_state_dir, disable_env_vars):
         """Explicit None sessionId -> per-process 'unknown-<pid>' key."""
         sm = adapter.resolve_session({"sessionId": None})
-        assert sm.state_file == omp_state_dir / f"state_unknown-{os.getpid()}.json"
+        assert sm.state_file == omp_state_dir / f"state_f_{os.getpid()}.json"
 
     def test_idless_fallback_is_per_process(self, omp_state_dir, disable_env_vars):
         """Missing sessionId keys off pid so concurrent id-less runs don't collide.
@@ -130,7 +131,7 @@ class TestResolveSession:
         for f in files:
             key = f.stem.replace("state_", "", 1)
             assert not key.isdigit(), f"bare PID-keyed state file produced: {f.name}"
-            assert key == f"unknown-{os.getpid()}"
+            assert key == f"f_{os.getpid()}"
 
     def test_init_state_called(self, omp_state_dir, disable_env_vars):
         """Returned StateManager has init_state() called (file exists with {})."""
@@ -148,7 +149,7 @@ class TestResolveSession:
     def test_lock_path_matches_key(self, omp_state_dir, disable_env_vars):
         """Lock file is named .lock_{key} in STATE_DIR."""
         sm = adapter.resolve_session({"sessionId": "ses_lock"})
-        assert sm._lock_path == omp_state_dir / ".lock_ses_lock"
+        assert sm._lock_path == omp_state_dir / ".lock_s_ses_lock"
 
     def test_state_dir_attribute(self, omp_state_dir, disable_env_vars):
         """The StateManager.state_dir attribute matches adapter.STATE_DIR."""
@@ -162,12 +163,45 @@ class TestResolveSession:
         opencode-style ``sessionID`` must fall through to the 'unknown-<pid>' key.
         """
         sm = adapter.resolve_session({"sessionID": "WRONG_CASE"})
-        assert sm.state_file == omp_state_dir / f"state_unknown-{os.getpid()}.json"
+        assert sm.state_file == omp_state_dir / f"state_f_{os.getpid()}.json"
 
     def test_extra_payload_fields_ignored(self, omp_state_dir, disable_env_vars):
         """Extra payload fields are not used for the session key."""
         sm = adapter.resolve_session({"sessionId": "ses_only", "type": "turn_end", "message": {}})
-        assert sm.state_file == omp_state_dir / "state_ses_only.json"
+        assert sm.state_file == omp_state_dir / "state_s_ses_only.json"
+
+    def test_unsafe_or_oversized_session_id_cannot_escape_state_dir(self, omp_state_dir, disable_env_vars):
+        unsafe = "../../../escaped/session" + ("x" * 5000)
+        sm = adapter.resolve_session({"sessionId": unsafe})
+
+        assert sm.state_file.parent == omp_state_dir
+        assert sm._lock_path.parent == omp_state_dir
+        assert sm.state_file.name.startswith("state_h_")
+        assert len(sm.state_file.name) < 100
+        assert not (omp_state_dir.parent / "escaped").exists()
+
+    def test_generated_and_literal_session_key_namespaces_are_disjoint(self):
+        generated = adapter.session_file_key({"sessionId": "../../../escaped/session"})
+        literal = adapter.session_file_key({"sessionId": generated})
+
+        assert generated.startswith("h_")
+        assert literal.startswith("s_")
+        assert generated != literal
+
+    def test_missing_and_literal_fallback_session_key_namespaces_are_disjoint(self):
+        fallback = adapter.session_file_key({})
+        literal = adapter.session_file_key({"sessionId": f"unknown-{os.getpid()}"})
+
+        assert fallback.startswith("f_")
+        assert literal.startswith("s_")
+        assert fallback != literal
+
+    def test_distinct_json_surrogates_have_distinct_session_keys(self):
+        first = json.loads('"\\ud800"')
+        second = json.loads('"\\ud801"')
+
+        assert first != second
+        assert adapter.session_file_key({"sessionId": first}) != adapter.session_file_key({"sessionId": second})
 
 
 # ── ensure_session_initialized tests ─────────────────────────────────────────
