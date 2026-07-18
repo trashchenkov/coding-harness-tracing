@@ -476,11 +476,11 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
         command_was_redacted = False
     start_ms = start_ms or str(now_ms)
 
-    # Override command from after-event if present
+    # Use the after-event command only when creation-time state did not redact
+    # it. A terminal payload must not reverse an earlier privacy decision.
     after_cmd = _jq_str(input_json, "command", "shell_command")
-    if after_cmd:
+    if after_cmd and not command_was_redacted:
         command = after_cmd
-        command_was_redacted = False
 
     output = _jq_str(input_json, "output", "stdout", "result")
     exit_code = _jq_str(input_json, "exit_code", "exitCode")

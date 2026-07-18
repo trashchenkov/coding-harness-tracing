@@ -1595,6 +1595,43 @@ class TestDeferredStatePrivacy:
         assert "SHELL_DISK_SECRET" not in state_text
         assert "<redacted" in state_text
 
+    def test_shell_creation_redaction_is_irreversible_when_after_event_repeats_command(
+        self, captured_spans, monkeypatch
+    ):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+        command = "printf IRREVERSIBLE_SHELL_SECRET"
+        _dispatch(
+            "beforeShellExecution",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "command": command,
+            },
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+        _dispatch(
+            "afterShellExecution",
+            {
+                "conversation_id": "privacy-conv",
+                "generation_id": "privacy-gen",
+                "command": command,
+                "output": "done",
+                "exit_code": "0",
+            },
+        )
+
+        shell_payload = next(
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Shell"
+        )
+        shell_span = shell_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in shell_span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
+
     def test_stop_reapplies_current_prompt_and_model_output_policy(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
