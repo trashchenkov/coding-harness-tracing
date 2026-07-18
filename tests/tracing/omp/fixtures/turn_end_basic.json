@@ -22,7 +22,7 @@
       "reasoningTokens": 7,
       "cost": { "input": 0.001, "output": 0.002, "cacheRead": 0.0001, "cacheWrite": 0.00005, "total": 0.0125 }
     },
-    "stopReason": "tool_use",
+    "stopReason": "toolUse",
     "timestamp": 5000,
     "duration": 3000
   },

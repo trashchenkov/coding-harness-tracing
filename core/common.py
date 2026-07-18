@@ -757,9 +757,10 @@ class FileLock:
     - mkdir fallback: creates lock_path as a directory (matches bash behavior)
     """
 
-    def __init__(self, lock_path: Path, timeout: float = 3.0) -> None:
+    def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True) -> None:
         self.lock_path = Path(lock_path)
         self.timeout = timeout
+        self.break_on_timeout = break_on_timeout
         self._fd: Optional[IO[str]] = None
         self._method = _LOCK_IMPL
 
@@ -791,8 +792,11 @@ class FileLock:
                 return
             except (OSError, BlockingIOError):
                 if time.monotonic() >= deadline:
-                    # Force-acquire: close, remove, reopen
                     self._fd.close()
+                    self._fd = None
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
+                    # Force-acquire: remove and reopen the lock inode.
                     try:
                         self.lock_path.unlink(missing_ok=True)
                     except OSError:
@@ -824,6 +828,9 @@ class FileLock:
             except (OSError, IOError):
                 if time.monotonic() >= deadline:
                     self._fd.close()
+                    self._fd = None
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                     try:
                         self.lock_path.unlink(missing_ok=True)
                     except OSError:
@@ -853,6 +860,8 @@ class FileLock:
                 return
             except FileExistsError:
                 if time.monotonic() >= deadline:
+                    if not self.break_on_timeout:
+                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                     # Force-acquire: remove and recreate (matches bash lines 67-70)
                     try:
                         shutil.rmtree(self.lock_path)

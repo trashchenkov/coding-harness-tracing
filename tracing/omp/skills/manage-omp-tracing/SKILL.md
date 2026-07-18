@@ -5,7 +5,7 @@ description: Set up and configure Arize tracing for Oh My Pi (omp) terminal codi
 
 # Setup omp Tracing
 
-Configure OpenInference tracing for **Oh My Pi (omp)** terminal coding sessions to Arize AX (cloud) or Phoenix (self-hosted). Like opencode, omp loads its extensions [in-process inside its Bun runtime](https://omp.sh/docs/hooks) — there is no per-event subprocess. The integration ships as a small TypeScript hook shim that forwards omp's once-fired lifecycle events to a Python handler (`arize-hook-omp`) which emits spans. Spans are sent directly to the backend from the handler — no separate buffer/collector service is required.
+Configure OpenInference tracing for **Oh My Pi (omp)** terminal coding sessions to Arize AX (cloud) or Phoenix (self-hosted). OMP loads its extensions [in-process inside its Bun runtime](https://omp.sh/docs/hooks). The integration ships as a small TypeScript hook shim that forwards OMP's lifecycle events to a short-lived Python dispatcher (`arize-hook-omp`). The shim awaits dispatcher completion (bounded to 1.5 seconds) so state mutations preserve lifecycle order; span export remains asynchronous and fail-soft. No separate buffer/collector service is required.
 
 ## How to Use This Skill
 
@@ -189,9 +189,9 @@ Tell the user:
 
 ## Architecture (How spans are produced)
 
-omp loads its extensions **in-process** inside its Bun runtime ([hook docs](https://omp.sh/docs/hooks)). Unlike opencode, omp exposes rich, **once-fired** lifecycle events that already carry final, structured data, so the Arize integration is a stateful event-forward (no snapshot reconciliation, no dedup). It is split into two pieces:
+OMP loads its extensions **in-process** inside its Bun runtime ([hook docs](https://omp.sh/docs/hooks)). Unlike opencode, OMP exposes rich, **once-fired** lifecycle events that already carry final, structured data, so the Arize integration is a stateful event-forward with defensive replay idempotency rather than snapshot reconciliation. It is split into two pieces:
 
-1. **TypeScript hook shim** at `~/.omp/extensions/arize-tracing.ts`. A dumb bridge. On a whitelist of lifecycle events — `before_agent_start` (the prompt), `turn_end` (the completed `AssistantMessage` with inline token usage + model, plus that turn's `toolResults`), `agent_end` (run finished), and `session_shutdown` — it spawns `arize-hook-omp` detached and pipes the event payload to stdin. The shim contains no tracing logic and never blocks omp's event loop.
+1. **TypeScript hook shim** at `~/.omp/extensions/arize-tracing.ts`. A dumb bridge. On a whitelist of lifecycle events — `before_agent_start` (the prompt), `turn_end` (the completed `AssistantMessage` with inline token usage + model, plus that turn's `toolResults`), `agent_end` (run finished), and `session_shutdown` — it spawns `arize-hook-omp`, pipes the event payload to stdin, and awaits completion for at most 1.5 seconds. The shim contains no tracing logic; the bounded wait preserves lifecycle ordering and stays below OMP's 2-second shutdown hook deadline.
 2. **Python event handler** (`arize-hook-omp`). A small state machine keyed by session id. It dispatches on `payload["type"]`, accumulates per-session state, and emits `Turn`/`LLM`/`TOOL` spans on receipt. Pairs each `ToolCall` with its `ToolResultMessage` by id to build TOOL spans with both input args and output.
 
 ## Span tree

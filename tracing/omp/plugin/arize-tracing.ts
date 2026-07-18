@@ -1,31 +1,23 @@
 // Arize omp tracing hook (shim).
 //
-// This file ships in the repo and is copied into the user's omp extensions
-// dir (~/.omp/extensions/) by the installer, then registered by absolute path
-// in the "extensions" array of ~/.omp/agent/settings.json (omp does NOT
-// auto-discover an extensions dir). omp loads it in-process inside its own Bun
-// runtime. The shim is a DUMB BRIDGE: it contains no tracing logic. On a small
-// whitelist of once-fired lifecycle events it spawns the Python entry point
-// `arize-hook-omp` (detached, fire-and-forget) with the event payload piped to
-// stdin. ALL parsing, span building, and token math happens in the Python
-// handler (tracing/omp/hooks/handlers.py).
+// OMP loads this extension in-process in Bun. The shim is intentionally a dumb
+// bridge: it forwards four authoritative lifecycle payloads to arize-hook-omp;
+// all state, span construction, privacy handling, and token math stay in Python.
 //
-// Verified against omp's HookAPI / examples (https://omp.sh/docs/hooks and
-// packages/coding-agent/examples/hooks/*.ts, e.g. auto-commit-on-exit.ts):
-//   - a hook default-exports a factory `function (pi: HookAPI)`;
-//   - handlers register via `pi.on(eventName, (event, ctx) => ...)`;
-//   - `session_shutdown` fires with an empty event, so the session id is read
-//     from the hook context via ctx.sessionManager.getSessionId(), not the event.
-// `import type` is erasable, so Bun runs this file directly with no npm deps.
+// OMP awaits async extension handlers in registration order. We therefore await
+// each short-lived Python dispatcher instead of detaching it, preserving event
+// completion and per-session ordering. Python exports spans in its own detached
+// fail-soft child, so this wait covers state mutation rather than OTLP latency.
 //
-// Forwarded payload contract (do not change top-level type/sessionId without
-// updating the Python handler):
+// Forwarded payload contract:
 //   { type, sessionId, ...eventFields }
 
 import { spawn } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
-import type { HookAPI, HookContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+
+const FORWARD_TIMEOUT_MS = 1500;
 
 function binaryPath(): string {
   const base = join(homedir(), ".arize", "harness", "venv");
@@ -34,26 +26,45 @@ function binaryPath(): string {
     : join(base, "bin", "arize-hook-omp");
 }
 
-function forward(payload: unknown): void {
-  try {
-    const child = spawn(binaryPath(), [], {
-      stdio: ["pipe", "ignore", "ignore"],
-      detached: true,
-    });
-    child.on("error", () => {});
-    child.stdin?.write(JSON.stringify(payload));
-    child.stdin?.end();
-    child.unref();
-  } catch {
-    /* fail-soft: tracing must never break the host */
-  }
+function forward(payload: unknown): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(binaryPath(), [], {
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const stop = (): void => {
+        try {
+          child.kill();
+        } catch {
+          /* already exited */
+        }
+        finish();
+      };
+      const timer = setTimeout(stop, FORWARD_TIMEOUT_MS);
+
+      child.once("error", finish);
+      child.once("close", finish);
+      child.stdin?.on("error", stop);
+      try {
+        child.stdin?.end(JSON.stringify(payload));
+      } catch {
+        stop();
+      }
+    } catch {
+      resolve();
+    }
+  });
 }
 
-// Resolve the omp session id from the hook context. session_shutdown's event
-// payload is empty, so every payload is stamped with the id read from ctx.
-// ReadonlySessionManager exposes getSessionId() (a method) — verified against
-// packages/coding-agent/src/session/session-manager.ts.
-function sessionIdOf(ctx: HookContext): string {
+// session_shutdown has an empty event, so stamp every payload from context.
+function sessionIdOf(ctx: ExtensionContext): string {
   try {
     return ctx.sessionManager.getSessionId() || "";
   } catch {
@@ -61,10 +72,10 @@ function sessionIdOf(ctx: HookContext): string {
   }
 }
 
-export default function (pi: HookAPI): void {
+export default function (pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     try {
-      forward({ type: "before_agent_start", sessionId: sessionIdOf(ctx), prompt: event.prompt });
+      await forward({ type: "before_agent_start", sessionId: sessionIdOf(ctx), prompt: event.prompt });
     } catch {
       /* fail-soft */
     }
@@ -72,7 +83,7 @@ export default function (pi: HookAPI): void {
 
   pi.on("turn_end", async (event, ctx) => {
     try {
-      forward({
+      await forward({
         type: "turn_end",
         sessionId: sessionIdOf(ctx),
         turnIndex: event.turnIndex,
@@ -86,7 +97,12 @@ export default function (pi: HookAPI): void {
 
   pi.on("agent_end", async (event, ctx) => {
     try {
-      forward({ type: "agent_end", sessionId: sessionIdOf(ctx), messages: event.messages });
+      await forward({
+        type: "agent_end",
+        sessionId: sessionIdOf(ctx),
+        messages: event.messages,
+        willContinue: event.willContinue,
+      });
     } catch {
       /* fail-soft */
     }
@@ -94,7 +110,7 @@ export default function (pi: HookAPI): void {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     try {
-      forward({ type: "session_shutdown", sessionId: sessionIdOf(ctx) });
+      await forward({ type: "session_shutdown", sessionId: sessionIdOf(ctx) });
     } catch {
       /* fail-soft */
     }

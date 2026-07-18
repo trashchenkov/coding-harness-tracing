@@ -12,9 +12,12 @@ Unlike opencode there is no snapshot/message payload to mine for the project
 name, so the derivation chain is simply
 ``env.project_name`` -> ``os.path.basename(os.getcwd())`` -> ``HARNESS_NAME``.
 """
+
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import time
 
 from core.common import StateManager, env, get_timestamp_ms, log, redirect_stderr_to_log_file
@@ -26,6 +29,8 @@ _HARNESS = HARNESSES["omp"]
 SERVICE_NAME = _HARNESS["service_name"]  # "omp"
 SCOPE_NAME = _HARNESS["scope_name"]  # "arize-omp-plugin"
 STATE_DIR = STATE_BASE_DIR / _HARNESS["state_subdir"]  # ~/.arize/harness/state/omp
+_SAFE_SESSION_KEY = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_MAX_SESSION_ID_CHARS = 1_024
 
 # Route hook stderr to a per-harness log file unless the user already set one.
 os.environ.setdefault("ARIZE_LOG_FILE", str(_HARNESS["default_log_file"]))
@@ -40,6 +45,11 @@ def check_requirements() -> bool:
     return True
 
 
+def _raw_session_id(input_json: dict) -> str:
+    value = input_json.get("sessionId")
+    return value if isinstance(value, str) and value else f"unknown-{os.getpid()}"
+
+
 def _session_key(input_json: dict) -> str:
     """Return the omp ``sessionId``, or a per-process fallback when it is absent.
 
@@ -48,20 +58,36 @@ def _session_key(input_json: dict) -> str:
     literal, so two concurrent id-less runs cannot clobber each other's state
     file. Within a single event's process the pid is stable, so ``resolve_session``
     and ``ensure_session_initialized`` agree on the key; span correlation across a
-    run's separate detached processes is already impossible without a real
+    run's separate dispatcher processes is already impossible without a real
     ``sessionId``, so no correlation is lost by using the pid here.
     """
-    return input_json.get("sessionId") or f"unknown-{os.getpid()}"
+    session_id = _raw_session_id(input_json)
+    if len(session_id) <= _MAX_SESSION_ID_CHARS:
+        return session_id
+    marker = f"<truncated {len(session_id) - _MAX_SESSION_ID_CHARS} chars>"
+    return session_id[: _MAX_SESSION_ID_CHARS - len(marker)] + marker
+
+
+def session_file_key(input_json: dict) -> str:
+    """Return a stable, single-component filesystem key for an OMP session."""
+    value = input_json.get("sessionId")
+    if not isinstance(value, str) or not value:
+        return f"f_{os.getpid()}"
+    session_id = value
+    if _SAFE_SESSION_KEY.fullmatch(session_id):
+        return f"s_{session_id}"
+    digest = hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"h_{digest}"
 
 
 def resolve_session(input_json: dict) -> StateManager:
-    """Build a StateManager keyed off the omp ``sessionId`` payload field.
+    """Build a StateManager keyed off a filesystem-safe session token.
 
-    Missing/empty sessionId falls back to a per-process ``"unknown-<pid>"`` key
-    (see ``_session_key``) — omp adapters never use PID-based keys for real
-    sessions.
+    Normal short alphanumeric IDs remain readable. Unsafe or oversized IDs are
+    represented by a stable SHA-256 token, so they cannot escape ``STATE_DIR``.
+    Missing/empty IDs use a per-process ``"unknown-<pid>"`` fallback.
     """
-    key = _session_key(input_json)
+    key = session_file_key(input_json)
 
     state_file = STATE_DIR / f"state_{key}.json"
     lock_path = STATE_DIR / f".lock_{key}"
