@@ -75,7 +75,8 @@ acquire_lock() {
     done
     echo "$$" > "$LOCK_DIR/pid"
     LOCK_HELD=1
-    trap 'release_lock' EXIT HUP INT TERM
+    trap 'release_lock' EXIT
+    trap 'release_lock; exit 0' HUP INT TERM
 }
 
 # --- Find the entry point binary ---
