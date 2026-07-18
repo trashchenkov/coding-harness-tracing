@@ -19,4 +19,5 @@ HOOK_EVENTS: dict[str, str] = {
     "PostToolUse": "arize-hook-copilot-post-tool",
     "Stop": "arize-hook-copilot-stop",
     "SubagentStop": "arize-hook-copilot-subagent-stop",
+    "SessionEnd": "arize-hook-copilot-session-end",
 }

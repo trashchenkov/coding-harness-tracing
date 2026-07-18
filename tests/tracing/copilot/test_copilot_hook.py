@@ -23,6 +23,7 @@ from tracing.copilot.hooks.handlers import (
     _read_stdin,
     post_tool_use,
     pre_tool_use,
+    session_end,
     session_start,
     stop,
     subagent_stop,
@@ -183,6 +184,65 @@ class TestSessionStart:
         assert state.get("session_id") == "sess-123"
         assert state.get("project_name") == "repo"
         assert state.get("trace_count") == "0"
+
+    def test_does_not_erase_trace_when_prompt_arrives_first(self, tmp_path, monkeypatch):
+        """Official CLI 1.0.71 can emit UserPromptSubmit before SessionStart."""
+        from tracing.copilot.hooks import adapter as _adapter
+
+        monkeypatch.setattr(_adapter, "STATE_DIR", tmp_path)
+        payload = {
+            "cwd": "/some/repo",
+            "session_id": "sess-out-of-order",
+            "prompt": "keep me",
+        }
+        _handle_user_prompt_submitted(payload)
+        from tracing.copilot.hooks.adapter import resolve_session
+
+        before = resolve_session(payload).get("current_trace_id")
+        _handle_session_start(
+            {
+                "cwd": "/some/repo",
+                "session_id": "sess-out-of-order",
+                "initial_prompt": "keep me",
+                "source": "new",
+            }
+        )
+        state = resolve_session(payload)
+        assert state.get("current_trace_id") == before
+        assert state.get("current_trace_prompt") == "keep me"
+
+
+class TestSessionEnd:
+    def test_removes_session_state_and_lock(self, tmp_path, monkeypatch):
+        from tracing.copilot.hooks import adapter as _adapter
+        from tracing.copilot.hooks import handlers as _handlers
+
+        monkeypatch.setattr(_adapter, "STATE_DIR", tmp_path)
+        payload = {"session_id": "sess-ended", "cwd": "/repo"}
+        _handle_user_prompt_submitted({**payload, "prompt": "done"})
+        state = _adapter.resolve_session(payload)
+        assert state.state_file is not None and state.state_file.exists()
+
+        _handlers._handle_session_end({**payload, "reason": "complete"})
+
+        assert not state.state_file.exists()
+        assert state._lock_path is not None and not state._lock_path.exists()
+
+        # Duplicate/late delivery must remain a no-op and must not recreate state.
+        _handlers._handle_session_end({**payload, "reason": "complete"})
+
+        assert not state.state_file.exists()
+        assert not state._lock_path.exists()
+
+    def test_missing_session_id_does_not_create_fallback_state(self, tmp_path, monkeypatch):
+        from tracing.copilot.hooks import adapter as _adapter
+        from tracing.copilot.hooks import handlers as _handlers
+
+        monkeypatch.setattr(_adapter, "STATE_DIR", tmp_path)
+
+        _handlers._handle_session_end({"reason": "complete"})
+
+        assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +613,63 @@ class TestHandleStop:
         assert state.get("current_trace_span_id") is None
         assert state.get("current_trace_prompt") is None
 
+    def test_output_uses_prompt_privacy_flag(self, tmp_path, monkeypatch):
+        """Assistant model output is prompt content, not tool content."""
+        self._seed_trace(tmp_path, monkeypatch, prompt="SECRET INPUT")
+        sent = []
+        from tracing.copilot.hooks import handlers as _handlers
+
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        monkeypatch.setattr(
+            _handlers,
+            "parse_transcript",
+            lambda _: {"output_text": "SECRET OUTPUT"},
+        )
+        monkeypatch.setattr(_handlers, "send_span", lambda s: sent.append(s))
+
+        _handlers._handle_stop(
+            {
+                "session_id": "sess-1",
+                "hook_event_name": "Stop",
+                "transcript_path": "/documented/path/events.jsonl",
+            }
+        )
+
+        assert len(sent) == 1
+        attrs = _get_span_attrs(sent[0])
+        assert attrs["input.value"]["stringValue"] == "<redacted (12 chars)>"
+        assert attrs["output.value"]["stringValue"] == "<redacted (13 chars)>"
+
+    def test_retries_transcript_until_final_assistant_message_is_flushed(self, tmp_path, monkeypatch):
+        self._seed_trace(tmp_path, monkeypatch, prompt="ping")
+        sent = []
+        from tracing.copilot.hooks import handlers as _handlers
+
+        parse = mock.Mock(
+            side_effect=[
+                {"model_name": "gpt-oss:120b-cloud", "output_text": ""},
+                {"model_name": "gpt-oss:120b-cloud", "output_text": "final"},
+            ]
+        )
+        monkeypatch.setattr(_handlers, "parse_transcript", parse)
+        sleep = mock.Mock()
+        monkeypatch.setattr(_handlers.time, "sleep", sleep)
+        monkeypatch.setattr(_handlers, "send_span", lambda span: sent.append(span))
+
+        _handlers._handle_stop(
+            {
+                "session_id": "sess-1",
+                "hook_event_name": "Stop",
+                "transcript_path": "/tmp/events.jsonl",
+            }
+        )
+
+        assert parse.call_count == 2
+        sleep.assert_called_once()
+        attrs = _get_span_attrs(sent[0])
+        assert attrs["output.value"]["stringValue"] == "final"
+
 
 # ---------------------------------------------------------------------------
 # subagent_stop tests
@@ -560,6 +677,42 @@ class TestHandleStop:
 
 
 class TestHandleSubagentStop:
+
+    def test_accepts_copilot_cli_agent_name_fields(self, tmp_path, monkeypatch):
+        """CLI PascalCase SubagentStop uses agent_name/display_name, not VS Code IDs."""
+        from tracing.copilot.hooks import adapter as _adapter
+
+        monkeypatch.setattr(_adapter, "STATE_DIR", tmp_path)
+        from tracing.copilot.hooks.handlers import _handle_user_prompt_submitted
+
+        _handle_user_prompt_submitted(
+            {
+                "session_id": "sess-cli",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/repo",
+                "prompt": "delegate",
+            }
+        )
+        sent = []
+        from tracing.copilot.hooks import handlers as _handlers
+
+        monkeypatch.setattr(_handlers, "send_span", lambda span: sent.append(span))
+
+        _handlers._handle_subagent_stop(
+            {
+                "session_id": "sess-cli",
+                "hook_event_name": "SubagentStop",
+                "agent_name": "research-agent",
+                "agent_display_name": "Research Agent",
+            }
+        )
+
+        span = _get_span(sent[0])
+        attrs = _get_span_attrs(sent[0])
+        metadata = json.loads(attrs["metadata"]["stringValue"])
+        assert span["name"] == "Subagent: Research Agent"
+        assert metadata["agent_name"] == "research-agent"
+        assert metadata["agent_display_name"] == "Research Agent"
 
     def test_emits_chain_span_with_agent_metadata(self, tmp_path, monkeypatch):
         from tracing.copilot.hooks import adapter as _adapter
@@ -661,6 +814,7 @@ ENTRY_POINTS = [
     ("post_tool_use", post_tool_use, "_handle_post_tool_use", "PostToolUse"),
     ("stop", stop, "_handle_stop", "Stop"),
     ("subagent_stop", subagent_stop, "_handle_subagent_stop", "SubagentStop"),
+    ("session_end", session_end, "_handle_session_end", "SessionEnd"),
 ]
 
 

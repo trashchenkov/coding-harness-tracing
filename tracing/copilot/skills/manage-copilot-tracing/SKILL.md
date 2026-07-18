@@ -135,13 +135,15 @@ Copilot hooks are registered in a single `.github/hooks/hooks.json` file. Create
 
 ```json
 {
+  "version": 1,
   "hooks": {
     "SessionStart":      [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-session-start"}],
     "UserPromptSubmit":  [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-user-prompt"}],
     "PreToolUse":        [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-pre-tool"}],
     "PostToolUse":       [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-post-tool"}],
     "Stop":              [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-stop"}],
-    "SubagentStop":      [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-subagent-stop"}]
+    "SubagentStop":      [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-subagent-stop"}],
+    "SessionEnd":        [{"type": "command", "command": "~/.arize/harness/venv/bin/arize-hook-copilot-session-end"}]
   }
 }
 ```
@@ -155,7 +157,7 @@ All `command` values should be absolute paths to the venv binary (e.g. `~/.arize
 3. **Hooks active**: Verify `.github/hooks/hooks.json` exists in the project root and each `command` path is the absolute venv binary path.
 4. **Quick dry-run test** (optional):
    ```bash
-   echo '{"hookEventName":"PreToolUse","tool_name":"test"}' | ARIZE_DRY_RUN=true arize-hook-copilot-pre-tool
+   echo '{"hook_event_name":"PreToolUse","tool_name":"test"}' | ARIZE_DRY_RUN=true arize-hook-copilot-pre-tool
    ```
 
 ### Confirm
@@ -171,16 +173,18 @@ Tell the user:
 
 ## Hook Events
 
-Copilot fires 6 hook events. Each event maps to a span:
+The adapter registers 7 Copilot hook events. Lifecycle hooks maintain state;
+completed operations emit spans:
 
-| Event | Span Name | Kind | Description |
-|-------|-----------|------|-------------|
-| `SessionStart` | `Session Start` | CHAIN | Session initialization |
-| `UserPromptSubmit` | `User Prompt` | CHAIN | User prompt text |
-| `PreToolUse` | `Tool: {name}` | TOOL | Tool start; **must print permission response to stdout** |
-| `PostToolUse` | `Tool: {name}` | TOOL | Tool result |
-| `Stop` | `Agent Stop` | LLM | Per-turn completion; transcript at `~/.copilot/session-state/<session_id>/events.jsonl` is parsed for model name, prompt, and tool-call count |
-| `SubagentStop` | `Subagent: {id}` | CHAIN | Subagent completion |
+| Event | Emission | Description |
+|-------|----------|-------------|
+| `SessionStart` | State only | Idempotent session initialization |
+| `UserPromptSubmit` | State only | Starts the current trace and records prompt text |
+| `PreToolUse` | State only | Records tool start and prints the required permission response |
+| `PostToolUse` | TOOL span | Emits the completed tool invocation under the current LLM parent |
+| `Stop` | LLM span | Parses `events.jsonl` for model, prompt, assistant output, and tool count |
+| `SubagentStop` | CHAIN span | Emits subagent completion using CLI or VS Code agent fields |
+| `SessionEnd` | State cleanup | Removes the completed session's state and lock files |
 
 ### PreToolUse permission response
 
