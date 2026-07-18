@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for tracing.cursor.hooks.handlers — the Cursor hook dispatcher and 15 event handlers."""
+"""Tests for tracing.cursor.hooks.handlers and the current Cursor hook inventory."""
 
 import io
 import json
@@ -9,15 +9,7 @@ from unittest import mock
 import pytest
 
 from tracing.cursor.hooks import adapter
-from tracing.cursor.hooks.handlers import (
-    _dispatch,
-    _event_name,
-    _is_cursor_ide_hook_payload,
-    _jq_str,
-    _print_permissive,
-    _trace_id_from_event,
-    main,
-)
+from tracing.cursor.hooks.handlers import _dispatch, _event_name, _jq_str, _print_permissive, _trace_id_from_event, main
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -56,12 +48,12 @@ def captured_spans():
 
 class TestPrintPermissive:
 
-    def test_before_event_returns_permission_allow(self):
-        """before* events write {"permission": "allow"} to sys.__stdout__."""
+    def test_before_submit_prompt_returns_continue_true(self):
+        """beforeSubmitPrompt uses its documented continuation response."""
         buf = io.StringIO()
         with mock.patch.object(sys, "__stdout__", buf):
             _print_permissive("beforeSubmitPrompt")
-        assert json.loads(buf.getvalue()) == {"permission": "allow"}
+        assert json.loads(buf.getvalue()) == {"continue": True}
 
     def test_before_shell_event(self):
         """beforeShellExecution also returns permission allow."""
@@ -70,26 +62,36 @@ class TestPrintPermissive:
             _print_permissive("beforeShellExecution")
         assert json.loads(buf.getvalue()) == {"permission": "allow"}
 
-    def test_after_event_returns_continue_true(self):
-        """Non-before events write {"continue": true}."""
+    def test_observational_event_returns_empty_object(self):
+        """Hooks with no control fields return valid empty JSON."""
         buf = io.StringIO()
         with mock.patch.object(sys, "__stdout__", buf):
             _print_permissive("afterAgentResponse")
-        assert json.loads(buf.getvalue()) == {"continue": True}
+        assert json.loads(buf.getvalue()) == {}
 
-    def test_stop_event_returns_continue_true(self):
-        """stop event writes {"continue": true}."""
+    def test_pre_tool_use_returns_permission_allow(self):
         buf = io.StringIO()
         with mock.patch.object(sys, "__stdout__", buf):
-            _print_permissive("stop")
-        assert json.loads(buf.getvalue()) == {"continue": True}
+            _print_permissive("preToolUse")
+        assert json.loads(buf.getvalue()) == {"permission": "allow"}
 
-    def test_empty_event_returns_continue_true(self):
-        """Empty event string writes {"continue": true}."""
+    def test_subagent_start_returns_permission_allow(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "__stdout__", buf):
+            _print_permissive("subagentStart")
+        assert json.loads(buf.getvalue()) == {"permission": "allow"}
+
+    def test_workspace_open_returns_empty_plugin_paths(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "__stdout__", buf):
+            _print_permissive("workspaceOpen")
+        assert json.loads(buf.getvalue()) == {"pluginPaths": []}
+
+    def test_empty_event_returns_empty_object(self):
         buf = io.StringIO()
         with mock.patch.object(sys, "__stdout__", buf):
             _print_permissive("")
-        assert json.loads(buf.getvalue()) == {"continue": True}
+        assert json.loads(buf.getvalue()) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -128,22 +130,6 @@ class TestJqStr:
     def test_all_none_returns_default(self):
         d = {"a": None, "b": None}
         assert _jq_str(d, "a", "b", default="x") == "x"
-
-
-class TestIdeCliPayloadDetection:
-
-    def test_hook_event_name_implies_ide(self):
-        assert _is_cursor_ide_hook_payload({"hook_event_name": "beforeSubmitPrompt"}) is True
-
-    def test_hook_event_name_empty_defaults_ide_unless_cli_present(self):
-        assert _is_cursor_ide_hook_payload({"hook_event_name": ""}) is True
-        assert _is_cursor_ide_hook_payload({"hook_event_name": "", "hookEventName": "x"}) is False
-
-    def test_hook_event_name_only_cli_key(self):
-        assert _is_cursor_ide_hook_payload({"hookEventName": "beforeSubmitPrompt"}) is False
-
-    def test_neither_key_defaults_ide(self):
-        assert _is_cursor_ide_hook_payload({"conversation_id": "c"}) is True
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +237,8 @@ class TestDispatch:
 
 class TestHandleBeforeSubmitPrompt:
 
-    def test_cli_payload_sends_root_before_submit(self, captured_spans, monkeypatch):
-        """CLI-style payload (hookEventName only): root CHAIN at submit; LLM is deferred to stop."""
+    def test_legacy_camel_case_payload_uses_same_deferred_topology(self, captured_spans, monkeypatch):
+        """Compatibility aliases do not select a different host topology."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=5000),
@@ -266,55 +252,14 @@ class TestHandleBeforeSubmitPrompt:
                     "conversation_id": "conv-1",
                     "generation_id": "gen-1",
                     "prompt": "fix the bug",
-                    "model_name": "claude-4",
                 },
             )
 
         save_mock.assert_called_once_with("gen-1", "aabb" * 4)
-        assert len(captured_spans) == 1
-        root0 = captured_spans[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-        assert root0["name"] == "User Prompt"
-        root_attrs0 = {a["key"]: a["value"] for a in root0["attributes"]}
-        assert root_attrs0["input.value"]["stringValue"] == "fix the bug"
-        assert "output.value" not in root_attrs0
+        assert captured_spans == []
 
-        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=9000):
-            _dispatch(
-                "afterAgentResponse",
-                {
-                    "hookEventName": "afterAgentResponse",
-                    "conversation_id": "conv-1",
-                    "generation_id": "gen-1",
-                    "response": "I fixed the bug",
-                    "model_name": "claude-4",
-                },
-            )
-
-        # afterAgentResponse no longer emits the LLM span — it is deferred to stop.
-        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
-        assert names == ["User Prompt"]
-
-        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=10000):
-            _dispatch(
-                "stop",
-                {
-                    "hookEventName": "stop",
-                    "conversation_id": "conv-1",
-                    "generation_id": "gen-1",
-                },
-            )
-
-        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
-        assert names == ["User Prompt", "Agent Response", "Agent Stop"]
-        llm = captured_spans[1]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-        llm_attrs = {a["key"]: a["value"] for a in llm["attributes"]}
-        assert llm_attrs["openinference.span.kind"]["stringValue"] == "LLM"
-        assert llm_attrs["input.value"]["stringValue"] == "fix the bug"
-        assert llm_attrs["output.value"]["stringValue"] == "I fixed the bug"
-        assert llm_attrs["session.id"]["stringValue"] == "conv-1"
-
-    def test_ide_payload_defers_root_chain_to_after_response(self, captured_spans, monkeypatch):
-        """IDE payload (hook_event_name): root CHAIN at afterAgentResponse; LLM deferred to stop."""
+    def test_documented_payload_defers_root_chain_to_after_response(self, captured_spans, monkeypatch):
+        """Documented payload defers root CHAIN; LLM completion is deferred to stop."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=5000),
@@ -1106,7 +1051,7 @@ class TestMain:
 
         dispatch_mock.assert_called_once_with("beforeSubmitPrompt", input_data)
         result = json.loads(stdout_buf.getvalue())
-        assert result == {"permission": "allow"}
+        assert result == {"continue": True}
 
     def test_invalid_json_still_prints_permissive(self, monkeypatch, tmp_path):
         """Invalid JSON on stdin still prints permissive response."""
@@ -1123,8 +1068,8 @@ class TestMain:
             main()
 
         result = json.loads(stdout_buf.getvalue())
-        # event is "" when JSON parse fails, so we get continue response
-        assert result == {"continue": True}
+        # No event-specific response can be selected after malformed input.
+        assert result == {}
 
     def test_exception_in_dispatch_still_prints_permissive(self, monkeypatch, tmp_path):
         """Exception in _dispatch still prints permissive response."""
@@ -1147,7 +1092,7 @@ class TestMain:
             main()
 
         result = json.loads(stdout_buf.getvalue())
-        assert result == {"continue": True}
+        assert result == {}
 
     def test_check_requirements_false_still_prints_permissive(self, monkeypatch, tmp_path):
         """When check_requirements returns False, still prints permissive."""
@@ -1165,7 +1110,7 @@ class TestMain:
 
         result = json.loads(stdout_buf.getvalue())
         # event is "" because we return before reading stdin
-        assert result == {"continue": True}
+        assert result == {}
 
     def test_empty_stdin(self, monkeypatch, tmp_path):
         """Empty stdin produces empty dict, still prints permissive."""
@@ -1184,7 +1129,7 @@ class TestMain:
 
         dispatch_mock.assert_called_once_with("", {})
         result = json.loads(stdout_buf.getvalue())
-        assert result == {"continue": True}
+        assert result == {}
 
     def test_stderr_redirected_to_log_file(self, monkeypatch, tmp_path):
         """main() redirects stderr to env.log_file."""
@@ -1746,9 +1691,9 @@ class TestConversationIdAttribute:
     # Minimal payloads per event that produce at least one span
     _EVENT_PAYLOADS = {
         "beforeSubmitPrompt": {
-            "hookEventName": "beforeSubmitPrompt",  # CLI path — sends span immediately
+            "hook_event_name": "beforeSubmitPrompt",
             "conversation_id": "conv-abc",
-            "generation_id": "gen-abc",
+            # Missing generation exercises the safe immediate fallback.
             "prompt": "test",
         },
         # afterAgentResponse is excluded: under the deferred-LLM design it no longer
@@ -2354,9 +2299,9 @@ class TestProjectNameInjection:
             _dispatch(
                 event,
                 {
-                    "hookEventName": event,
+                    "hook_event_name": event,
                     "conversation_id": "c1",
-                    "generation_id": "g1",
+                    # Missing generation emits immediately without shared state.
                     "prompt": "hi",
                 },
             )

@@ -108,7 +108,20 @@ class TestHooksJson:
 
     def test_is_valid_json(self, data):
         assert isinstance(data, dict)
+        assert data["version"] == 1
         assert "hooks" in data
+
+    def test_current_official_event_inventory(self, data):
+        """Cursor 2.5+ exposes 21 documented hook events."""
+        assert len(data["hooks"]) == 21
+        assert {
+            "preToolUse",
+            "postToolUseFailure",
+            "subagentStart",
+            "subagentStop",
+            "preCompact",
+            "workspaceOpen",
+        } <= set(data["hooks"])
 
     def test_event_keys_match_constants(self, data):
         from tracing.cursor.constants import HOOK_EVENTS
@@ -226,8 +239,8 @@ class TestRunHook:
         assert "cursor-plugin-venv" in text
 
     def test_resolves_plugin_root_from_script(self):
-        # Cursor exposes no plugin-root env var; the script must derive its
-        # own location.
+        # The manifest uses CURSOR_PLUGIN_ROOT; after host expansion (and in
+        # direct smoke tests) the bootstrap derives its root from its own path.
         assert "dirname" in RUN_HOOK.read_text()
 
     def test_does_not_reference_claude_plugin_vars(self):
@@ -243,6 +256,62 @@ class TestRunHook:
             capture_output=True,
         )
         assert result.returncode == 0, f"sh -n syntax check failed: {result.stderr.decode(errors='replace')}"
+
+    def test_parallel_first_fire_bootstraps_once(self, tmp_path):
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        count_file = tmp_path / "install-count"
+        entry_template = tmp_path / "entry"
+        entry_template.write_text("#!/bin/sh\ncat >/dev/null\nprintf '{}'\n")
+        entry_template.chmod(0o755)
+        pip_template = tmp_path / "pip"
+        pip_template.write_text(
+            "#!/bin/sh\n"
+            'printf x >> "$BOOTSTRAP_COUNT"\n'
+            "/usr/bin/sleep 0.3\n"
+            'dest="$HOME/.arize/harness/cursor-plugin-venv/bin/arize-hook-cursor"\n'
+            '/usr/bin/cp "$FAKE_ENTRY" "$dest"\n'
+            '/usr/bin/chmod +x "$dest"\n'
+        )
+        pip_template.chmod(0o755)
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = -c ]; then\n'
+            '  case "$2" in\n'
+            "    *version_info*) exit 0 ;;\n"
+            "    *hashlib*) /usr/bin/sha256sum \"$3\" | /usr/bin/cut -d' ' -f1; exit 0 ;;\n"
+            "  esac\n"
+            "fi\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then\n'
+            '  /usr/bin/mkdir -p "$3/bin"\n'
+            '  /usr/bin/cp "$FAKE_PIP" "$3/bin/pip"\n'
+            '  /usr/bin/chmod +x "$3/bin/pip"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n"
+        )
+        python.chmod(0o755)
+        env = {
+            **os.environ,
+            "HOME": str(tmp_path / "home"),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "BOOTSTRAP_COUNT": str(count_file),
+            "FAKE_ENTRY": str(entry_template),
+            "FAKE_PIP": str(pip_template),
+        }
+
+        processes = [
+            subprocess.Popen(
+                [str(RUN_HOOK)], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(b"{}", timeout=30) for process in processes]
+
+        assert all(process.returncode == 0 for process in processes)
+        assert [stdout for stdout, _ in results] == [b"{}", b"{}"]
+        assert count_file.read_text() == "x"
 
     def test_fails_open_with_empty_stdout_when_bootstrap_fails(self):
         """If no Python is available, run-hook must exit 0 with empty stdout.

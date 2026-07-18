@@ -100,10 +100,25 @@ install.bat uninstall cursor
 | Phoenix endpoint | `http://localhost:6006` |
 | Arize AX endpoint | `otlp.arize.com:443` |
 | Hook config file | `.cursor/hooks.json` |
-| Hook events registered | `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`, `afterAgentResponse`, `afterAgentThought`, `beforeShellExecution`, `afterShellExecution`, `beforeMCPExecution`, `afterMCPExecution`, `beforeReadFile`, `afterFileEdit`, `beforeTabFileRead`, `afterTabFileEdit`, `postToolUse`, `stop` |
-| Events emitted by Cursor CLI | `sessionStart`, `sessionEnd`, `beforeShellExecution`, `afterShellExecution`, `afterFileEdit`, `postToolUse`, `stop` (subset of the above; remaining events are IDE-only) |
+| Hook events registered | `beforeSubmitPrompt`, `afterAgentResponse`, `afterAgentThought`, `beforeShellExecution`, `afterShellExecution`, `beforeMCPExecution`, `afterMCPExecution`, `beforeReadFile`, `afterFileEdit`, `stop`, `beforeTabFileRead`, `afterTabFileEdit`, `sessionStart`, `sessionEnd`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `subagentStart`, `subagentStop`, `preCompact`, `workspaceOpen` |
+| Host dispatch | Cursor documents Agent, Tab, and app-lifecycle categories. The exact events observed depend on the host, build, mode, and action; do not infer IDE versus CLI from payload key casing. |
 | State directory | `~/.arize/harness/state/cursor/` |
 | Log file | `~/.arize/harness/logs/cursor.log` |
+
+## Privacy controls
+
+Content capture is on by default. Redact categories independently before
+exporting spans:
+
+```bash
+export ARIZE_LOG_PROMPTS=false       # user prompts
+export ARIZE_LOG_MODEL_OUTPUTS=false # agent responses and thoughts
+export ARIZE_LOG_TOOL_CONTENT=false  # tool inputs and outputs
+export ARIZE_LOG_TOOL_DETAILS=false  # command text and file paths
+```
+
+For example, prompts can remain redacted while model outputs are captured, or
+vice versa.
 
 ## Verifying tracing
 
@@ -111,6 +126,6 @@ Use Cursor (IDE or `agent` CLI) as normal. The hooks fire on agent activity with
 
 - Errors land in `~/.arize/harness/logs/cursor.log` always; set `export ARIZE_VERBOSE=true` before launching Cursor to also see routine hook activity.
 - Confirm spans appear in your configured project in Arize AX or Phoenix.
-- IDE-only events (e.g. `beforeReadFile`, `beforeMCPExecution`, `afterAgentResponse`) only fire when running through the Cursor IDE; the CLI emits the subset listed in **Events emitted by Cursor CLI** above.
+- Verify host invocation separately for the exact Cursor build and surface you use. Handler replay proves parsing and transport, not that a particular IDE or CLI action dispatches a hook.
 
 See the [main README's Environment variables section](../../README.md#environment-variables) for the full list of runtime overrides (`ARIZE_TRACE_ENABLED`, `ARIZE_DRY_RUN`, `ARIZE_USER_ID`, etc.).

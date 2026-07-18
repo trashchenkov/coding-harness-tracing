@@ -1,7 +1,6 @@
 {
+  "version": 1,
   "hooks": {
-    "sessionStart": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
-    "sessionEnd": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "beforeSubmitPrompt": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "afterAgentResponse": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "afterAgentThought": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
@@ -11,9 +10,17 @@
     "afterMCPExecution": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "beforeReadFile": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "afterFileEdit": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "stop": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "beforeTabFileRead": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
     "afterTabFileEdit": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
-    "stop": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
-    "postToolUse": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }]
+    "sessionStart": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "sessionEnd": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "preToolUse": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "postToolUse": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "postToolUseFailure": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "subagentStart": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "subagentStop": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "preCompact": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }],
+    "workspaceOpen": [{ "command": "${CURSOR_PLUGIN_ROOT}/scripts/run-hook" }]
   }
 }

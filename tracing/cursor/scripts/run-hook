@@ -23,6 +23,41 @@ PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATA_DIR="$HOME/.arize/harness"
 VENV_DIR="$DATA_DIR/cursor-plugin-venv"
 MARKER="$DATA_DIR/.cursor-plugin.pyproject.sha256"
+LOCK_DIR="$DATA_DIR/.cursor-plugin-bootstrap.lock"
+LOCK_HELD=0
+
+# Serialize first-fire installation.  mkdir is atomic on the local filesystems
+# where Cursor keeps plugin data.  A PID file lets a later invocation recover
+# after a bootstrap process is killed before releasing the lock.
+release_lock() {
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        LOCK_HELD=0
+    fi
+}
+
+acquire_lock() {
+    attempts=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [ -f "$LOCK_DIR/pid" ]; then
+            owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+            if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -rf "$LOCK_DIR"
+                continue
+            fi
+        fi
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 300 ]; then
+            echo "[arize] Timed out waiting for Cursor tracing bootstrap lock" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    echo "$$" > "$LOCK_DIR/pid"
+    LOCK_HELD=1
+    trap 'release_lock' EXIT HUP INT TERM
+}
 
 # --- Find the entry point binary ---
 find_entry_point() {
@@ -65,6 +100,9 @@ bootstrap() {
         return 1
     }
 
+    mkdir -p "$DATA_DIR"
+    acquire_lock || return 1
+
     # Recover from a half-created venv (seen in Cursor Cloud where
     # python3-venv may be partially available). If $VENV_DIR exists but has
     # no usable pip, wipe it and rebuild.
@@ -75,11 +113,11 @@ bootstrap() {
     fi
 
     if ! needs_install; then
+        release_lock
         return 0
     fi
 
     echo "[arize] Setting up Cursor tracing venv..." >&2
-    mkdir -p "$DATA_DIR"
 
     "$PYTHON_CMD" -m venv "$VENV_DIR" 2>&1 | tail -3 >&2 || {
         echo "[arize] Failed to create venv" >&2
@@ -109,6 +147,7 @@ bootstrap() {
         "$PLUGIN_ROOT/pyproject.toml" > "$MARKER"
 
     echo "[arize] Cursor tracing venv ready" >&2
+    release_lock
 }
 
 # --- Main ---

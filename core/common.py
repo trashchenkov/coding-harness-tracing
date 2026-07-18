@@ -252,6 +252,10 @@ class _Env:
         return self._resolve_log_flag("ARIZE_LOG_PROMPTS", "prompts", True)
 
     @property
+    def log_model_outputs(self) -> bool:
+        return self._resolve_log_flag("ARIZE_LOG_MODEL_OUTPUTS", "model_outputs", True)
+
+    @property
     def log_tool_details(self) -> bool:
         return self._resolve_log_flag("ARIZE_LOG_TOOL_DETAILS", "tool_details", True)
 

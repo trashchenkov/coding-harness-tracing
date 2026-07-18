@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Cursor hook handler: single entry point dispatching all 15 Cursor hook events.
+"""Cursor hook handler: single entry point dispatching current Cursor hook events.
 
 Replaces tracing/cursor/hooks/hook-handler.sh (475 lines).
 
-Input contract: JSON on stdin, all 15 events (IDE + CLI) routed here.
+Input contract: JSON on stdin, all registered events routed here.
 stdout: MUST print permissive JSON response, even on error.
 stderr: redirected to ARIZE_LOG_FILE before dispatch.
 """
@@ -25,6 +25,7 @@ from tracing.cursor.hooks.adapter import (
     state_pop,
     state_push,
     trace_id_from_generation,
+    truncate_attr,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,7 @@ def _resolve_project_name() -> str:
     """Project name for Cursor spans: framework env override or config.json,
     else cwd basename, else the service name.
 
-    Cursor builds many span dicts across 15 handlers and keeps no per-session
+    Cursor builds spans across the current hook inventory and keeps no per-session
     project state, so it resolves the project centrally at send time — matching
     the framework-scoped resolution the other harnesses do in their adapters.
     """
@@ -55,6 +56,19 @@ def send_span(payload: dict) -> bool:
         for ss in rs.get("scopeSpans", []):
             for span in ss.get("spans", []):
                 span.setdefault("attributes", []).append(attr)
+
+    def bound_string_values(value):
+        """Bound every OTLP stringValue immediately before transport."""
+        if isinstance(value, dict):
+            if isinstance(value.get("stringValue"), str):
+                value["stringValue"] = truncate_attr(value["stringValue"])
+            for child in value.values():
+                bound_string_values(child)
+        elif isinstance(value, list):
+            for child in value:
+                bound_string_values(child)
+
+    bound_string_values(payload)
     return _send_span_to_backend(payload)
 
 
@@ -64,19 +78,34 @@ def send_span(payload: dict) -> bool:
 
 
 def _print_permissive(event: str) -> None:
-    """Print the permissive JSON response to stdout.
+    """Print an event-valid fail-open JSON response to stdout.
 
-    before* events -> {"permission": "allow"}
-    all others     -> {"continue": true}
+    Cursor validates response fields per event. Permission-gated hooks use
+    ``permission=allow``; ``beforeSubmitPrompt`` has its own ``continue``
+    control; observational hooks accept an empty object.
 
     Uses sys.__stdout__ (the original stdout saved by Python) in case
     sys.stdout has been redirected.
     """
     stdout = sys.__stdout__ or sys.stdout
-    if event.startswith("before"):
-        stdout.write('{"permission": "allow"}')
+    permission_events = {
+        "beforeShellExecution",
+        "beforeMCPExecution",
+        "beforeReadFile",
+        "beforeTabFileRead",
+        "preToolUse",
+        "subagentStart",
+    }
+    response: dict[str, object]
+    if event in permission_events:
+        response = {"permission": "allow"}
+    elif event == "beforeSubmitPrompt":
+        response = {"continue": True}
+    elif event == "workspaceOpen":
+        response = {"pluginPaths": []}
     else:
-        stdout.write('{"continue": true}')
+        response = {}
+    stdout.write(json.dumps(response, separators=(",", ":")))
     stdout.flush()
 
 
@@ -90,6 +119,15 @@ def _jq_str(input_json: dict, *keys, default: str = "") -> str:
         if val is not None and val != "":
             return str(val)
     return default
+
+
+def _json_string(value) -> str:
+    """Serialize structured hook fields deterministically for text attributes."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return str(value)
 
 
 def _resolve_user_id(input_json: dict) -> str:
@@ -112,29 +150,11 @@ def _to_int(v):
 
 
 def _event_name(input_json: dict) -> str:
-    """Extract event name from payload, tolerant of IDE and CLI key variants.
+    """Extract event name, preferring Cursor's documented snake_case key.
 
-    Cursor IDE uses ``hook_event_name``; Cursor CLI uses ``hookEventName``.
+    Other keys are retained only for compatibility with old/synthetic callers.
     """
     return _jq_str(input_json, "hook_event_name", "hookEventName", "event_name", "eventName", "event")
-
-
-def _is_cursor_ide_hook_payload(input_json: dict) -> bool:
-    """Return True when the stdin JSON looks like Cursor IDE (vs CLI) hook payloads.
-
-    IDE emits ``hook_event_name``; CLI emits ``hookEventName`` — same split as ``_event_name``.
-    Root CHAIN timing: IDE keeps the original deferred span (sent at afterAgentResponse with
-    full turn duration and output on CHAIN). CLI sends the root at beforeSubmitPrompt so
-    strict OTLP backends see the parent before tool spans.
-
-    If neither key is set, default to IDE so existing payloads without a discriminator keep
-    the original semantics.
-    """
-    if input_json.get("hook_event_name"):
-        return True
-    if input_json.get("hookEventName"):
-        return False
-    return True
 
 
 def _trace_id_from_event(gen_id: str, conversation_id: str) -> str:
@@ -182,7 +202,13 @@ def _dispatch(event: str, input_json: dict) -> None:
         "stop": _handle_stop,
         "sessionStart": _handle_session_start,
         "sessionEnd": _handle_session_end,
+        "preToolUse": _handle_pre_tool_use,
         "postToolUse": _handle_post_tool_use,
+        "postToolUseFailure": _handle_post_tool_use_failure,
+        "subagentStart": _handle_subagent_start,
+        "subagentStop": _handle_subagent_stop,
+        "preCompact": _handle_pre_compact,
+        "workspaceOpen": _handle_workspace_open,
     }
 
     handler = handlers.get(event)
@@ -198,32 +224,33 @@ def _dispatch(event: str, input_json: dict) -> None:
 
 
 def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """Root CHAIN for the turn.
+    """Create the turn root, deferred when a generation can pair lifecycle events.
 
-    * **IDE** (``hook_event_name``): deferred until afterAgentResponse — original CHAIN span
-      with full duration and output on the root.
-    * **CLI** (``hookEventName`` only): sent here so tool spans that fire before
-      afterAgentResponse parent to an existing span on strict OTLP backends.
+    Cursor's documented and current CLI payloads both use ``hook_event_name``;
+    there is no supported host discriminator. A missing generation cannot be
+    paired safely, so that degraded case is emitted immediately without state.
     """
     sid = span_id_16()
-    gen_root_span_save(gen_id, sid)
+    if gen_id:
+        gen_root_span_save(gen_id, sid)
 
     prompt = _jq_str(input_json, "prompt", "input", "text")
     model = _jq_str(input_json, "model", "model_name")
-    deferred_root = _is_cursor_ide_hook_payload(input_json)
+    deferred_root = bool(gen_id)
 
-    state_push(
-        f"root_{sanitize(gen_id)}",
-        {
-            "span_id": sid,
-            "trace_id": trace_id,
-            "conversation_id": conversation_id,
-            "start_ms": now_ms,
-            "prompt": prompt,
-            "model": model,
-            "deferred_root": deferred_root,
-        },
-    )
+    if gen_id:
+        state_push(
+            f"root_{sanitize(gen_id)}",
+            {
+                "span_id": sid,
+                "trace_id": trace_id,
+                "conversation_id": conversation_id,
+                "start_ms": now_ms,
+                "prompt": prompt,
+                "model": model,
+                "deferred_root": deferred_root,
+            },
+        )
 
     if deferred_root:
         log(f"beforeSubmitPrompt: deferred root span {sid} (trace={trace_id})")
@@ -260,7 +287,7 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
 
 
 def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """Defers LLM span until stop (so per-turn tokens land on it). IDE also sends deferred User Prompt CHAIN."""
+    """Defer the LLM span until stop so per-turn tokens land on it."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
 
@@ -274,13 +301,13 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     prompt = root_state.get("prompt", "") if root_state else ""
     deferred_root = root_state.get("deferred_root", True) if root_state else True
 
-    # Redact prompt and model response unless opted in via ARIZE_LOG_PROMPTS.
+    # Prompt and model output have independent privacy controls.
     prompt = redact_content(env.log_prompts, prompt)
-    response = redact_content(env.log_prompts, response)
+    response = redact_content(env.log_model_outputs, response)
 
     user_id = _resolve_user_id(input_json)
 
-    # IDE: send User Prompt CHAIN first (parent before LLM for strict backends), full I/O + duration.
+    # Send User Prompt CHAIN first (parent before LLM for strict backends), full I/O + duration.
     if root_state and deferred_root:
         root_conv_id = root_state.get("conversation_id", conversation_id)
         root_attrs = {
@@ -371,7 +398,7 @@ def _handle_after_agent_thought(input_json, conversation_id, gen_id, trace_id, n
 
     attrs = {
         "openinference.span.kind": "CHAIN",
-        "output.value": redact_content(env.log_prompts, thought),
+        "output.value": redact_content(env.log_model_outputs, thought),
         "session.id": conversation_id,
     }
     if conversation_id:
@@ -969,25 +996,53 @@ _DEDICATED_TOOL_NAMES = frozenset(
 )
 
 
-def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """TOOL span for Cursor CLI postToolUse event."""
-    tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
+def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
+    """Parallel-safe generic tool state key scoped to one generation."""
+    return f"tool_{sanitize(gen_id)}_{sanitize(tool_use_id)}"
 
-    # Dedup: skip tools that have dedicated before*/after* handlers
+
+def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Capture generic tool input before execution, keyed by tool_use_id."""
+    tool_use_id = _jq_str(input_json, "tool_use_id")
+    if not tool_use_id:
+        return
+    state_push(
+        _tool_state_key(gen_id, tool_use_id),
+        {
+            "start_ms": now_ms,
+            "tool_name": _jq_str(input_json, "tool_name"),
+            "tool_input": redact_content(env.log_tool_content, _json_string(input_json.get("tool_input"))),
+        },
+    )
+    log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
+
+
+def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """TOOL span for a successful generic tool call."""
+    tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
+    tool_use_id = _jq_str(input_json, "tool_use_id")
+    popped = state_pop(_tool_state_key(gen_id, tool_use_id)) if tool_use_id else None
+
+    # Dedicated hooks provide richer fields. Still pop generic state so a host
+    # emitting both APIs does not leave dangling files.
     if tool_name.lower() in _DEDICATED_TOOL_NAMES:
         log(f"postToolUse: skipping {tool_name!r} — covered by dedicated handler")
         return
 
     sid = span_id_16()
     parent = gen_root_span_get(gen_id) if gen_id else ""
-
-    tool_input = _jq_str(input_json, "tool_input", "toolInput", "input", "arguments", "args")
-    output = _jq_str(input_json, "result", "output", "response", "stdout")
-
-    tool_input = redact_content(env.log_tool_content, tool_input)
-    output = redact_content(env.log_tool_content, output)
-
-    user_id = _resolve_user_id(input_json)
+    tool_input = popped.get("tool_input", "") if popped else ""
+    if not tool_input:
+        raw_input = input_json.get("tool_input")
+        if raw_input is None:
+            raw_input = _jq_str(input_json, "toolInput", "input", "arguments", "args")
+        tool_input = redact_content(env.log_tool_content, _json_string(raw_input))
+    raw_output = input_json.get("tool_output")
+    if raw_output is None:
+        raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
+    output = redact_content(env.log_tool_content, _json_string(raw_output))
+    duration = _to_int(input_json.get("duration"))
+    start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
 
     attrs = {
         "openinference.span.kind": "TOOL",
@@ -995,6 +1050,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     }
     if conversation_id:
         attrs["cursor.conversation.id"] = conversation_id
+    user_id = _resolve_user_id(input_json)
     if user_id:
         attrs["user.id"] = user_id
     if tool_name:
@@ -1004,15 +1060,13 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     if output:
         attrs["output.value"] = output
 
-    span_name = f"Tool: {tool_name}" if tool_name else "Tool Use"
-
     span = build_span(
-        span_name,
+        f"Tool: {tool_name}" if tool_name else "Tool Use",
         "TOOL",
         sid,
         trace_id,
         parent,
-        now_ms,
+        start_ms,
         now_ms,
         attrs,
         SERVICE_NAME,
@@ -1020,6 +1074,139 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     )
     send_span(span)
     log(f"postToolUse: span {sid} (tool={tool_name})")
+
+
+def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Emit a TOOL span for failures, timeouts, denial, or interruption."""
+    tool_name = _jq_str(input_json, "tool_name") or "unknown"
+    tool_use_id = _jq_str(input_json, "tool_use_id")
+    popped = state_pop(_tool_state_key(gen_id, tool_use_id)) if tool_use_id else None
+    tool_input = popped.get("tool_input", "") if popped else ""
+    if not tool_input:
+        tool_input = redact_content(env.log_tool_content, _json_string(input_json.get("tool_input")))
+    error_message = redact_content(env.log_tool_content, _jq_str(input_json, "error_message"))
+    failure_type = _jq_str(input_json, "failure_type")
+    duration = _to_int(input_json.get("duration"))
+    start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+
+    attrs = {
+        "openinference.span.kind": "TOOL",
+        "tool.name": tool_name,
+        "input.value": tool_input,
+        "output.value": error_message,
+        "session.id": conversation_id,
+        "cursor.tool.status": "error",
+        "cursor.tool.failure_type": failure_type,
+        "cursor.tool.is_interrupt": bool(input_json.get("is_interrupt", False)),
+    }
+    if conversation_id:
+        attrs["cursor.conversation.id"] = conversation_id
+    user_id = _resolve_user_id(input_json)
+    if user_id:
+        attrs["user.id"] = user_id
+
+    span = build_span(
+        f"Tool: {tool_name}",
+        "TOOL",
+        span_id_16(),
+        trace_id,
+        gen_root_span_get(gen_id) if gen_id else "",
+        start_ms,
+        now_ms,
+        attrs,
+        SERVICE_NAME,
+        SCOPE_NAME,
+    )
+    send_span(span)
+    log(f"postToolUseFailure: span for tool={tool_name}")
+
+
+def _subagent_state_key(gen_id: str, subagent_id: str) -> str:
+    return f"subagent_{sanitize(gen_id)}_{sanitize(subagent_id)}"
+
+
+def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Capture parallel-safe subagent start state."""
+    subagent_id = _jq_str(input_json, "subagent_id")
+    if not subagent_id:
+        return
+    state_push(
+        _subagent_state_key(gen_id, subagent_id),
+        {
+            "start_ms": now_ms,
+            "task": redact_content(env.log_prompts, _jq_str(input_json, "task")),
+            "subagent_type": _jq_str(input_json, "subagent_type"),
+        },
+    )
+    log(f"subagentStart: pushed state for subagent_id={subagent_id}")
+
+
+def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Emit one CHAIN span for a completed, failed, or aborted subagent."""
+    subagent_id = _jq_str(input_json, "subagent_id")
+    popped = state_pop(_subagent_state_key(gen_id, subagent_id)) if subagent_id else None
+    duration = _to_int(input_json.get("duration_ms"))
+    start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+    subagent_type = _jq_str(input_json, "subagent_type") or (popped or {}).get("subagent_type", "")
+    task = (popped or {}).get("task", "") or redact_content(env.log_prompts, _jq_str(input_json, "task"))
+    summary = redact_content(env.log_prompts, _jq_str(input_json, "summary", "error_message"))
+    attrs = {
+        "openinference.span.kind": "CHAIN",
+        "input.value": task,
+        "output.value": summary,
+        "session.id": conversation_id,
+        "cursor.subagent.id": subagent_id,
+        "cursor.subagent.type": subagent_type,
+        "cursor.subagent.status": _jq_str(input_json, "status"),
+    }
+    if conversation_id:
+        attrs["cursor.conversation.id"] = conversation_id
+
+    span = build_span(
+        f"Subagent: {subagent_type or 'unknown'}",
+        "CHAIN",
+        span_id_16(),
+        trace_id,
+        gen_root_span_get(gen_id) if gen_id else "",
+        start_ms,
+        now_ms,
+        attrs,
+        SERVICE_NAME,
+        SCOPE_NAME,
+    )
+    send_span(span)
+    log(f"subagentStop: span for subagent_id={subagent_id}")
+
+
+def _handle_pre_compact(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Record context compaction without capturing transcript content."""
+    attrs = {
+        "openinference.span.kind": "CHAIN",
+        "session.id": conversation_id,
+        "cursor.compact.trigger": _jq_str(input_json, "trigger"),
+    }
+    for field in ("context_usage_percent", "context_tokens", "context_window_size", "message_count"):
+        value = _to_int(input_json.get(field))
+        if value is not None:
+            attrs[f"cursor.compact.{field}"] = value
+    span = build_span(
+        "Context Compaction",
+        "CHAIN",
+        span_id_16(),
+        trace_id,
+        gen_root_span_get(gen_id) if gen_id else "",
+        now_ms,
+        now_ms,
+        attrs,
+        SERVICE_NAME,
+        SCOPE_NAME,
+    )
+    send_span(span)
+
+
+def _handle_workspace_open(input_json, conversation_id, gen_id, trace_id, now_ms):
+    """Do not create a trace for an app lifecycle event without a session."""
+    log("workspaceOpen: tracing hook loaded")
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1217,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 def main():
     """Entry point for arize-hook-cursor. Cursor hook.
 
-    Input contract: JSON on stdin, all 15 events (IDE + CLI) routed here.
+    Input contract: JSON on stdin, all registered events routed here.
     stdout: MUST print permissive JSON response, even on error.
     stderr: redirected to ARIZE_LOG_FILE at adapter import time via
         core.common.redirect_stderr_to_log_file().
