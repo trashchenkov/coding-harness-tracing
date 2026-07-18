@@ -1632,6 +1632,34 @@ class TestDeferredStatePrivacy:
         assert attrs["input.value"].startswith("<redacted")
         assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
 
+    def test_subagent_creation_redaction_is_irreversible_when_stop_repeats_task(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        task = "SUBAGENT_IRREVERSIBLE_SECRET"
+        common = {
+            "conversation_id": "privacy-conv",
+            "generation_id": "privacy-gen",
+            "subagent_type": "explore",
+            "task": task,
+        }
+        _dispatch("subagentStart", common)
+
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+        _dispatch(
+            "subagentStop",
+            {**common, "status": "completed", "summary": "allowed summary"},
+        )
+
+        subagent_payload = next(
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Subagent: explore"
+        )
+        subagent_span = subagent_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in subagent_span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert task not in json.dumps(subagent_payload)
+
     def test_stop_reapplies_current_prompt_and_model_output_policy(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")

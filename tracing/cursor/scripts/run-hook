@@ -37,6 +37,33 @@ release_lock() {
     fi
 }
 
+# Reclaiming is itself serialized inside the existing lock directory. The
+# atomic nested mkdir prevents two contenders that observed the same stale PID
+# from both retaining authority to remove a subsequently acquired live lock.
+reclaim_lock_if_stale() {
+    RECLAIM_DIR="$LOCK_DIR/.reclaim"
+    mkdir "$RECLAIM_DIR" 2>/dev/null || return 1
+
+    latest_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    stale=0
+    case "$latest_owner" in
+        ''|*[!0-9]*) stale=1 ;;
+        *)
+            if ! kill -0 "$latest_owner" 2>/dev/null; then
+                stale=1
+            fi
+            ;;
+    esac
+
+    if [ "$stale" -eq 1 ]; then
+        rm -rf "$LOCK_DIR"
+        return 0
+    fi
+
+    rmdir "$RECLAIM_DIR" 2>/dev/null || true
+    return 1
+}
+
 acquire_lock() {
     attempts=0
     metadata_attempts=0
@@ -48,12 +75,10 @@ acquire_lock() {
                 # allow a grace period before reclaiming absent/bad metadata.
                 metadata_attempts=$((metadata_attempts + 1))
                 if [ "$metadata_attempts" -ge 10 ]; then
-                    # Re-read before removal: the owner may have published a
-                    # valid PID after our first read in this iteration.
-                    latest_owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-                    case "$latest_owner" in
-                        ''|*[!0-9]*) rm -rf "$LOCK_DIR" ;;
-                    esac
+                    # Re-check and reclaim only after winning the nested
+                    # recovery claim; another contender may have acquired the
+                    # outer lock since our initial observation.
+                    reclaim_lock_if_stale || true
                     metadata_attempts=0
                     continue
                 fi
@@ -61,7 +86,7 @@ acquire_lock() {
             *)
                 metadata_attempts=0
                 if ! kill -0 "$owner" 2>/dev/null; then
-                    rm -rf "$LOCK_DIR"
+                    reclaim_lock_if_stale || true
                     continue
                 fi
                 ;;
