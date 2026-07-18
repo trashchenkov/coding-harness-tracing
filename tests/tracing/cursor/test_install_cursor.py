@@ -146,14 +146,14 @@ class TestFreshInstall:
         assert "backend" not in config
         assert "collector" not in config
 
-        # Check hooks.json has 15 events (12 IDE + 3 CLI)
+        # Check hooks.json has the full current Cursor event inventory.
         hooks_file = fake_home / ".cursor" / "hooks.json"
         assert hooks_file.exists()
         hooks_data = json.loads(hooks_file.read_text())
 
         assert hooks_data["version"] == 1
         hooks = hooks_data.get("hooks", {})
-        assert len(hooks) == 15
+        assert len(hooks) == len(tracing.cursor.constants.HOOK_EVENTS)
 
         # sessionStart, sessionEnd, and postToolUse are present and use the same hook command
         assert "sessionStart" in hooks
@@ -302,9 +302,9 @@ class TestIdempotent:
         hooks_file = fake_home / ".cursor" / "hooks.json"
         hooks_data = json.loads(hooks_file.read_text())
 
-        # Still exactly 15 events with 1 entry each
+        # Still exactly the canonical events with 1 entry each
         hooks = hooks_data["hooks"]
-        assert len(hooks) == 15
+        assert len(hooks) == len(tracing.cursor.constants.HOOK_EVENTS)
         for event, entries in hooks.items():
             assert len(entries) == 1, f"Event {event} has {len(entries)} entries"
 

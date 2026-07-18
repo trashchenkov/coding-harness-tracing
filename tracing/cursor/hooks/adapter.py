@@ -125,9 +125,12 @@ def state_pop(key: str) -> "dict | None":
         value = data[-1]
         data = data[:-1]
 
-        tmp = stack_file.with_suffix(f".tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(stack_file)
+        if data:
+            tmp = stack_file.with_suffix(f".tmp.{os.getpid()}")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(stack_file)
+        else:
+            stack_file.unlink(missing_ok=True)
 
     return value if isinstance(value, dict) else None
 

@@ -108,12 +108,11 @@ class TestStateStack:
         stack_file = adapter.STATE_DIR / "new_key.stack.json"
         assert stack_file.exists()
 
-    def test_pop_last_leaves_empty_list(self):
+    def test_pop_last_removes_stack_file(self):
         adapter.state_push("k2", {"x": 1})
         adapter.state_pop("k2")
         stack_file = adapter.STATE_DIR / "k2.stack.json"
-        data = json.loads(stack_file.read_text())
-        assert data == []
+        assert not stack_file.exists()
 
     def test_concurrent_push(self):
         """5 threads push concurrently — all values present, no corruption."""
