@@ -722,6 +722,46 @@ class TestHandleStop:
 
         assert len(captured_spans) == 1
 
+    def test_generationless_tool_and_subagent_emit_inline_without_shared_state(self, captured_spans, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "false")
+
+        tool_common = {
+            "conversation_id": "c-no-gen",
+            "tool_use_id": "tool-no-gen",
+            "tool_name": "browser",
+            "tool_input": {"secret": "TOOL_NO_GEN_SECRET"},
+        }
+        _dispatch("preToolUse", tool_common)
+        _dispatch("postToolUse", {**tool_common, "tool_output": "TOOL_NO_GEN_OUTPUT"})
+        failed_tool = {
+            **tool_common,
+            "tool_use_id": "failed-tool-no-gen",
+            "error_message": "TOOL_NO_GEN_FAILURE",
+        }
+        _dispatch("preToolUse", failed_tool)
+        _dispatch("postToolUseFailure", failed_tool)
+
+        subagent_common = {
+            "conversation_id": "c-no-gen",
+            "subagent_type": "explore",
+            "task": "SUBAGENT_NO_GEN_SECRET",
+        }
+        _dispatch("subagentStart", subagent_common)
+        _dispatch("subagentStop", {**subagent_common, "summary": "SUBAGENT_NO_GEN_OUTPUT"})
+
+        assert len(captured_spans) == 3
+        empty_generation_shard = adapter.STATE_DIR / adapter.generation_state_key("")
+        assert not empty_generation_shard.exists()
+        payload_text = json.dumps(captured_spans)
+        assert "TOOL_NO_GEN_SECRET" not in payload_text
+        assert "TOOL_NO_GEN_OUTPUT" not in payload_text
+        assert "TOOL_NO_GEN_FAILURE" not in payload_text
+        assert "SUBAGENT_NO_GEN_SECRET" not in payload_text
+        assert "SUBAGENT_NO_GEN_OUTPUT" not in payload_text
+
     def test_no_gen_id_skips_cleanup(self, captured_spans, monkeypatch):
         """Without gen_id, state_cleanup_generation is not called."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
