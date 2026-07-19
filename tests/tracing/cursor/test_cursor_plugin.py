@@ -39,6 +39,24 @@ CORE_SYMLINK = PLUGIN_DIR / "core"
 RUN_HOOK = PLUGIN_DIR / "scripts" / "run-hook"
 
 
+def _real_cmd(name: str) -> str:
+    """Absolute path to a real system utility, bypassing the fake PATH shims.
+
+    Core utilities live in /usr/bin on usr-merged Linux but in /bin on macOS,
+    so the fake bootstrap scripts must resolve them instead of hardcoding.
+    """
+    path = shutil.which(name, path="/usr/bin:/bin")
+    assert path is not None, f"required command not found: {name}"
+    return path
+
+
+def _sha256_cmd() -> str:
+    """A command printing ``<hex digest> <file>`` for the given file argument."""
+    if shutil.which("sha256sum", path="/usr/bin:/bin"):
+        return _real_cmd("sha256sum")
+    return f"{_real_cmd('shasum')} -a 256"
+
+
 def _install_source_hash(root=PLUGIN_DIR):
     files = [root / "pyproject.toml"]
     seen_dirs = set()
@@ -291,10 +309,10 @@ class TestRunHook:
         pip_template.write_text(
             "#!/bin/sh\n"
             'printf x >> "$BOOTSTRAP_COUNT"\n'
-            "/usr/bin/sleep 0.3\n"
+            f"{_real_cmd('sleep')} 0.3\n"
             'dest="$HOME/.arize/harness/cursor-plugin-venv/bin/arize-hook-cursor"\n'
-            '/usr/bin/cp "$FAKE_ENTRY" "$dest"\n'
-            '/usr/bin/chmod +x "$dest"\n'
+            f'{_real_cmd("cp")} "$FAKE_ENTRY" "$dest"\n'
+            f'{_real_cmd("chmod")} +x "$dest"\n'
         )
         pip_template.chmod(0o755)
         python = fake_bin / "python3"
@@ -303,16 +321,16 @@ class TestRunHook:
             'if [ "$1" = -c ]; then\n'
             '  case "$2" in\n'
             "    *version_info*) exit 0 ;;\n"
-            "    *hashlib*) /usr/bin/sha256sum \"$3\" | /usr/bin/cut -d' ' -f1; exit 0 ;;\n"
+            f"    *hashlib*) {_sha256_cmd()} \"$3\" | {_real_cmd('cut')} -d' ' -f1; exit 0 ;;\n"
             "  esac\n"
             "fi\n"
             'if [ "$1" = -m ] && [ "$2" = venv ]; then\n'
-            '  /usr/bin/mkdir -p "$3/bin"\n'
-            '  /usr/bin/cp "$FAKE_PIP" "$3/bin/pip"\n'
-            '  /usr/bin/chmod +x "$3/bin/pip"\n'
+            f'  {_real_cmd("mkdir")} -p "$3/bin"\n'
+            f'  {_real_cmd("cp")} "$FAKE_PIP" "$3/bin/pip"\n'
+            f'  {_real_cmd("chmod")} +x "$3/bin/pip"\n'
             "  exit 0\n"
             "fi\n"
-            'if [ "$1" = - ]; then exec /usr/bin/python3 "$@"; fi\n'
+            f'if [ "$1" = - ]; then exec {sys.executable} "$@"; fi\n'
             "exit 1\n"
         )
         python.chmod(0o755)
@@ -355,9 +373,9 @@ class TestRunHook:
         pip.write_text(
             "#!/bin/sh\n"
             f"printf x >> '{count_file}'\n"
-            f"if /usr/bin/mkdir '{active_dir}' 2>/dev/null; then\n"
-            "  /usr/bin/sleep 0.3\n"
-            f"  /usr/bin/rmdir '{active_dir}'\n"
+            f"if {_real_cmd('mkdir')} '{active_dir}' 2>/dev/null; then\n"
+            f"  {_real_cmd('sleep')} 0.3\n"
+            f"  {_real_cmd('rmdir')} '{active_dir}'\n"
             "else\n"
             f"  printf overlap > '{overlap_file}'\n"
             "fi\n"
@@ -370,7 +388,7 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
         )
         python.chmod(0o755)
         leader_dir = tmp_path / "stale-removal-leader"
@@ -378,18 +396,18 @@ class TestRunHook:
         fake_rm.write_text(
             "#!/bin/sh\n"
             f'if [ "$1" = -rf ] && [ "$2" = \'{lock_dir}\' ]; then\n'
-            f"  if /usr/bin/mkdir '{leader_dir}' 2>/dev/null; then\n"
-            '    exec /usr/bin/rm "$@"\n'
+            f"  if {_real_cmd('mkdir')} '{leader_dir}' 2>/dev/null; then\n"
+            f'    exec {_real_cmd("rm")} "$@"\n'
             "  fi\n"
             "  attempts=0\n"
-            f"  while [ \"$(/usr/bin/cat '{lock_dir}/pid' 2>/dev/null || true)\" = '{stale_pid}' ] || "
+            f"  while [ \"$({_real_cmd('cat')} '{lock_dir}/pid' 2>/dev/null || true)\" = '{stale_pid}' ] || "
             f"        [ ! -f '{lock_dir}/pid' ]; do\n"
             "    attempts=$((attempts + 1))\n"
             '    [ "$attempts" -ge 200 ] && exit 1\n'
-            "    /usr/bin/sleep 0.01\n"
+            f"    {_real_cmd('sleep')} 0.01\n"
             "  done\n"
             "fi\n"
-            'exec /usr/bin/rm "$@"\n'
+            f'exec {_real_cmd("rm")} "$@"\n'
         )
         fake_rm.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -428,7 +446,7 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -459,7 +477,7 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -509,7 +527,7 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -535,7 +553,7 @@ class TestRunHook:
         pip.write_text(
             "#!/bin/sh\n"
             'kill -TERM "$PPID"\n'
-            "/usr/bin/sleep 0.1\n"
+            f"{_real_cmd('sleep')} 0.1\n"
             'BIN_DIR=$(dirname "$0")\n'
             "printf '#!/bin/sh\\nprintf EXECUTED_AFTER_TERM\\n' > \"$BIN_DIR/arize-hook-cursor\"\n"
             'chmod +x "$BIN_DIR/arize-hook-cursor"\n'
@@ -545,7 +563,7 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' 'exec /usr/bin/python3 "$@"\n'
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
         )
         python.chmod(0o755)
 
