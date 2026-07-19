@@ -1188,6 +1188,8 @@ def _tool_input_with_privacy_provenance(state_key: str, popped: Optional[dict]) 
 
 def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Capture generic tool input before execution, keyed by tool_use_id."""
+    if not gen_id:
+        return
     tool_use_id = _jq_str(input_json, "tool_use_id")
     if not tool_use_id:
         return
@@ -1211,7 +1213,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     """TOOL span for a successful generic tool call."""
     tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
     tool_use_id = _jq_str(input_json, "tool_use_id")
-    state_key = _tool_state_key(gen_id, tool_use_id) if tool_use_id else ""
+    state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
     popped = state_pop(state_key) if state_key else None
 
     # Dedicated hooks provide richer fields. Still pop generic state so a host
@@ -1281,7 +1283,7 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     """Emit a TOOL span for failures, timeouts, denial, or interruption."""
     tool_name = _jq_str(input_json, "tool_name") or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
-    state_key = _tool_state_key(gen_id, tool_use_id) if tool_use_id else ""
+    state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
     popped = state_pop(state_key) if state_key else None
     tool_input, input_is_redacted = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
     if not tool_input and not input_is_redacted:
@@ -1347,6 +1349,8 @@ def _subagent_state_key(gen_id: str, subagent_type: str, task: str) -> str:
 
 def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Capture subagent start state using declared cross-event fields."""
+    if not gen_id:
+        return
     subagent_id = _jq_str(input_json, "subagent_id")
     subagent_type = _jq_str(input_json, "subagent_type")
     raw_task = _jq_str(input_json, "task")
@@ -1370,10 +1374,10 @@ def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms)
     """Emit one CHAIN span for a completed, failed, or aborted subagent."""
     raw_task = _jq_str(input_json, "task")
     stop_type = _jq_str(input_json, "subagent_type")
-    state_key = _subagent_state_key(gen_id, stop_type, raw_task)
-    popped = state_pop(state_key)
-    privacy_key = f"{state_key}_privacy"
-    privacy_state = state_pop(privacy_key)
+    state_key = _subagent_state_key(gen_id, stop_type, raw_task) if gen_id else ""
+    popped = state_pop(state_key) if state_key else None
+    privacy_key = f"{state_key}_privacy" if state_key else ""
+    privacy_state = state_pop(privacy_key) if privacy_key else None
     subagent_id = (popped or {}).get("subagent_id", "") or _jq_str(input_json, "subagent_id")
     duration = _to_int(input_json.get("duration_ms"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
@@ -1389,12 +1393,17 @@ def _handle_subagent_stop(input_json, conversation_id, gen_id, trace_id, now_ms)
         task_was_redacted = False
     task = _redact_deferred(env.log_prompts, task_source, task_was_redacted)
     task_is_redacted = task_was_redacted or not env.log_prompts
-    privacy_record = dict(privacy_state or {})
-    privacy_record["task"] = task if task_is_redacted else ""
-    privacy_record["task_redacted"] = task_is_redacted
-    state_push(privacy_key, privacy_record)
+    if privacy_key:
+        privacy_record = dict(privacy_state or {})
+        privacy_record["task"] = task if task_is_redacted else ""
+        privacy_record["task_redacted"] = task_is_redacted
+        state_push(privacy_key, privacy_record)
     raw_summary = _jq_str(input_json, "summary", "error_message")
-    summary = _redact_terminal_field(privacy_key, "summary", raw_summary, env.log_model_outputs)[0]
+    summary = (
+        _redact_terminal_field(privacy_key, "summary", raw_summary, env.log_model_outputs)[0]
+        if privacy_key
+        else redact_content(env.log_model_outputs, raw_summary)
+    )
     attrs = {
         "openinference.span.kind": "CHAIN",
         "input.value": task,
