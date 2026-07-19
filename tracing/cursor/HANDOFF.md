@@ -328,18 +328,56 @@ Linux. A real macOS GUI-launched Cursor test is especially useful because GUI
 apps may not inherit shell environment variables. Windows plugin behavior
 also needs a real host smoke if Windows support is required for this change.
 
-### 4. Final independent exact-SHA reviews were still running at push request
+### 4. Final independent exact-SHA reviews completed with two blockers
 
 Two read-only reviews were launched for exact code SHA
-`b1d28bde7ac46eb7b61ebe7ad0c5efa8e7fcf732`:
+`b1d28bde7ac46eb7b61ebe7ad0c5efa8e7fcf732`. The branch was initially pushed
+before they completed because the repository owner explicitly requested an
+immediate fork-branch handoff. Both reviews subsequently returned `FAIL`.
+Their findings were independently reproduced in the pushed worktree.
 
-1. durable state, SQLite, cleanup, locking, and legacy compatibility;
-2. functional lifecycle, host contracts, generation-less behavior, privacy,
-   bootstrap, and test validity.
+#### Blocker A: root-state reads follow a symlinked generation shard
 
-The branch is being pushed before those reviews finish because the repository
-owner explicitly requested an immediate fork-branch handoff. Their eventual
-results therefore must not be described as pre-push approval.
+`gen_root_span_get()` constructs `STATE_DIR / token / root_<token>` directly.
+`_read_private_text()` rejects a symlink only at the final file component; it
+does not reject a symlink at the intermediate `STATE_DIR / token` shard.
+Consequently, an external matching root file can be read and used as parent
+span state.
+
+Independent reproduction result:
+
+```text
+symlink_parent_read= 'EXTERNAL_PARENT_SPAN_SECRET'
+```
+
+Cleanup already rejects a symlinked shard, so read and cleanup confinement are
+inconsistent. The fix should be test-driven and should validate/open the
+parent shard without following symlinks rather than relying only on lexical
+path construction.
+
+#### Blocker B: `sessionEnd` before `stop` deletes a deferred Agent Response
+
+Generated `afterAgentResponse` stores an LLM entry for later emission.
+`_handle_stop()` drains that stack, but `_handle_session_end()` does not.
+Dispatch nevertheless performs complete generation cleanup after either
+terminal event. If `sessionEnd` arrives first, cleanup removes the pending LLM
+entry; a later `stop` cannot emit it.
+
+Independent reproduction result for
+`afterAgentResponse -> sessionEnd -> duplicate sessionEnd -> stop -> duplicate stop`:
+
+```text
+before_terminal= ['User Prompt']
+after_terminal= ['User Prompt', 'Session End', 'Agent Stop']
+agent_response_present= False
+```
+
+The expected `Agent Response` is absent. Existing ordering coverage exercised
+`stop -> sessionEnd`, not the inverse state-loss path.
+
+These blockers mean the branch must not be presented as ready for an upstream
+pull request despite the green 2,167-test suite. No code fix for either finding
+was included in this documentation update.
 
 ### 5. No upstream PR was created
 
