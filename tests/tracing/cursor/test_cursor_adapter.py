@@ -2,6 +2,7 @@
 """Tests for tracing.cursor.hooks.adapter — Cursor-specific adapter module."""
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 
@@ -276,6 +277,30 @@ class TestStateCleanupGeneration:
         with pytest.raises(OSError):
             adapter.gen_root_span_get(gen_id)
         assert outside_root.read_text() == "EXTERNAL_PARENT_SECRET"
+
+    def test_root_read_rejects_symlinked_generation_shard(self, tmp_path):
+        gen_id = "gen-shard-symlink-read"
+        token = adapter.generation_state_key(gen_id)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / f"root_{token}").write_text("EXTERNAL_PARENT_SPAN_SECRET")
+        (adapter.STATE_DIR / token).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(OSError):
+            adapter.gen_root_span_get(gen_id)
+
+    def test_root_read_rejects_hard_linked_state_file(self, tmp_path):
+        gen_id = "gen-hardlink-read"
+        token = adapter.generation_state_key(gen_id)
+        shard = adapter.STATE_DIR / token
+        shard.mkdir()
+
+        outside_root = tmp_path / "outside-root"
+        outside_root.write_text("EXTERNAL_HARDLINK_SECRET")
+        os.link(outside_root, shard / f"root_{token}")
+
+        with pytest.raises(OSError):
+            adapter.gen_root_span_get(gen_id)
 
     def test_cleanup_rejects_symlink_shard_without_touching_target(self, tmp_path):
         gen_id = "gen-symlink"
