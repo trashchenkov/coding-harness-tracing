@@ -570,6 +570,47 @@ credentials supplied only via `~/.arize/harness/config.json` (no env vars).
   payload replay.
 - No upstream PR decision was made in this round.
 
+## Review response round (2026-07-19, after independent re-review)
+
+Independent re-review of the continuation round returned REQUEST CHANGES with
+three blocking findings sharing one root cause: the completion ledger
+distinguishes the two terminal events, but generation state died after the
+first one. All findings were addressed:
+
+- **Second terminal span lost its parent** (both orders): the first terminal
+  claim now persists the root span identity in a content-free
+  `terminal_attribution` ledger table (digest-keyed, retained like
+  tombstones), and `_terminal_attribution_context()` recovers the parent when
+  the root state file is already cleaned up.
+- **Cumulative tokens double-counted**: usage is attributed exactly once per
+  generation. The first terminal event with token data attaches it (to the
+  flushed Agent Response, else to its own CHAIN span) and durably sets
+  `usage_attributed`; a later terminal event never re-attaches counts. A
+  tokenless first terminal does not burn the attribution — a later terminal
+  with counts still carries them. The earlier regression test that codified
+  the double-count was replaced by a full two-order matrix test asserting
+  span names, parent linkage, trace identity, single token ownership, model
+  attribution, duplicate suppression, and cleanup.
+- **`sessionEnd`-first lost `llm.model_name`**: `_handle_session_end` now
+  parses `model` and routes it with the token attrs, mirroring `stop`.
+- **TOCTOU fallback** (medium): on platforms without `dir_fd` support the
+  shard read now fails closed (state unavailable) instead of a check-then-open
+  race.
+- **Old-pip fallback range** (medium): `--use-feature=in-tree-build` retry
+  (pip 21.1–21.2 only) was replaced by installing from a symlink-resolved
+  copy of the plugin tree, which works on every supported pip including 20.x.
+  Re-validated on the real macOS host with pip 21.2.4: the plugin reinstalled
+  through the new fallback and exported spans end to end.
+- **Test shims now `shlex.quote` the interpreter path** (low).
+- The `manage-cursor-tracing` skill's lifecycle/token wording was updated to
+  the either-order terminal contract.
+
+Suite after this round: 2,176 passed on macOS; pre-commit, compileall, and
+diff checks clean. The reviewer-confirmed pre-existing issue (terminal claim
+recorded before export success, so a transient export failure suppresses
+redelivery) is unchanged; it predates this branch's continuation rounds and
+needs its own decision.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
