@@ -1954,7 +1954,20 @@ class TestHandlePostToolUse:
 
     @pytest.mark.parametrize(
         "tool_name",
-        ["shell", "Shell", "TERMINAL", "bash", "read_file", "edit_file", "tab_file_read", "mcp"],
+        [
+            "shell",
+            "Shell",
+            "TERMINAL",
+            "bash",
+            "read_file",
+            "edit_file",
+            "tab_file_read",
+            "mcp",
+            # Real hosts name MCP calls "MCP:<tool>" in generic tool events while
+            # also emitting the dedicated MCP pair (observed on Cursor CLI).
+            "MCP:echo_marker",
+            "mcp:server_tool",
+        ],
     )
     def test_post_tool_use_skips_each_dedicated_tool_name(self, captured_spans, monkeypatch, tool_name):
         """postToolUse short-circuits for each known dedicated tool name (case-insensitive)."""
