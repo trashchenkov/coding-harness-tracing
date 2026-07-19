@@ -67,7 +67,13 @@ def _install_source_hash(root=PLUGIN_DIR):
             dirnames[:] = []
             continue
         seen_dirs.add(real_dir)
-        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if name != "__pycache__"
+            and not name.endswith(".egg-info")
+            and not (name == "build" and Path(dirpath) == Path(root))
+        )
         files.extend(Path(dirpath) / name for name in sorted(filenames) if name.endswith(".py"))
 
     digest = hashlib.sha256()
@@ -620,11 +626,23 @@ class TestRunHook:
         assert result.stdout == b""
         assert not lock_dir.exists()
 
-    def test_pip_install_falls_back_to_symlink_resolved_copy(self, tmp_path):
-        """pip < 21.3 breaks the relative core symlink by building from a temp
-        copy of the tree (seen with macOS CommandLineTools Python 3.9, and
-        pip 20.x rejects --use-feature=in-tree-build entirely); the bootstrap
-        must retry from a copy whose core is a real directory."""
+    def test_pip_install_uses_pruned_symlink_resolved_copy(self, tmp_path):
+        """The install source handed to pip must be a copy with the core
+        symlink materialized (pip < 21.3 breaks on the relative symlink, and
+        pip 20.x rejects --use-feature=in-tree-build) and with build/ and
+        *.egg-info pruned — a stale build/lib would otherwise be packaged
+        instead of the current sources."""
+        plugin_root = tmp_path / "plugin"
+        shutil.copytree(PLUGIN_DIR, plugin_root)
+        run_hook = plugin_root / "scripts" / "run-hook"
+        # Simulate artifacts left in the plugin dir by an earlier failed pip.
+        stale_build = plugin_root / "build" / "lib" / "tracing" / "cursor" / "hooks"
+        stale_build.mkdir(parents=True)
+        (stale_build / "handlers.py").write_text("STALE = True\n")
+        egg_info = plugin_root / "cursor_tracing.egg-info"
+        egg_info.mkdir()
+        (egg_info / "PKG-INFO").write_text("Name: cursor-tracing\n")
+
         home = tmp_path / "home"
         venv_bin = home / ".arize" / "harness" / "cursor-plugin-venv" / "bin"
         venv_bin.mkdir(parents=True)
@@ -633,15 +651,17 @@ class TestRunHook:
         pip.write_text(
             "#!/bin/sh\n"
             "target=$3\n"
-            # Simulate an old pip: only an install source whose core is a real
-            # directory (not the repo's relative symlink) can build.
+            # Old-pip semantics: only a source whose core is a real directory
+            # builds; refuse any source still carrying build artifacts.
             'if [ -d "$target/core" ] && [ ! -L "$target/core" ] '
-            '&& [ -f "$target/core/common.py" ]; then\n'
+            '&& [ -f "$target/core/common.py" ] '
+            '&& [ ! -d "$target/build" ] '
+            '&& [ ! -d "$target/cursor_tracing.egg-info" ]; then\n'
             f"  printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
             f"  chmod +x '{entry_point}'\n"
             "  exit 0\n"
             "fi\n"
-            "echo 'error: package directory core does not exist' >&2\n"
+            "echo 'error: unbuildable install source' >&2\n"
             "exit 1\n"
         )
         pip.chmod(0o755)
@@ -656,11 +676,13 @@ class TestRunHook:
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
 
-        result = subprocess.run([str(RUN_HOOK)], env=env, input=b"{}", capture_output=True, timeout=10)
+        result = subprocess.run([str(run_hook)], env=env, input=b"{}", capture_output=True, timeout=10)
 
         assert result.returncode == 0
         assert result.stdout == b"{}"
         marker = home / ".arize" / "harness" / ".cursor-plugin.pyproject.sha256"
+        # The fingerprint must ignore the build artifacts, so it matches the
+        # clean plugin tree and pollution cannot mask or force reinstalls.
         assert marker.read_text().strip() == _install_source_hash()
 
     def test_fails_open_with_empty_stdout_when_bootstrap_fails(self):
