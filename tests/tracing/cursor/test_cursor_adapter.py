@@ -256,6 +256,27 @@ class TestStateCleanupGeneration:
         assert adapter.state_pop("shell_g10") == {"command": "legacy-g10"}
         assert adapter.state_pop("tool_a_b") == {"generation": "a", "tool": "b"}
 
+    def test_state_reads_reject_symlinked_stack_and_root_files(self, tmp_path):
+        gen_id = "gen-read-symlink"
+        token = adapter.generation_state_key(gen_id)
+        shard = adapter.STATE_DIR / token
+        shard.mkdir()
+
+        outside_stack = tmp_path / "outside-stack.json"
+        outside_stack.write_text('[{"secret": "EXTERNAL_SECRET"}]')
+        key = f"shell_{token}"
+        (shard / f"{key}.stack.json").symlink_to(outside_stack)
+        with pytest.raises(OSError):
+            adapter.state_pop(key)
+        assert "EXTERNAL_SECRET" in outside_stack.read_text()
+
+        outside_root = tmp_path / "outside-root"
+        outside_root.write_text("EXTERNAL_PARENT_SECRET")
+        (shard / f"root_{token}").symlink_to(outside_root)
+        with pytest.raises(OSError):
+            adapter.gen_root_span_get(gen_id)
+        assert outside_root.read_text() == "EXTERNAL_PARENT_SECRET"
+
     def test_cleanup_rejects_symlink_shard_without_touching_target(self, tmp_path):
         gen_id = "gen-symlink"
         safe = adapter.generation_state_key(gen_id)
@@ -364,6 +385,37 @@ class TestCompletedGenerationLedger:
                 "INSERT INTO completed_generations(digest) VALUES (?)",
                 (sqlite3.Binary(b"a" * 64),),
             )
+
+    def test_exact_guards_do_not_hide_preexisting_blob_digest(self):
+        gen_id = "existing"
+        digest = adapter.stable_digest(gen_id)
+        adapter.generation_mark_completed(gen_id)
+        ledger = adapter.STATE_DIR / "completed_generations.sqlite3"
+        guards = (
+            ("completed_digest_insert_guard", "completed_generations", "INSERT"),
+            ("completed_digest_update_guard", "completed_generations", "UPDATE"),
+            ("pending_digest_insert_guard", "pending_generation_cleanups", "INSERT"),
+            ("pending_digest_update_guard", "pending_generation_cleanups", "UPDATE"),
+        )
+        with sqlite3.connect(ledger) as connection:
+            for name, _, _ in guards:
+                connection.execute(f"DROP TRIGGER {name}")
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE completed_generations SET digest = ? WHERE digest = ?",
+                (sqlite3.Binary(digest.encode()), digest),
+            )
+            for name, table, operation in guards:
+                connection.execute(
+                    f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
+                    "WHEN NEW.digest IS NULL OR typeof(NEW.digest) != 'text' "
+                    "OR length(NEW.digest) != 64 "
+                    "OR NEW.digest GLOB '*[^0-9a-f]*' "
+                    "BEGIN SELECT RAISE(ABORT, 'invalid generation digest'); END"
+                )
+
+        assert adapter.generation_completion_status(gen_id) == "ledger-unavailable"
+        assert adapter.generation_is_completed(gen_id) is True
 
     def test_legacy_blob_digest_with_old_exact_guards_fails_closed(self):
         adapter.STATE_DIR.mkdir(parents=True, exist_ok=True)

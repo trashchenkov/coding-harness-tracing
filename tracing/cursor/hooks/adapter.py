@@ -60,6 +60,25 @@ def _ensure_private_file(path) -> None:
         os.close(fd)
 
 
+def _read_private_text(path):
+    """Read one regular private file without following its final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"private state path is not a regular file: {path}")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "r") as stream:
+            fd = -1
+            return stream.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _write_private_text(path, text: str) -> None:
     """Crash-safely replace text using a descriptor created with mode 0600."""
     _ensure_private_dir(path.parent)
@@ -243,11 +262,9 @@ def _install_digest_guards(connection) -> None:
     exact_guards = all(
         installed.get(name) == trigger_sql(name, table, operation) for name, (table, operation) in guards.items()
     )
-    if exact_guards:
-        return
-
-    # A missing or same-name/different-definition trigger is not provenance.
-    # Validate all legacy rows before replacing guards so corruption fails closed.
+    # Trigger definitions only constrain future writes. Validate retained rows on
+    # every bounded ledger open as well, so temporarily disabled checks cannot
+    # hide malformed provenance after the exact guards are restored.
     for table in ("completed_generations", "pending_generation_cleanups"):
         invalid = connection.execute(
             f"SELECT 1 FROM {table} "
@@ -257,6 +274,10 @@ def _install_digest_guards(connection) -> None:
         ).fetchone()
         if invalid is not None:
             raise sqlite3.DatabaseError(f"invalid digest in {table}")
+    if exact_guards:
+        return
+
+    # A missing or same-name/different-definition trigger is not provenance.
     for name, (table, operation) in guards.items():
         if name in installed:
             connection.execute(f"DROP TRIGGER {name}")
@@ -394,6 +415,72 @@ def generation_mark_completed(gen_id: str, *, cleanup_pending: bool = False) -> 
     generation_mark_digest_completed(_generation_digest(gen_id), cleanup_pending=cleanup_pending)
 
 
+def generation_claim_terminal_event(gen_id: str, event: str) -> bool:
+    """Atomically claim one terminal event and complete its generation."""
+    if not gen_id or event not in {"stop", "sessionEnd"}:
+        raise ValueError("invalid terminal event claim")
+    generation_digest = _generation_digest(gen_id)
+    event_digest = stable_digest(f"cursor-terminal-event\0{event}\0{gen_id}")
+    terminal_digests = tuple(
+        stable_digest(f"cursor-terminal-event\0{terminal_event}\0{gen_id}") for terminal_event in ("stop", "sessionEnd")
+    )
+    with completion_ledger_guard():
+        with _completed_db_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            metadata = _read_completion_metadata(connection)
+            if metadata is None:
+                raise sqlite3.DatabaseError("completion ledger metadata disappeared")
+            row_count, saturated = metadata
+            actual_count = connection.execute("SELECT count(*) FROM completed_generations").fetchone()[0]
+            if actual_count != row_count:
+                raise sqlite3.DatabaseError("completion ledger count changed during terminal claim")
+            if connection.execute(
+                "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1",
+                (event_digest,),
+            ).fetchone():
+                return False
+            if saturated:
+                return False
+            generation_exists = (
+                connection.execute(
+                    "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1",
+                    (generation_digest,),
+                ).fetchone()
+                is not None
+            )
+            if generation_exists:
+                # A pre-domain-separation tombstone cannot identify which
+                # terminal event was already delivered. Fail closed rather than
+                # replaying either event once after upgrade.
+                current_claim_exists = (
+                    connection.execute(
+                        "SELECT 1 FROM completed_generations " "WHERE digest IN (?, ?) LIMIT 1",
+                        terminal_digests,
+                    ).fetchone()
+                    is not None
+                )
+                if not current_claim_exists:
+                    return False
+            new_rows = 1 + int(not generation_exists)
+            if row_count + new_rows > COMPLETION_LEDGER_MAX_ROWS:
+                connection.execute("UPDATE completion_metadata SET saturated = 1 WHERE singleton = 1")
+                return False
+            connection.execute("INSERT INTO completed_generations(digest) VALUES (?)", (event_digest,))
+            if not generation_exists:
+                connection.execute("INSERT INTO completed_generations(digest) VALUES (?)", (generation_digest,))
+            connection.execute(
+                "UPDATE completion_metadata SET row_count = row_count + ?, "
+                "saturated = CASE WHEN row_count + ? >= ? THEN 1 ELSE 0 END "
+                "WHERE singleton = 1",
+                (new_rows, new_rows, COMPLETION_LEDGER_MAX_ROWS),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_generation_cleanups(digest) VALUES (?)",
+                (generation_digest,),
+            )
+            return True
+
+
 def generation_pending_cleanup_batch() -> "tuple[list[str], bool] | None":
     """Return one bounded cleanup batch plus whether durable work remains."""
     with completion_ledger_guard():
@@ -520,10 +607,10 @@ def state_push(key: str, value: dict) -> None:
     _ensure_private_file(lock_path)
 
     with FileLock(lock_path):
-        if stack_file.exists():
-            stack_file.chmod(0o600)
+        serialized = _read_private_text(stack_file)
+        if serialized is not None:
             try:
-                data = json.loads(stack_file.read_text()) or []
+                data = json.loads(serialized) or []
             except json.JSONDecodeError:
                 data = []
         else:
@@ -548,12 +635,12 @@ def state_pop(key: str) -> "dict | None":
     _ensure_private_file(lock_path)
 
     with FileLock(lock_path):
-        if not stack_file.exists():
+        serialized = _read_private_text(stack_file)
+        if serialized is None:
             return None
-        stack_file.chmod(0o600)
 
         try:
-            data = json.loads(stack_file.read_text()) or []
+            data = json.loads(serialized) or []
         except json.JSONDecodeError:
             return None
 
@@ -588,10 +675,8 @@ def gen_root_span_get(gen_id: str) -> str:
         return ""
     token = generation_state_key(gen_id)
     root_file = STATE_DIR / token / f"root_{token}"
-    if root_file.exists():
-        root_file.chmod(0o600)
-        return root_file.read_text().strip()
-    return ""
+    serialized = _read_private_text(root_file)
+    return serialized.strip() if serialized is not None else ""
 
 
 # --- Generation cleanup ---
