@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -42,14 +43,21 @@ _GENERATION_TOKEN_RE = re.compile(r"g_[0-9a-f]{64}(?![0-9a-f])")
 def _ensure_private_dir(path) -> None:
     """Create or tighten a directory that stores private tracing state."""
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise OSError(f"private state path is not a real directory: {path}")
     path.chmod(0o700)
 
 
 def _ensure_private_file(path) -> None:
     """Create a private file without an umask-dependent exposure window."""
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(fd)
-    path.chmod(0o600)
+    flags = os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"private state path is not a regular file: {path}")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
 
 
 def _write_private_text(path, text: str) -> None:
@@ -605,6 +613,8 @@ def state_cleanup_generation_digest(digest: str) -> None:
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError("invalid generation digest")
     shard = STATE_DIR / f"g_{digest}"
+    if shard.is_symlink():
+        raise OSError(f"generation state shard must not be a symlink: {shard}")
     if not shard.exists():
         return
     if not shard.is_dir():

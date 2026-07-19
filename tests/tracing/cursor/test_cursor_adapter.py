@@ -256,6 +256,25 @@ class TestStateCleanupGeneration:
         assert adapter.state_pop("shell_g10") == {"command": "legacy-g10"}
         assert adapter.state_pop("tool_a_b") == {"generation": "a", "tool": "b"}
 
+    def test_cleanup_rejects_symlink_shard_without_touching_target(self, tmp_path):
+        gen_id = "gen-symlink"
+        safe = adapter.generation_state_key(gen_id)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "victim"
+        victim.write_text("do not delete")
+        (adapter.STATE_DIR / safe).symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(OSError):
+            adapter.state_cleanup_generation(gen_id)
+
+        assert victim.read_text() == "do not delete"
+
+        (adapter.STATE_DIR / safe).unlink()
+        (adapter.STATE_DIR / safe).symlink_to(tmp_path / "missing", target_is_directory=True)
+        with pytest.raises(OSError):
+            adapter.state_cleanup_generation(gen_id)
+
     def test_cleanup_nonempty_lock_dir(self):
         gen_id = "gen-lockdir"
         safe = adapter.generation_state_key(gen_id)
