@@ -526,15 +526,48 @@ portability, and performed the first real-host smoke with the Cursor CLI.
   `<redacted (0 chars)>` while the command text stayed visible — command text
   is governed by `ARIZE_LOG_TOOL_DETAILS`, matching the documented split.
 
+### Real-host observations (Cursor IDE 3.8.24, macOS GUI)
+
+A second smoke exercised the GUI IDE with workspace-level hooks and
+credentials supplied only via `~/.arize/harness/config.json` (no env vars).
+
+- The deferred prompt/response pipeline that the CLI never exercises worked
+  end to end: `beforeSubmitPrompt` deferred the root, `afterAgentResponse`
+  emitted the User Prompt root and deferred the LLM entry, and `stop` emitted
+  the Agent Response LLM span carrying the per-turn token counts (including
+  the cache_read/cache_write split) plus the Agent Stop CHAIN — all in one
+  generation-derived trace with correct parenting.
+- Events observed: `beforeSubmitPrompt`, `afterAgentResponse`,
+  `afterAgentThought`, `beforeShellExecution`, `afterShellExecution`,
+  `beforeReadFile`, `afterFileEdit`, `preToolUse`, `postToolUse`,
+  `sessionStart`, `stop`.
+- Events NOT observed on this surface: `sessionEnd` — not even when the
+  workspace window was closed — plus `workspaceOpen`, MCP events, Tab
+  events, subagent events, `preCompact`, `postToolUseFailure`. The IDE's
+  terminal event on this build is `stop`; the CLI's is `sessionEnd`. Both
+  orderings are therefore reachable in production, which is why the Blocker B
+  flush-on-either-terminal fix matters on both surfaces.
+- The `afterAgentThought` identity split reproduced here too: 3 of 7 thought
+  events carried the turn's generation_id (parented correctly), 4 carried a
+  different generation identity and landed in parentless traces.
+- The bounded-cleanup design was validated live: the turn accumulated more
+  private state entries than one 16-entry cleanup pass allows, `stop`-time
+  cleanup failed loudly with "cleanup incomplete; retry required" after the
+  terminal claim was already durable (no replay), later hook fires swept the
+  backlog through the pending-cleanup ledger, and a final probe event removed
+  the last marker and the shard.
+- The `config.json` credentials route for GUI-launched Cursor works as
+  documented.
+
 ### Still open after this round
 
-- Cursor IDE (GUI) surface not exercised — only the CLI. A GUI-launched
-  macOS Cursor may not inherit shell env vars; config.json remains the
-  recommended credentials path.
 - Export verified against a local capture sink in Phoenix payload shape; a
   real Phoenix/Arize UI inspection of parent relationships has still not been
   performed.
 - Windows bootstrap remains unexercised.
+- MCP, Tab, subagent, `preCompact`, and `postToolUseFailure` events were not
+  triggered on either real surface; their handlers remain validated only by
+  payload replay.
 - No upstream PR decision was made in this round.
 
 ## Safety and delivery note
