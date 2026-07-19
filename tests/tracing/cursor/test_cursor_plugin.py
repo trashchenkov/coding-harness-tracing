@@ -609,6 +609,43 @@ class TestRunHook:
         assert result.stdout == b""
         assert not lock_dir.exists()
 
+    def test_pip_install_retries_with_in_tree_build_for_old_pip(self, tmp_path):
+        """pip < 21.3 breaks the relative core symlink by building from a temp
+        copy of the tree (seen with macOS CommandLineTools Python 3.9); the
+        bootstrap must retry with that pip's opt-in in-tree build."""
+        home = tmp_path / "home"
+        venv_bin = home / ".arize" / "harness" / "cursor-plugin-venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        entry_point = venv_bin / "arize-hook-cursor"
+        pip = venv_bin / "pip"
+        pip.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            "  *--use-feature=in-tree-build*)\n"
+            f"    printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
+            f"    chmod +x '{entry_point}'\n"
+            "    exit 0 ;;\n"
+            "esac\n"
+            "echo 'error: package directory core does not exist' >&2\n"
+            "exit 1\n"
+        )
+        pip.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        python = fake_bin / "python3"
+        python.write_text(
+            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+        )
+        python.chmod(0o755)
+        env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        result = subprocess.run([str(RUN_HOOK)], env=env, input=b"{}", capture_output=True, timeout=10)
+
+        assert result.returncode == 0
+        assert result.stdout == b"{}"
+        marker = home / ".arize" / "harness" / ".cursor-plugin.pyproject.sha256"
+        assert marker.read_text().strip() == _install_source_hash()
+
     def test_fails_open_with_empty_stdout_when_bootstrap_fails(self):
         """If no Python is available, run-hook must exit 0 with empty stdout.
 

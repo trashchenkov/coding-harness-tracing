@@ -273,9 +273,15 @@ bootstrap() {
         return 1
     }
     if ! "$PIP" install --quiet "$PLUGIN_ROOT" >&2; then
-        echo "[arize] pip install failed" >&2
-        rm -f "$MARKER"
-        return 1
+        # pip < 21.3 (e.g. macOS CommandLineTools Python 3.9) builds from a
+        # temp copy of the tree, which breaks the relative core symlink; its
+        # opt-in in-tree build avoids the copy. Newer pips build in-tree by
+        # default and reject the removed flag, so this is retry-only.
+        if ! "$PIP" install --quiet --use-feature=in-tree-build "$PLUGIN_ROOT" >&2; then
+            echo "[arize] pip install failed" >&2
+            rm -f "$MARKER"
+            return 1
+        fi
     fi
 
     # Publish only the fingerprint selected before installation. This also
