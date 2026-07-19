@@ -656,6 +656,44 @@ Tab events (needs real IDE Tab completion), subagent events, `preCompact`
 (needs a compaction-length conversation), `postToolUseFailure`, Windows,
 and a real Phoenix/Arize UI inspection.
 
+## Real Phoenix inspection (2026-07-19, local instance)
+
+A local Phoenix (arize-phoenix, `localhost:6006`) received a real CLI run
+plus an IDE-style event sequence replayed through the installed dispatcher
+(beforeSubmitPrompt → thought → shell pair → afterFileEdit →
+afterAgentResponse → stop → sessionEnd with token counts). Verified via
+Phoenix's GraphQL API and visually in the UI:
+
+- **Ingestion**: all 16 span POSTs to `/v1/projects/cursor/spans` returned
+  202; zero rejections in the server log — the payload shape is accepted by
+  the real backend, not just a capture stub.
+- **Topology**: the deferred-pipeline trace assembled as one tree — User
+  Prompt root (with real 2.3s latency from the deferred start time), Agent
+  Thinking / Shell / File Edit / Agent Response / Agent Stop / Session End
+  all correctly parented, confirming both terminal spans keep their parent
+  after the terminal-attribution fix. No missing-parent references anywhere.
+- **OpenInference semantics**: the Agent Response span renders as a proper
+  LLM span — model `composer-2` shown, LLM Input/Output panes populated,
+  token count 2,390 displayed and aggregated into the project total
+  (2,050 prompt including cache buckets + 340 completion). CHAIN/TOOL kinds
+  render with their badges; paired tool spans show real latencies.
+- **Sessions**: the Sessions view groups both conversations by
+  `session.id`, shows first input / last output, and surfaces `user.id`.
+- **Confirmed UX cost of the known thought-identity issue**: the orphan
+  Agent Thinking spans appear as separate single-span parentless traces in
+  the root-spans list — visible clutter, reinforcing that the
+  `afterAgentThought` generation-identity contract question is worth
+  resolving before wide rollout.
+- **Notes**: `ARIZE_PROJECT_NAME` is intentionally ignored on the Phoenix
+  backend (framework-scoped project override is `PHOENIX_PROJECT_NAME`;
+  see issue #74), so spans land in the service-name project `cursor`.
+  Total Cost shows $0 because Phoenix has no pricing for `composer-2` —
+  cost requires a model-pricing entry, not a tracing change.
+
+Arize AX remains unexercised end to end (needs real credentials): its
+OTLP JSON transport, auth headers, and `arize.project.name` injection have
+never run against the real service.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
