@@ -21,12 +21,12 @@ from tracing.cursor.hooks.adapter import (
     completion_ledger_guard,
     gen_root_span_get,
     gen_root_span_save,
+    generation_claim_terminal_event,
     generation_completion_status,
     generation_digest_completion_status,
     generation_finish_pending_cleanup_batch,
     generation_guard,
     generation_mark_cleanup_done,
-    generation_mark_completed,
     generation_mark_digest_completed,
     generation_pending_cleanup_batch,
     generation_state_key,
@@ -287,7 +287,11 @@ def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> No
                 if not conversation_id:
                     log(f"Ignoring {event} without generation or conversation identity")
                     return
-                fallback_digest = stable_digest(f"cursor-terminal-fallback\0{conversation_id}")
+                legacy_digest = stable_digest(f"cursor-terminal-fallback\0{conversation_id}")
+                if generation_digest_completion_status(legacy_digest) != "active":
+                    log(f"Ignoring {event} with legacy generationless completion")
+                    return
+                fallback_digest = stable_digest(f"cursor-terminal-fallback\0{event}\0{conversation_id}")
                 completion_status = generation_digest_completion_status(fallback_digest)
                 if completion_status != "active":
                     log(f"Ignoring {event} without generation: {completion_status}")
@@ -308,20 +312,22 @@ def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> No
     # orders every handler against saturation transitions across generations.
     with generation_guard(gen_id):
         with completion_ledger_guard():
-            completion_status = generation_completion_status(gen_id)
-            if completion_status != "active":
-                log(f"Ignoring {event} for generation: {completion_status}")
-                return
             if event in {"stop", "sessionEnd"}:
-                # Claim at-most-once terminal delivery and durable cleanup work
-                # in one ledger transaction before any handler side effect.
-                generation_mark_completed(gen_id, cleanup_pending=True)
+                # Claim each distinct terminal event at most once while also
+                # completing the generation and queuing cleanup atomically.
+                if not generation_claim_terminal_event(gen_id, event):
+                    log(f"Ignoring duplicate or unclaimable {event} for generation")
+                    return
                 try:
                     handler(input_json, conversation_id, gen_id, trace_id, now_ms)
                 finally:
                     state_cleanup_generation(gen_id)
                     generation_mark_cleanup_done(stable_digest(gen_id))
             else:
+                completion_status = generation_completion_status(gen_id)
+                if completion_status != "active":
+                    log(f"Ignoring {event} for generation: {completion_status}")
+                    return
                 handler(input_json, conversation_id, gen_id, trace_id, now_ms)
 
 

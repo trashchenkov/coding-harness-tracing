@@ -722,6 +722,42 @@ class TestHandleStop:
 
         assert len(captured_spans) == 1
 
+    @pytest.mark.parametrize("generation_id", ["g1", ""])
+    def test_stop_and_session_end_are_distinct_once_only_events(self, captured_spans, monkeypatch, generation_id):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "c1"}
+        if generation_id:
+            payload["generation_id"] = generation_id
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers.gen_root_span_get", return_value=""),
+        ):
+            _dispatch("stop", payload)
+            _dispatch("stop", payload)
+            _dispatch("sessionEnd", payload)
+            _dispatch("sessionEnd", payload)
+
+        names = [span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for span in captured_spans]
+        assert names == ["Agent Stop", "Session End"]
+
+    @pytest.mark.parametrize("generation_id", ["legacy-g1", ""])
+    def test_legacy_terminal_tombstone_fails_closed_after_domain_separation(
+        self, captured_spans, monkeypatch, generation_id
+    ):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "legacy-c1"}
+        if generation_id:
+            payload["generation_id"] = generation_id
+            adapter.generation_mark_completed(generation_id)
+        else:
+            legacy_digest = adapter.stable_digest("cursor-terminal-fallback\0legacy-c1")
+            adapter.generation_mark_digest_completed(legacy_digest)
+
+        _dispatch("stop", payload)
+        _dispatch("sessionEnd", payload)
+
+        assert captured_spans == []
+
     def test_generationless_tool_and_subagent_emit_inline_without_shared_state(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
@@ -795,7 +831,7 @@ class TestHandleStop:
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
             mock.patch(
-                "tracing.cursor.hooks.handlers.generation_mark_completed",
+                "tracing.cursor.hooks.handlers.generation_claim_terminal_event",
                 side_effect=sqlite3.OperationalError("database is locked"),
             ) as mark,
             mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None) as pop,
@@ -805,7 +841,7 @@ class TestHandleStop:
             with pytest.raises(sqlite3.OperationalError, match="database is locked"):
                 _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
 
-        mark.assert_called_once_with("g1", cleanup_pending=True)
+        mark.assert_called_once_with("g1", event)
         pop.assert_not_called()
         send.assert_not_called()
         cleanup.assert_not_called()
@@ -2055,14 +2091,14 @@ class TestDeferredStatePrivacy:
         entered_mark = threading.Event()
         release_mark = threading.Event()
         duplicate_started = threading.Event()
-        original_mark = adapter.generation_mark_completed
+        original_claim = getattr(sys.modules["tracing.cursor.hooks.handlers"], "generation_claim_terminal_event")
 
-        def slow_mark(gen_id, *, cleanup_pending=False):
+        def slow_claim(gen_id, event):
             entered_mark.set()
             assert release_mark.wait(timeout=5)
-            original_mark(gen_id, cleanup_pending=cleanup_pending)
+            return original_claim(gen_id, event)
 
-        monkeypatch.setattr("tracing.cursor.hooks.handlers.generation_mark_completed", slow_mark)
+        monkeypatch.setattr("tracing.cursor.hooks.handlers.generation_claim_terminal_event", slow_claim)
         monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
         monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
 
