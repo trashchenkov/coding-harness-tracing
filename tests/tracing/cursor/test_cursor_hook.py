@@ -756,31 +756,84 @@ class TestHandleStop:
         names = [span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for span in captured_spans]
         assert names == ["User Prompt", "Agent Response", "Session End", "Agent Stop"]
 
-    def test_session_end_first_attaches_tokens_to_flushed_llm_span(self, captured_spans, monkeypatch):
-        """A sessionEnd that flushes deferred entries routes its tokens like stop does."""
+    @pytest.mark.parametrize("order", [("stop", "sessionEnd"), ("sessionEnd", "stop")])
+    def test_terminal_matrix_parenting_tokens_and_model_once(self, captured_spans, monkeypatch, order):
+        """Both terminal orders: correct parents, tokens and model attributed exactly once."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         payload = {"conversation_id": "conv-1", "generation_id": "gen-1"}
+        terminal_extra = {
+            "input_tokens": 100,
+            "output_tokens": 40,
+            "cache_read_tokens": 10,
+            "model": "cursor-model-x",
+        }
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000):
+            _dispatch("beforeSubmitPrompt", {**payload, "hook_event_name": "beforeSubmitPrompt", "prompt": "p"})
             _dispatch("afterAgentResponse", {**payload, "hook_event_name": "afterAgentResponse", "response": "r"})
+        first, second = order
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=2000):
-            _dispatch("sessionEnd", {**payload, "input_tokens": 100, "output_tokens": 40, "cache_read_tokens": 10})
-            _dispatch("stop", {**payload, "input_tokens": 100, "output_tokens": 40, "cache_read_tokens": 10})
+            _dispatch(first, {**payload, **terminal_extra})
+            _dispatch(first, {**payload, **terminal_extra})  # duplicate
+            _dispatch(second, {**payload, **terminal_extra})
+            _dispatch(second, {**payload, **terminal_extra})  # duplicate
 
+        all_spans = [span["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for span in captured_spans]
+        terminal_name = {"stop": "Agent Stop", "sessionEnd": "Session End"}
+        assert [span["name"] for span in all_spans] == [
+            "User Prompt",
+            "Agent Response",
+            terminal_name[first],
+            terminal_name[second],
+        ]
+        spans = {span["name"]: span for span in all_spans}
+
+        # One trace; every span parented under the User Prompt root — including
+        # the second terminal event, whose root state was already cleaned up.
+        root = spans["User Prompt"]
+        assert len({span["traceId"] for span in all_spans}) == 1
+        assert root.get("parentSpanId", "") == ""
+        for name in ("Agent Response", "Agent Stop", "Session End"):
+            assert spans[name]["parentSpanId"] == root["spanId"], f"{name} lost its parent"
+
+        # Cumulative usage and model attach exactly once: on the deferred LLM
+        # span flushed by the first terminal event, and nowhere else.
+        llm_attrs = _attrs(spans["Agent Response"])
+        assert llm_attrs["llm.token_count.prompt"]["intValue"] == 110
+        assert llm_attrs["llm.token_count.completion"]["intValue"] == 40
+        assert llm_attrs["llm.token_count.total"]["intValue"] == 150
+        assert llm_attrs["llm.model_name"]["stringValue"] == "cursor-model-x"
+        for name in ("Agent Stop", "Session End"):
+            chain_attrs = _attrs(spans[name])
+            token_keys = [key for key in chain_attrs if key.startswith("llm.token_count.")]
+            assert token_keys == [], f"{name} re-attributed usage: {token_keys}"
+
+        # Generation state is fully cleaned up after the terminal family.
+        shard = adapter.STATE_DIR / adapter.generation_state_key("gen-1")
+        assert not shard.exists()
+
+    @pytest.mark.parametrize("order", [("stop", "sessionEnd"), ("sessionEnd", "stop")])
+    def test_second_terminal_attributes_usage_when_first_had_none(self, captured_spans, monkeypatch, order):
+        """A tokenless first terminal must not burn the attribution: the later
+        terminal event still carries its counts (on its own CHAIN span)."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "conv-1", "generation_id": "gen-1"}
+        first, second = order
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=2000):
+            _dispatch(first, payload)
+            _dispatch(second, {**payload, "input_tokens": 7, "output_tokens": 3})
+
+        terminal_name = {"stop": "Agent Stop", "sessionEnd": "Session End"}
         spans = {
             span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"]: span["resourceSpans"][0]["scopeSpans"][0][
                 "spans"
             ][0]
             for span in captured_spans
         }
-        llm_attrs = {a["key"]: a["value"] for a in spans["Agent Response"]["attributes"]}
-        assert llm_attrs["llm.token_count.prompt"]["intValue"] == 110
-        assert llm_attrs["llm.token_count.completion"]["intValue"] == 40
-        assert llm_attrs["llm.token_count.total"]["intValue"] == 150
-        session_attrs = {a["key"]: a["value"] for a in spans["Session End"]["attributes"]}
-        assert "llm.token_count.prompt" not in session_attrs
-        # The later stop finds no deferred entries; its tokens fall back to Agent Stop.
-        stop_attrs = {a["key"]: a["value"] for a in spans["Agent Stop"]["attributes"]}
-        assert stop_attrs["llm.token_count.prompt"]["intValue"] == 110
+        first_attrs = _attrs(spans[terminal_name[first]])
+        assert not any(key.startswith("llm.token_count.") for key in first_attrs)
+        second_attrs = _attrs(spans[terminal_name[second]])
+        assert second_attrs["llm.token_count.prompt"]["intValue"] == 7
+        assert second_attrs["llm.token_count.completion"]["intValue"] == 3
 
     @pytest.mark.parametrize("generation_id", ["legacy-g1", ""])
     def test_legacy_terminal_tombstone_fails_closed_after_domain_separation(

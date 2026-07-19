@@ -97,9 +97,11 @@ def _read_private_shard_text(shard, name):
     semantics and the file is opened relative to that descriptor.
     """
     if os.open not in os.supports_dir_fd:
-        if shard.is_symlink():
-            raise OSError(f"generation state shard must not be a symlink: {shard}")
-        return _read_private_text(shard / name)
+        # Without openat() a shard check and the subsequent open are separate
+        # syscalls, so the shard could be swapped for a symlink in between.
+        # Fail closed: treat the state as unavailable instead of risking a
+        # TOCTOU read through an attacker-controlled path.
+        return None
     dir_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
     try:
         dir_fd = os.open(shard, dir_flags)
@@ -406,6 +408,21 @@ def _completed_db_connect():
             connection.commit()
         connection.execute("BEGIN IMMEDIATE")
         _install_digest_guards(connection)
+        # Content-free per-generation terminal metadata. Generation state is
+        # removed after the first terminal event, so the root span identity and
+        # whether token usage was already attributed must survive here for the
+        # other terminal event. Rows are digest-keyed like tombstones and share
+        # their retention (never guessed, never replayed).
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS terminal_attribution "
+            "(digest TEXT NOT NULL PRIMARY KEY CHECK(typeof(digest) = 'text' "
+            "AND length(digest) = 64 "
+            "AND digest NOT GLOB '*[^0-9a-f]*'), "
+            "root_span_id TEXT NOT NULL CHECK(typeof(root_span_id) = 'text' "
+            "AND length(root_span_id) <= 16 "
+            "AND root_span_id NOT GLOB '*[^0-9a-f]*'), "
+            "usage_attributed INTEGER NOT NULL CHECK(usage_attributed IN (0, 1)))"
+        )
         connection.commit()
         try:
             ledger.chmod(0o600)
@@ -510,6 +527,14 @@ def generation_claim_terminal_event(gen_id: str, event: str) -> bool:
             connection.execute("INSERT INTO completed_generations(digest) VALUES (?)", (event_digest,))
             if not generation_exists:
                 connection.execute("INSERT INTO completed_generations(digest) VALUES (?)", (generation_digest,))
+                # First terminal claim: capture the root span identity before
+                # the finally-cleanup deletes generation state, so the other
+                # terminal event can still parent correctly.
+                connection.execute(
+                    "INSERT OR IGNORE INTO terminal_attribution"
+                    "(digest, root_span_id, usage_attributed) VALUES (?, ?, 0)",
+                    (generation_digest, gen_root_span_get(gen_id)),
+                )
             connection.execute(
                 "UPDATE completion_metadata SET row_count = row_count + ?, "
                 "saturated = CASE WHEN row_count + ? >= ? THEN 1 ELSE 0 END "
@@ -521,6 +546,39 @@ def generation_claim_terminal_event(gen_id: str, event: str) -> bool:
                 (generation_digest,),
             )
             return True
+
+
+def generation_terminal_attribution_get(gen_id: str) -> "dict | None":
+    """Return persisted terminal metadata for a generation, or None."""
+    if not gen_id:
+        return None
+    with completion_ledger_guard():
+        if not _completed_db_path().exists():
+            return None
+        with _completed_db_connect() as connection:
+            row = connection.execute(
+                "SELECT root_span_id, usage_attributed FROM terminal_attribution WHERE digest = ?",
+                (_generation_digest(gen_id),),
+            ).fetchone()
+    if row is None:
+        return None
+    root_span_id, usage_attributed = row
+    if not isinstance(root_span_id, str) or usage_attributed not in (0, 1):
+        raise sqlite3.DatabaseError("invalid terminal attribution row")
+    return {"root_span_id": root_span_id, "usage_attributed": bool(usage_attributed)}
+
+
+def generation_terminal_attribution_note_usage(gen_id: str) -> None:
+    """Durably record that token usage was attributed for this generation."""
+    if not gen_id:
+        return
+    with completion_ledger_guard():
+        with _completed_db_connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE terminal_attribution SET usage_attributed = 1 WHERE digest = ?",
+                (_generation_digest(gen_id),),
+            )
 
 
 def generation_pending_cleanup_batch() -> "tuple[list[str], bool] | None":
