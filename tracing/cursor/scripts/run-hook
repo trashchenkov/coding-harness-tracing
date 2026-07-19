@@ -273,11 +273,21 @@ bootstrap() {
         return 1
     }
     if ! "$PIP" install --quiet "$PLUGIN_ROOT" >&2; then
-        # pip < 21.3 (e.g. macOS CommandLineTools Python 3.9) builds from a
-        # temp copy of the tree, which breaks the relative core symlink; its
-        # opt-in in-tree build avoids the copy. Newer pips build in-tree by
-        # default and reject the removed flag, so this is retry-only.
-        if ! "$PIP" install --quiet --use-feature=in-tree-build "$PLUGIN_ROOT" >&2; then
+        # pip < 21.3 (e.g. macOS CommandLineTools Python 3.9 ships 21.2.4;
+        # older 3.9 builds ship 20.x) builds local directories from a temp
+        # copy of the tree, which breaks the relative core symlink. Retrying
+        # from a symlink-resolved copy works on every supported pip, unlike
+        # --use-feature=in-tree-build which only pip 21.1-21.2 accepts.
+        resolved_src=$(mktemp -d "$DATA_DIR/.cursor-plugin-src.XXXXXX") || resolved_src=""
+        install_ok=1
+        if [ -n "$resolved_src" ]; then
+            if cp -RL "$PLUGIN_ROOT/." "$resolved_src/" 2>/dev/null \
+                && "$PIP" install --quiet "$resolved_src" >&2; then
+                install_ok=0
+            fi
+            rm -rf "$resolved_src"
+        fi
+        if [ "$install_ok" -ne 0 ]; then
             echo "[arize] pip install failed" >&2
             rm -f "$MARKER"
             return 1

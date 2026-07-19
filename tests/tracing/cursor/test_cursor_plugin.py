@@ -9,6 +9,7 @@ symlink, and bootstrap script all cohere as described in the design spec
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -330,7 +331,7 @@ class TestRunHook:
             f'  {_real_cmd("chmod")} +x "$3/bin/pip"\n'
             "  exit 0\n"
             "fi\n"
-            f'if [ "$1" = - ]; then exec {sys.executable} "$@"; fi\n'
+            f'if [ "$1" = - ]; then exec {shlex.quote(sys.executable)} "$@"; fi\n'
             "exit 1\n"
         )
         python.chmod(0o755)
@@ -388,7 +389,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
         leader_dir = tmp_path / "stale-removal-leader"
@@ -446,7 +449,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -477,7 +482,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -527,7 +534,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -563,7 +572,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
 
@@ -609,10 +620,11 @@ class TestRunHook:
         assert result.stdout == b""
         assert not lock_dir.exists()
 
-    def test_pip_install_retries_with_in_tree_build_for_old_pip(self, tmp_path):
+    def test_pip_install_falls_back_to_symlink_resolved_copy(self, tmp_path):
         """pip < 21.3 breaks the relative core symlink by building from a temp
-        copy of the tree (seen with macOS CommandLineTools Python 3.9); the
-        bootstrap must retry with that pip's opt-in in-tree build."""
+        copy of the tree (seen with macOS CommandLineTools Python 3.9, and
+        pip 20.x rejects --use-feature=in-tree-build entirely); the bootstrap
+        must retry from a copy whose core is a real directory."""
         home = tmp_path / "home"
         venv_bin = home / ".arize" / "harness" / "cursor-plugin-venv" / "bin"
         venv_bin.mkdir(parents=True)
@@ -620,12 +632,15 @@ class TestRunHook:
         pip = venv_bin / "pip"
         pip.write_text(
             "#!/bin/sh\n"
-            'case "$*" in\n'
-            "  *--use-feature=in-tree-build*)\n"
-            f"    printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
-            f"    chmod +x '{entry_point}'\n"
-            "    exit 0 ;;\n"
-            "esac\n"
+            "target=$3\n"
+            # Simulate an old pip: only an install source whose core is a real
+            # directory (not the repo's relative symlink) can build.
+            'if [ -d "$target/core" ] && [ ! -L "$target/core" ] '
+            '&& [ -f "$target/core/common.py" ]; then\n'
+            f"  printf '#!/bin/sh\\ncat >/dev/null\\nprintf {{}}\\n' > '{entry_point}'\n"
+            f"  chmod +x '{entry_point}'\n"
+            "  exit 0\n"
+            "fi\n"
             "echo 'error: package directory core does not exist' >&2\n"
             "exit 1\n"
         )
@@ -634,7 +649,9 @@ class TestRunHook:
         fake_bin.mkdir()
         python = fake_bin / "python3"
         python.write_text(
-            "#!/bin/sh\n" 'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n' f'exec {sys.executable} "$@"\n'
+            "#!/bin/sh\n"
+            'if [ "$1" = -m ] && [ "$2" = venv ]; then exit 0; fi\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         python.chmod(0o755)
         env = {**os.environ, "HOME": str(home), "PATH": f"{fake_bin}:{os.environ['PATH']}"}
