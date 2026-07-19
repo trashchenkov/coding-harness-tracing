@@ -740,6 +740,48 @@ class TestHandleStop:
         names = [span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for span in captured_spans]
         assert names == ["Agent Stop", "Session End"]
 
+    def test_session_end_before_stop_still_emits_deferred_agent_response(self, captured_spans, monkeypatch):
+        """sessionEnd-first must flush the deferred LLM entry that cleanup would delete."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "conv-1", "generation_id": "gen-1"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000):
+            _dispatch("beforeSubmitPrompt", {**payload, "hook_event_name": "beforeSubmitPrompt", "prompt": "p"})
+            _dispatch("afterAgentResponse", {**payload, "hook_event_name": "afterAgentResponse", "response": "r"})
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=2000):
+            _dispatch("sessionEnd", payload)
+            _dispatch("sessionEnd", payload)
+            _dispatch("stop", payload)
+            _dispatch("stop", payload)
+
+        names = [span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for span in captured_spans]
+        assert names == ["User Prompt", "Agent Response", "Session End", "Agent Stop"]
+
+    def test_session_end_first_attaches_tokens_to_flushed_llm_span(self, captured_spans, monkeypatch):
+        """A sessionEnd that flushes deferred entries routes its tokens like stop does."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "conv-1", "generation_id": "gen-1"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000):
+            _dispatch("afterAgentResponse", {**payload, "hook_event_name": "afterAgentResponse", "response": "r"})
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=2000):
+            _dispatch("sessionEnd", {**payload, "input_tokens": 100, "output_tokens": 40, "cache_read_tokens": 10})
+            _dispatch("stop", {**payload, "input_tokens": 100, "output_tokens": 40, "cache_read_tokens": 10})
+
+        spans = {
+            span["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"]: span["resourceSpans"][0]["scopeSpans"][0][
+                "spans"
+            ][0]
+            for span in captured_spans
+        }
+        llm_attrs = {a["key"]: a["value"] for a in spans["Agent Response"]["attributes"]}
+        assert llm_attrs["llm.token_count.prompt"]["intValue"] == 110
+        assert llm_attrs["llm.token_count.completion"]["intValue"] == 40
+        assert llm_attrs["llm.token_count.total"]["intValue"] == 150
+        session_attrs = {a["key"]: a["value"] for a in spans["Session End"]["attributes"]}
+        assert "llm.token_count.prompt" not in session_attrs
+        # The later stop finds no deferred entries; its tokens fall back to Agent Stop.
+        stop_attrs = {a["key"]: a["value"] for a in spans["Agent Stop"]["attributes"]}
+        assert stop_attrs["llm.token_count.prompt"]["intValue"] == 110
+
     @pytest.mark.parametrize("generation_id", ["legacy-g1", ""])
     def test_legacy_terminal_tombstone_fails_closed_after_domain_separation(
         self, captured_spans, monkeypatch, generation_id
@@ -2940,7 +2982,7 @@ class TestDeferredLlmSpan:
         assert llm_attrs["llm.token_count.total"]["intValue"] == 0
 
     def test_session_end_token_routing_unchanged(self, captured_spans, monkeypatch):
-        """sessionEnd is NOT affected — tokens still attach to the Session End CHAIN span."""
+        """Without deferred LLM entries, tokens still attach to the Session End CHAIN span."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=9000),

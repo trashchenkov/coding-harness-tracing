@@ -897,6 +897,65 @@ def _handle_after_tab_file_edit(input_json, conversation_id, gen_id, trace_id, n
     log(f"afterTabFileEdit: span {sid}")
 
 
+def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
+    """Drain and emit every deferred Agent Response span for a generation.
+
+    Dispatch removes all generation state after either terminal event, so
+    whichever of ``stop``/``sessionEnd`` arrives first must flush the deferred
+    stack — otherwise a sessionEnd-first ordering would delete the pending
+    entries before stop could emit them. Returns the flushed entries.
+    """
+    llm_entries = []
+    if gen_id:
+        llm_key = f"llm_{generation_state_key(gen_id)}"
+        while True:
+            entry = state_pop(llm_key)
+            if entry is None:
+                break
+            llm_entries.append(entry)
+
+    for idx, entry in enumerate(llm_entries):
+        entry_conv_id = entry.get("conversation_id")
+        llm_attrs = {
+            "openinference.span.kind": "LLM",
+            "input.value": _redact_deferred(
+                env.log_prompts, entry.get("input", ""), bool(entry.get("input_redacted", False))
+            ),
+            "output.value": _redact_deferred(
+                env.log_model_outputs, entry.get("output", ""), bool(entry.get("output_redacted", False))
+            ),
+        }
+        if entry_conv_id:
+            llm_attrs["session.id"] = entry_conv_id
+            llm_attrs["cursor.conversation.id"] = entry_conv_id
+        entry_user = entry.get("user_id")
+        if entry_user:
+            llm_attrs["user.id"] = entry_user
+        entry_model = entry.get("model", "")
+        if entry_model:
+            llm_attrs["llm.model_name"] = entry_model
+        # Tokens are cumulative per turn — attribute only to the most recent LLM span.
+        if idx == 0:
+            llm_attrs.update(token_attrs)
+
+        llm_start = int(entry.get("start_ms") or now_ms)
+        llm_span = build_span(
+            "Agent Response",
+            "LLM",
+            entry.get("span_id", ""),
+            entry.get("trace_id", trace_id),
+            entry.get("parent", ""),
+            llm_start,
+            llm_start,
+            llm_attrs,
+            SERVICE_NAME,
+            SCOPE_NAME,
+        )
+        send_span(llm_span)
+
+    return llm_entries
+
+
 def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Flush deferred LLM span(s) with per-turn tokens, then send Agent Stop CHAIN + cleanup."""
     sid = span_id_16()
@@ -942,55 +1001,8 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     if model:
         token_attrs["llm.model_name"] = model
 
-    # Drain deferred LLM stack for this generation (LIFO: first pop = most recent).
-    llm_entries = []
-    if gen_id:
-        llm_key = f"llm_{generation_state_key(gen_id)}"
-        while True:
-            entry = state_pop(llm_key)
-            if entry is None:
-                break
-            llm_entries.append(entry)
-
     # Flush deferred LLM span(s) before Agent Stop so strict OTLP backends see parent first.
-    for idx, entry in enumerate(llm_entries):
-        entry_conv_id = entry.get("conversation_id")
-        llm_attrs = {
-            "openinference.span.kind": "LLM",
-            "input.value": _redact_deferred(
-                env.log_prompts, entry.get("input", ""), bool(entry.get("input_redacted", False))
-            ),
-            "output.value": _redact_deferred(
-                env.log_model_outputs, entry.get("output", ""), bool(entry.get("output_redacted", False))
-            ),
-        }
-        if entry_conv_id:
-            llm_attrs["session.id"] = entry_conv_id
-            llm_attrs["cursor.conversation.id"] = entry_conv_id
-        entry_user = entry.get("user_id")
-        if entry_user:
-            llm_attrs["user.id"] = entry_user
-        entry_model = entry.get("model", "")
-        if entry_model:
-            llm_attrs["llm.model_name"] = entry_model
-        # Tokens are cumulative per turn — attribute only to the most recent LLM span.
-        if idx == 0:
-            llm_attrs.update(token_attrs)
-
-        llm_start = int(entry.get("start_ms") or now_ms)
-        llm_span = build_span(
-            "Agent Response",
-            "LLM",
-            entry.get("span_id", ""),
-            entry.get("trace_id", trace_id),
-            entry.get("parent", ""),
-            llm_start,
-            llm_start,
-            llm_attrs,
-            SERVICE_NAME,
-            SCOPE_NAME,
-        )
-        send_span(llm_span)
+    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs)
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1069,10 +1081,12 @@ def _handle_session_start(input_json, conversation_id, gen_id, trace_id, now_ms)
 
 
 def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """CHAIN span for Cursor CLI sessionEnd event — closes the session.
+    """Flush deferred LLM span(s), then send Session End CHAIN — closes the session.
 
     Reuses tokens/duration from the payload when present.  Cleanup is owned by
-    the dispatcher's terminal claim/finally lifecycle.
+    the dispatcher's terminal claim/finally lifecycle, which runs after either
+    terminal event — so a sessionEnd that precedes stop must flush the deferred
+    stack itself or the entries would be deleted before stop could emit them.
     """
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
@@ -1083,6 +1097,34 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     reason = _jq_str(input_json, "reason")
 
     user_id = _resolve_user_id(input_json)
+
+    # Token fields can also appear on sessionEnd. Same OpenInference convention
+    # as _handle_stop: ``prompt`` is the total (uncached input + cache buckets),
+    # cache split reported via ``prompt_details.*`` subsets.
+    _inp_tok = input_json.get("input_tokens")
+    prompt_tokens = _to_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
+    _out_tok = input_json.get("output_tokens")
+    completion_tokens = _to_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
+    _cr_tok = input_json.get("cache_read_tokens")
+    cache_read = _to_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
+    _cw_tok = input_json.get("cache_write_tokens")
+    cache_write = _to_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
+    token_attrs = {}
+    prompt_total = None
+    if prompt_tokens is not None:
+        prompt_total = prompt_tokens + (cache_read or 0) + (cache_write or 0)
+        token_attrs["llm.token_count.prompt"] = prompt_total
+    if completion_tokens is not None:
+        token_attrs["llm.token_count.completion"] = completion_tokens
+    if cache_read is not None:
+        token_attrs["llm.token_count.prompt_details.cache_read"] = cache_read
+    if cache_write is not None:
+        token_attrs["llm.token_count.prompt_details.cache_write"] = cache_write
+    if prompt_total is not None and completion_tokens is not None:
+        token_attrs["llm.token_count.total"] = prompt_total + completion_tokens
+
+    # Flush deferred LLM span(s) before Session End so strict OTLP backends see parent first.
+    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs)
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1099,29 +1141,9 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     if reason:
         attrs["cursor.session.reason"] = reason
 
-    # Token fields can also appear on sessionEnd. Same OpenInference convention
-    # as _handle_stop: ``prompt`` is the total (uncached input + cache buckets),
-    # cache split reported via ``prompt_details.*`` subsets.
-    _inp_tok = input_json.get("input_tokens")
-    prompt_tokens = _to_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
-    _out_tok = input_json.get("output_tokens")
-    completion_tokens = _to_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
-    _cr_tok = input_json.get("cache_read_tokens")
-    cache_read = _to_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
-    _cw_tok = input_json.get("cache_write_tokens")
-    cache_write = _to_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
-    prompt_total = None
-    if prompt_tokens is not None:
-        prompt_total = prompt_tokens + (cache_read or 0) + (cache_write or 0)
-        attrs["llm.token_count.prompt"] = prompt_total
-    if completion_tokens is not None:
-        attrs["llm.token_count.completion"] = completion_tokens
-    if cache_read is not None:
-        attrs["llm.token_count.prompt_details.cache_read"] = cache_read
-    if cache_write is not None:
-        attrs["llm.token_count.prompt_details.cache_write"] = cache_write
-    if prompt_total is not None and completion_tokens is not None:
-        attrs["llm.token_count.total"] = prompt_total + completion_tokens
+    # Fallback (no deferred afterAgentResponse): keep token attrs on Session End.
+    if not llm_entries:
+        attrs.update(token_attrs)
 
     span = build_span(
         "Session End",
