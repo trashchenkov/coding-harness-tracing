@@ -3,13 +3,24 @@
 
 import io
 import json
+import os
+import sqlite3
 import sys
+import threading
 from unittest import mock
 
 import pytest
 
 from tracing.cursor.hooks import adapter
-from tracing.cursor.hooks.handlers import _dispatch, _event_name, _jq_str, _print_permissive, _trace_id_from_event, main
+from tracing.cursor.hooks.handlers import (
+    _dispatch,
+    _event_name,
+    _jq_str,
+    _print_permissive,
+    _sweep_pending_generation_cleanups,
+    _trace_id_from_event,
+    main,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -163,6 +174,99 @@ class TestDispatch:
         ):
             _dispatch("afterAgentResponse", {"conversation_id": "c1", "generation_id": "g1"})
             h.assert_called_once()
+
+    @pytest.mark.parametrize("ledger_status", ["ledger-saturated", "ledger-unavailable"])
+    def test_missing_generation_drops_when_ledger_is_globally_fail_closed(self, monkeypatch, ledger_status):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch(
+                "tracing.cursor.hooks.handlers.generation_completion_status", return_value=ledger_status
+            ) as completion_status,
+            mock.patch("tracing.cursor.hooks.handlers._handle_after_agent_thought") as handler,
+            mock.patch("tracing.cursor.hooks.handlers.log") as log_mock,
+        ):
+            _dispatch("afterAgentThought", {"conversation_id": "c1", "text": "private"})
+
+        completion_status.assert_called_once_with("")
+        handler.assert_not_called()
+        assert ledger_status in log_mock.call_args[0][0]
+
+    def test_missing_generation_routes_when_ledger_is_active(self, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch(
+                "tracing.cursor.hooks.handlers.generation_completion_status", return_value="active"
+            ) as completion_status,
+            mock.patch("tracing.cursor.hooks.handlers._handle_after_agent_thought") as handler,
+        ):
+            _dispatch("afterAgentThought", {"conversation_id": "c1", "text": "allowed"})
+
+        completion_status.assert_called_once_with("")
+        handler.assert_called_once()
+
+    def test_actual_saturated_ledger_drops_missing_generation(self, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setattr(adapter, "COMPLETION_LEDGER_MAX_ROWS", 1)
+        adapter.generation_mark_completed("terminal")
+
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers._handle_after_agent_thought") as handler,
+        ):
+            _dispatch("afterAgentThought", {"conversation_id": "c1", "text": "private"})
+
+        handler.assert_not_called()
+
+    @pytest.mark.parametrize("generation_id", [None, "g-active"])
+    def test_status_to_handler_is_atomic_with_global_saturation(self, monkeypatch, generation_id):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setattr(adapter, "COMPLETION_LEDGER_MAX_ROWS", 1)
+        checked_active = threading.Event()
+        resume_dispatch = threading.Event()
+        mark_done = threading.Event()
+        handler_called = threading.Event()
+        original_status = getattr(adapter, "generation_completion_status")
+        expected_status_id = generation_id or ""
+
+        def pause_after_active(gen_id):
+            status = original_status(gen_id)
+            if gen_id == expected_status_id and status == "active":
+                checked_active.set()
+                assert resume_dispatch.wait(timeout=5)
+            return status
+
+        def mark_terminal():
+            adapter.generation_mark_completed("terminal")
+            mark_done.set()
+
+        event = {"conversation_id": "c1", "text": "private"}
+        if generation_id is not None:
+            event["generation_id"] = generation_id
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers.generation_completion_status", side_effect=pause_after_active),
+            mock.patch(
+                "tracing.cursor.hooks.handlers._handle_after_agent_thought",
+                side_effect=lambda *_args: handler_called.set(),
+            ),
+        ):
+            dispatch_thread = threading.Thread(target=lambda: _dispatch("afterAgentThought", event))
+            mark_thread = threading.Thread(target=mark_terminal)
+            dispatch_thread.start()
+            assert checked_active.wait(timeout=5)
+            mark_thread.start()
+            mark_was_blocked = not mark_done.wait(timeout=0.1)
+            resume_dispatch.set()
+            dispatch_thread.join(timeout=5)
+            mark_thread.join(timeout=5)
+
+        assert mark_was_blocked
+        assert handler_called.is_set()
+        assert mark_done.is_set()
+        assert not dispatch_thread.is_alive()
+        assert not mark_thread.is_alive()
 
     def test_routes_stop(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
@@ -632,6 +736,162 @@ class TestHandleStop:
         assert "cursor.stop.status" not in attr_keys
         assert "cursor.stop.loop_count" not in attr_keys
 
+    @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+    def test_terminal_mark_failure_precedes_state_mutation_and_send(self, monkeypatch, event):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch(
+                "tracing.cursor.hooks.handlers.generation_mark_completed",
+                side_effect=sqlite3.OperationalError("database is locked"),
+            ) as mark,
+            mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None) as pop,
+            mock.patch("tracing.cursor.hooks.handlers.send_span") as send,
+            mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation") as cleanup,
+        ):
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
+
+        mark.assert_called_once_with("g1", cleanup_pending=True)
+        pop.assert_not_called()
+        send.assert_not_called()
+        cleanup.assert_not_called()
+
+    @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+    def test_terminal_post_claim_exception_still_cleans_state(self, monkeypatch, event):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None),
+            mock.patch("tracing.cursor.hooks.handlers.send_span", side_effect=RuntimeError("send failed")),
+            mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation") as cleanup,
+        ):
+            with pytest.raises(RuntimeError, match="send failed"):
+                _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
+
+        cleanup.assert_called_once_with("g1")
+        assert adapter.generation_is_completed("g1") is True
+
+    @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+    def test_later_nonterminal_event_retries_failed_terminal_cleanup(self, monkeypatch, event):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "c1", "generation_id": "g1"}
+        adapter.gen_root_span_save("g1", "private-root")
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None),
+            mock.patch("tracing.cursor.hooks.handlers.send_span") as send,
+            mock.patch(
+                "tracing.cursor.hooks.handlers.state_cleanup_generation",
+                side_effect=OSError("unlink failed"),
+            ) as cleanup,
+            mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation_digest") as swept_cleanup,
+        ):
+            with pytest.raises(OSError, match="unlink failed"):
+                _dispatch(event, payload)
+            _dispatch("workspaceOpen", payload)
+
+        cleanup.assert_called_once_with("g1")
+        swept_cleanup.assert_called_once_with(adapter.stable_digest("g1"))
+        assert send.call_count == 1
+        assert adapter.generation_is_completed("g1") is True
+
+    def test_real_main_sweeps_pending_cleanup_when_tracing_disabled(self, monkeypatch, capfd):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "false")
+        adapter.gen_root_span_save("g1", "DISABLED_PRIVATE_NEEDLE")
+        adapter.generation_mark_completed("g1", cleanup_pending=True)
+        monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+        main()
+
+        assert adapter.gen_root_span_get("g1") == ""
+        assert adapter.generation_pending_cleanup_batch() == ([], False)
+        assert json.loads(capfd.readouterr().out) == {}
+
+    def test_malformed_pending_digest_suppresses_dispatch(self, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        adapter.generation_mark_completed("completed", cleanup_pending=True)
+        with sqlite3.connect(adapter._completed_db_path()) as connection:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute("DROP TRIGGER completed_digest_insert_guard")
+            connection.execute(
+                "INSERT INTO completed_generations(digest) VALUES (?)",
+                ("z" * 64,),
+            )
+            connection.execute("UPDATE completion_metadata SET row_count = row_count + 1")
+        with mock.patch("tracing.cursor.hooks.handlers._handle_workspace_open") as handler:
+            _dispatch("workspaceOpen", {"generation_id": "active"})
+        handler.assert_not_called()
+
+    def test_pending_sweep_uses_one_bounded_bulk_ledger_update(self):
+        digests = [f"{value:064x}" for value in range(adapter.PENDING_CLEANUP_BATCH_SIZE)]
+        with (
+            mock.patch(
+                "tracing.cursor.hooks.handlers.generation_pending_cleanup_batch",
+                return_value=(digests, True),
+            ),
+            mock.patch(
+                "tracing.cursor.hooks.handlers.state_generation_digests_present",
+                return_value=set(),
+            ) as scan,
+            mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation_digest") as cleanup,
+            mock.patch("tracing.cursor.hooks.handlers.generation_finish_pending_cleanup_batch") as finish,
+        ):
+            assert _sweep_pending_generation_cleanups() is False
+        scan.assert_called_once_with()
+        cleanup.assert_not_called()
+        finish.assert_called_once_with(digests, [])
+
+    def test_pending_cleanup_batch_is_bounded_and_preserves_remainder(self):
+        adapter.generation_mark_completed("seed")
+        digests = [f"{value:064x}" for value in range(adapter.PENDING_CLEANUP_BATCH_SIZE + 1)]
+        with sqlite3.connect(adapter._completed_db_path()) as connection:
+            connection.executemany(
+                "INSERT INTO completed_generations(digest) VALUES (?)",
+                ((digest,) for digest in digests),
+            )
+            connection.executemany(
+                "INSERT INTO pending_generation_cleanups(digest) VALUES (?)",
+                ((digest,) for digest in digests),
+            )
+            connection.execute(
+                "UPDATE completion_metadata SET row_count = row_count + ?",
+                (len(digests),),
+            )
+
+        first, has_more = adapter.generation_pending_cleanup_batch()
+        assert len(first) == adapter.PENDING_CLEANUP_BATCH_SIZE
+        assert has_more is True
+        adapter.generation_finish_pending_cleanup_batch(first, [])
+        assert adapter.generation_pending_cleanup_batch() == ([digests[-1]], False)
+
+    def test_durable_state_files_are_private_even_with_open_umask(self):
+        previous_umask = os.umask(0)
+        try:
+            adapter.state_push("private-stack", {"secret": "value"})
+            adapter.gen_root_span_save("private-generation", "private-span")
+            with adapter.generation_guard("private-generation"):
+                pass
+            adapter.generation_mark_completed("private-generation")
+        finally:
+            os.umask(previous_umask)
+
+        for path in adapter.STATE_DIR.rglob("*"):
+            expected_mode = 0o700 if path.is_dir() else 0o600
+            assert path.stat().st_mode & 0o777 == expected_mode, path
+
+    def test_main_sweeps_once_before_dispatch(self, monkeypatch, capfd):
+        monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+        with (
+            mock.patch("tracing.cursor.hooks.handlers._sweep_pending_generation_cleanups", return_value=True) as sweep,
+            mock.patch("tracing.cursor.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.cursor.hooks.handlers._dispatch") as dispatch,
+        ):
+            main()
+        sweep.assert_called_once_with()
+        dispatch.assert_called_once_with("", {}, sweep_pending=False)
+        assert json.loads(capfd.readouterr().out) == {}
+
 
 # ---------------------------------------------------------------------------
 # _handle_before_shell_execution tests
@@ -659,7 +919,7 @@ class TestHandleBeforeShellExecution:
 
         push_mock.assert_called_once()
         key, value = push_mock.call_args[0]
-        assert "gen-1" in key or "gen_1" in key
+        assert key == f"shell_{adapter.generation_state_key('gen-1')}"
         assert value["command"] == "ls -la"
         assert value["cwd"] == "/home"
         assert value["start_ms"] == "1000"
@@ -744,7 +1004,7 @@ class TestHandleBeforeMcpExecution:
 
         push_mock.assert_called_once()
         key, value = push_mock.call_args[0]
-        assert "gen-1" in key or "gen_1" in key
+        assert key == f"mcp_{adapter.generation_state_key('gen-1')}"
         assert value["tool_name"] == "search"
         assert value["tool_input"] == '{"query": "test"}'
         assert value["start_ms"] == "1500"
@@ -1049,7 +1309,7 @@ class TestMain:
         ):
             main()
 
-        dispatch_mock.assert_called_once_with("beforeSubmitPrompt", input_data)
+        dispatch_mock.assert_called_once_with("beforeSubmitPrompt", input_data, sweep_pending=False)
         result = json.loads(stdout_buf.getvalue())
         assert result == {"continue": True}
 
@@ -1127,7 +1387,7 @@ class TestMain:
         ):
             main()
 
-        dispatch_mock.assert_called_once_with("", {})
+        dispatch_mock.assert_called_once_with("", {}, sweep_pending=False)
         result = json.loads(stdout_buf.getvalue())
         assert result == {}
 
@@ -1287,7 +1547,7 @@ class TestMainCamelCase:
         ):
             main()
 
-        dispatch_mock.assert_called_once_with("sessionStart", input_data)
+        dispatch_mock.assert_called_once_with("sessionStart", input_data, sweep_pending=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1636,6 +1896,101 @@ class TestDeferredStatePrivacy:
             assert attrs["output.value"].startswith("<redacted")
             assert "IRREVERSIBLE_SHELL_SECRET" not in json.dumps(shell_payload)
             assert "SHELL_OUTPUT_SECRET" not in json.dumps(shell_payload)
+
+    def test_delayed_shell_duplicate_after_stop_is_ignored_without_zombie_state(
+        self, captured_spans, monkeypatch, _patch_cursor_state
+    ):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        common = {"conversation_id": "privacy-conv", "generation_id": "privacy-gen"}
+        command = "printf POST_CLEANUP_COMMAND_SECRET"
+        after_payload = {
+            **common,
+            "command": command,
+            "output": "POST_CLEANUP_OUTPUT_SECRET",
+            "exit_code": "0",
+        }
+
+        _dispatch("beforeShellExecution", {**common, "command": command})
+        _dispatch("afterShellExecution", after_payload)
+        _dispatch("stop", common)
+        shell_count = sum(
+            payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Shell" for payload in captured_spans
+        )
+
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch("beforeShellExecution", {**common, "command": command})
+        _dispatch("afterShellExecution", after_payload)
+
+        assert (
+            sum(
+                payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Shell"
+                for payload in captured_spans
+            )
+            == shell_count
+        )
+        assert not list(_patch_cursor_state.glob("*privacy-gen*"))
+        state_bytes = b"".join(path.read_bytes() for path in _patch_cursor_state.rglob("*") if path.is_file())
+        assert b"POST_CLEANUP_COMMAND_SECRET" not in state_bytes
+        assert b"POST_CLEANUP_OUTPUT_SECRET" not in state_bytes
+
+    def test_stop_serializes_with_delayed_duplicate(self, captured_spans, monkeypatch, _patch_cursor_state):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+        common = {"conversation_id": "race-conv", "generation_id": "race-gen"}
+        after_payload = {
+            **common,
+            "command": "RACE_COMMAND_SECRET",
+            "output": "RACE_OUTPUT_SECRET",
+            "exit_code": "0",
+        }
+        _dispatch("beforeShellExecution", after_payload)
+        _dispatch("afterShellExecution", after_payload)
+
+        entered_mark = threading.Event()
+        release_mark = threading.Event()
+        duplicate_started = threading.Event()
+        original_mark = adapter.generation_mark_completed
+
+        def slow_mark(gen_id, *, cleanup_pending=False):
+            entered_mark.set()
+            assert release_mark.wait(timeout=5)
+            original_mark(gen_id, cleanup_pending=cleanup_pending)
+
+        monkeypatch.setattr("tracing.cursor.hooks.handlers.generation_mark_completed", slow_mark)
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+
+        stop_thread = threading.Thread(target=lambda: _dispatch("stop", common))
+
+        def deliver_duplicate():
+            duplicate_started.set()
+            _dispatch("afterShellExecution", after_payload)
+
+        duplicate_thread = threading.Thread(target=deliver_duplicate)
+        stop_thread.start()
+        assert entered_mark.wait(timeout=5)
+        duplicate_thread.start()
+        assert duplicate_started.wait(timeout=5)
+        release_mark.set()
+        stop_thread.join(timeout=5)
+        duplicate_thread.join(timeout=5)
+
+        assert not stop_thread.is_alive()
+        assert not duplicate_thread.is_alive()
+        shell_payloads = [
+            payload
+            for payload in captured_spans
+            if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Shell"
+        ]
+        assert len(shell_payloads) == 1
+        assert not list(_patch_cursor_state.glob("*race-gen*"))
+        state_bytes = b"".join(path.read_bytes() for path in _patch_cursor_state.rglob("*") if path.is_file())
+        assert b"RACE_COMMAND_SECRET" not in state_bytes
+        assert b"RACE_OUTPUT_SECRET" not in state_bytes
 
     def test_subagent_creation_redaction_is_irreversible_when_stop_repeats_task(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")

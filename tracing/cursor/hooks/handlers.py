@@ -7,7 +7,6 @@ Input contract: JSON on stdin, all registered events routed here.
 stdout: MUST print permissive JSON response, even on error.
 stderr: redirected to ARIZE_LOG_FILE before dispatch.
 """
-import hashlib
 import json
 import os
 import sys
@@ -19,11 +18,21 @@ from tracing.cursor.hooks.adapter import (
     SCOPE_NAME,
     SERVICE_NAME,
     check_requirements,
+    completion_ledger_guard,
     gen_root_span_get,
     gen_root_span_save,
-    sanitize,
+    generation_completion_status,
+    generation_finish_pending_cleanup_batch,
+    generation_guard,
+    generation_mark_cleanup_done,
+    generation_mark_completed,
+    generation_pending_cleanup_batch,
+    generation_state_key,
     span_id_16,
+    stable_digest,
     state_cleanup_generation,
+    state_cleanup_generation_digest,
+    state_generation_digests_present,
     state_pop,
     state_push,
     trace_id_from_generation,
@@ -198,10 +207,50 @@ def _trace_id_from_event(gen_id: str, conversation_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch(event: str, input_json: dict) -> None:
+def _sweep_pending_generation_cleanups() -> bool:
+    """Retry durable cleanup work; return false to suppress unsafe dispatch."""
+    with completion_ledger_guard():
+        batch = generation_pending_cleanup_batch()
+        if batch is None:
+            log("Pending generation cleanup ledger unavailable; suppressing dispatch")
+            return False
+        digests, has_more = batch
+        if not digests:
+            return True
+        try:
+            present = state_generation_digests_present()
+        except OSError as exc:
+            log(f"Pending generation state scan failed: {exc}")
+            return False
+
+        failed = []
+        for digest in digests:
+            if digest not in present:
+                continue
+            try:
+                state_cleanup_generation_digest(digest)
+            except Exception as exc:
+                failed.append(digest)
+                log(f"Pending generation cleanup failed for digest={digest}: {exc}")
+        try:
+            # One bounded transaction deletes only this batch's successful
+            # markers; failures and any unselected backlog remain durable.
+            generation_finish_pending_cleanup_batch(digests, failed)
+        except Exception as exc:
+            log(f"Pending generation cleanup ledger update failed: {exc}")
+            return False
+        return not failed and not has_more
+
+
+def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> None:
     """Route event to the appropriate handler."""
     conversation_id = input_json.get("conversation_id", "")
     gen_id = input_json.get("generation_id", "")
+
+    # Privacy cleanup remains live even if tracing is disabled after a terminal
+    # claim, and runs before any new event state can be handled.
+    if sweep_pending and not _sweep_pending_generation_cleanups():
+        return
 
     # Early exit: tracing disabled
     if not env.trace_enabled:
@@ -235,10 +284,39 @@ def _dispatch(event: str, input_json: dict) -> None:
     }
 
     handler = handlers.get(event)
-    if handler:
-        handler(input_json, conversation_id, gen_id, trace_id, now_ms)
-    else:
+    if not handler:
         log(f"Unknown hook event: {event}")
+        return
+
+    if not gen_id:
+        with completion_ledger_guard():
+            completion_status = generation_completion_status("")
+            if completion_status != "active":
+                log(f"Ignoring {event} without generation: {completion_status}")
+                return
+            handler(input_json, conversation_id, gen_id, trace_id, now_ms)
+        return
+
+    # A bounded striped guard makes completion-check → handler atomic with
+    # stop's mark → cleanup sequence. The global ledger guard additionally
+    # orders every handler against saturation transitions across generations.
+    with generation_guard(gen_id):
+        with completion_ledger_guard():
+            completion_status = generation_completion_status(gen_id)
+            if completion_status != "active":
+                log(f"Ignoring {event} for generation: {completion_status}")
+                return
+            if event in {"stop", "sessionEnd"}:
+                # Claim at-most-once terminal delivery and durable cleanup work
+                # in one ledger transaction before any handler side effect.
+                generation_mark_completed(gen_id, cleanup_pending=True)
+                try:
+                    handler(input_json, conversation_id, gen_id, trace_id, now_ms)
+                finally:
+                    state_cleanup_generation(gen_id)
+                    generation_mark_cleanup_done(stable_digest(gen_id))
+            else:
+                handler(input_json, conversation_id, gen_id, trace_id, now_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +342,7 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
 
     if gen_id:
         state_push(
-            f"root_{sanitize(gen_id)}",
+            f"root_{generation_state_key(gen_id)}",
             {
                 "span_id": sid,
                 "trace_id": trace_id,
@@ -321,7 +399,7 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     # "model" is a base field on all hook events
     model = _jq_str(input_json, "model", "model_name")
 
-    safe_gen = sanitize(gen_id) if gen_id else ""
+    safe_gen = generation_state_key(gen_id) if gen_id else ""
     root_state = state_pop(f"root_{safe_gen}") if safe_gen else None
     prompt = root_state.get("prompt", "") if root_state else ""
     deferred_root = root_state.get("deferred_root", True) if root_state else True
@@ -333,7 +411,7 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
     response_privacy_key = ""
     response_privacy = None
     if safe_gen:
-        response_hash = hashlib.sha256(raw_response.encode("utf-8")).hexdigest()[:24]
+        response_hash = stable_digest(raw_response)[:24]
         response_privacy_key = f"llm_privacy_{safe_gen}_{response_hash}"
         response_privacy = state_pop(response_privacy_key)
     if response_privacy:
@@ -401,7 +479,7 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
 
     if gen_id:
         # Defer LLM span to stop; tokens (only available at stop) attach there.
-        state_push(f"llm_{sanitize(gen_id)}", llm_entry)
+        state_push(f"llm_{generation_state_key(gen_id)}", llm_entry)
         log(f"afterAgentResponse: deferred LLM span {sid}")
         return
 
@@ -479,11 +557,11 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
     cwd = _jq_str(input_json, "cwd", "working_directory")
     command_allowed = env.log_tool_details
 
-    privacy_key = f"shell_privacy_{sanitize(gen_id)}"
+    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}"
     while state_pop(privacy_key):
         pass
     state_push(
-        f"shell_{sanitize(gen_id)}",
+        f"shell_{generation_state_key(gen_id)}",
         {
             "command": redact_content(command_allowed, command),
             "command_redacted": not command_allowed,
@@ -500,8 +578,8 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     """Merge with before state, create TOOL span. Replaces bash lines 184-232."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
-    privacy_key = f"shell_privacy_{sanitize(gen_id)}" if gen_id else ""
-    popped = state_pop(f"shell_{sanitize(gen_id)}") if gen_id else None
+    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}" if gen_id else ""
+    popped = state_pop(f"shell_{generation_state_key(gen_id)}") if gen_id else None
     privacy_state = state_pop(privacy_key) if privacy_key else None
 
     if popped:
@@ -580,7 +658,7 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
     mcp_url = _jq_str(input_json, "url", "server_url", "serverUrl")
     mcp_cmd = _jq_str(input_json, "command")
     tool_content_allowed = env.log_tool_content
-    state_key = f"mcp_{sanitize(gen_id)}"
+    state_key = f"mcp_{generation_state_key(gen_id)}"
     while state_pop(f"{state_key}_privacy"):
         pass
 
@@ -604,7 +682,7 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     """Merge with before state, create TOOL span. Replaces bash lines 262-312."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
-    state_key = f"mcp_{sanitize(gen_id)}" if gen_id else ""
+    state_key = f"mcp_{generation_state_key(gen_id)}" if gen_id else ""
     popped = state_pop(state_key) if state_key else None
 
     if popped:
@@ -855,7 +933,7 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     # Drain deferred LLM stack for this generation (LIFO: first pop = most recent).
     llm_entries = []
     if gen_id:
-        llm_key = f"llm_{sanitize(gen_id)}"
+        llm_key = f"llm_{generation_state_key(gen_id)}"
         while True:
             entry = state_pop(llm_key)
             if entry is None:
@@ -936,10 +1014,7 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         SCOPE_NAME,
     )
     send_span(span)
-
-    if gen_id:
-        state_cleanup_generation(gen_id)
-    log(f"stop: span {sid}, cleaned up gen={gen_id}")
+    log(f"stop: span {sid}, gen={gen_id}")
 
 
 def _handle_session_start(input_json, conversation_id, gen_id, trace_id, now_ms):
@@ -984,8 +1059,8 @@ def _handle_session_start(input_json, conversation_id, gen_id, trace_id, now_ms)
 def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     """CHAIN span for Cursor CLI sessionEnd event — closes the session.
 
-    Reuses tokens/duration from the payload when present.  Always cleans up
-    the gen_id keyed root span if one was saved by sessionStart.
+    Reuses tokens/duration from the payload when present.  Cleanup is owned by
+    the dispatcher's terminal claim/finally lifecycle.
     """
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
@@ -1049,10 +1124,7 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
         SCOPE_NAME,
     )
     send_span(span)
-
-    if gen_id:
-        state_cleanup_generation(gen_id)
-    log(f"sessionEnd: span {sid}, cleaned up gen={gen_id}")
+    log(f"sessionEnd: span {sid}, gen={gen_id}")
 
 
 _DEDICATED_TOOL_NAMES = frozenset(
@@ -1081,8 +1153,9 @@ _DEDICATED_TOOL_NAMES = frozenset(
 
 
 def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
-    """Parallel-safe generic tool state key scoped to one generation."""
-    return f"tool_{sanitize(gen_id)}_{sanitize(tool_use_id)}"
+    """Parallel-safe key preserving exact authoritative tool-use identity."""
+    tool_digest = stable_digest(tool_use_id)
+    return f"tool_{generation_state_key(gen_id)}_{tool_digest}"
 
 
 def _tool_input_with_privacy_provenance(state_key: str, popped: Optional[dict]) -> Tuple[str, bool]:
@@ -1262,8 +1335,8 @@ def _subagent_state_key(gen_id: str, subagent_type: str, task: str) -> str:
     Identical concurrent tasks share a LIFO stack rather than claiming ID-safe
     pairing the host contract cannot provide.
     """
-    correlation = hashlib.sha256(f"{subagent_type}\0{task}".encode("utf-8")).hexdigest()[:24]
-    return f"subagent_{sanitize(gen_id)}_{correlation}"
+    correlation = stable_digest(f"{subagent_type}\0{task}")[:24]
+    return f"subagent_{generation_state_key(gen_id)}_{correlation}"
 
 
 def _handle_subagent_start(input_json, conversation_id, gen_id, trace_id, now_ms):
@@ -1390,12 +1463,14 @@ def main():
     """
     event = ""
     try:
+        if not _sweep_pending_generation_cleanups():
+            return
         if not check_requirements():
             return
 
         input_json = json.loads(sys.stdin.read() or "{}")
         event = _event_name(input_json)
-        _dispatch(event, input_json)
+        _dispatch(event, input_json, sweep_pending=False)
     except Exception as e:
         error(f"cursor hook failed ({event}): {e}")
     finally:
