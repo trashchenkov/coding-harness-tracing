@@ -30,6 +30,8 @@ from tracing.cursor.hooks.adapter import (
     generation_mark_digest_completed,
     generation_pending_cleanup_batch,
     generation_state_key,
+    generation_terminal_attribution_get,
+    generation_terminal_attribution_note_usage,
     span_id_16,
     stable_digest,
     state_cleanup_generation,
@@ -897,6 +899,23 @@ def _handle_after_tab_file_edit(input_json, conversation_id, gen_id, trace_id, n
     log(f"afterTabFileEdit: span {sid}")
 
 
+def _terminal_attribution_context(gen_id):
+    """Return (parent_span_id, usage_already_attributed) for a terminal event.
+
+    Generation state — including the root span file — is deleted after the
+    first terminal event, but ``stop`` and ``sessionEnd`` are distinct
+    once-only events that can both arrive. The first terminal claim persists
+    the root span identity and a usage flag in the completion ledger, so the
+    second terminal event can still parent correctly and cumulative token
+    counts are attributed exactly once per generation.
+    """
+    attribution = generation_terminal_attribution_get(gen_id) if gen_id else None
+    parent = gen_root_span_get(gen_id)
+    if not parent and attribution:
+        parent = attribution["root_span_id"]
+    return parent, bool(attribution and attribution["usage_attributed"])
+
+
 def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
     """Drain and emit every deferred Agent Response span for a generation.
 
@@ -959,7 +978,7 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
 def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Flush deferred LLM span(s) with per-turn tokens, then send Agent Stop CHAIN + cleanup."""
     sid = span_id_16()
-    parent = gen_root_span_get(gen_id)
+    parent, usage_attributed = _terminal_attribution_context(gen_id)
 
     status = _jq_str(input_json, "status", "reason")
     loop_count = _jq_str(input_json, "loop_count", "loopCount", "iterations")
@@ -1001,8 +1020,11 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     if model:
         token_attrs["llm.model_name"] = model
 
-    # Flush deferred LLM span(s) before Agent Stop so strict OTLP backends see parent first.
-    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs)
+    # Flush deferred LLM span(s) before Agent Stop so strict OTLP backends see
+    # parent first. Cumulative usage is attributed at most once per generation:
+    # a terminal event that arrives after usage was already attributed carries
+    # the same counts again and must not re-attach them anywhere.
+    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs)
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1022,8 +1044,10 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         attrs["llm.model_name"] = model
 
     # Fallback (no afterAgentResponse, e.g. CLI): keep token attrs on Agent Stop.
-    if not llm_entries:
+    if not usage_attributed and not llm_entries:
         attrs.update(token_attrs)
+    if not usage_attributed and any(key.startswith("llm.token_count.") for key in token_attrs):
+        generation_terminal_attribution_note_usage(gen_id)
 
     span = build_span(
         "Agent Stop",
@@ -1089,12 +1113,13 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     stack itself or the entries would be deleted before stop could emit them.
     """
     sid = span_id_16()
-    parent = gen_root_span_get(gen_id)
+    parent, usage_attributed = _terminal_attribution_context(gen_id)
 
     _dur = input_json.get("duration_ms")
     duration_ms = _to_int(_dur if _dur is not None else input_json.get("durationMs"))
     final_status = _jq_str(input_json, "final_status", "finalStatus", "status")
     reason = _jq_str(input_json, "reason")
+    model = _jq_str(input_json, "model")
 
     user_id = _resolve_user_id(input_json)
 
@@ -1122,9 +1147,12 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
         token_attrs["llm.token_count.prompt_details.cache_write"] = cache_write
     if prompt_total is not None and completion_tokens is not None:
         token_attrs["llm.token_count.total"] = prompt_total + completion_tokens
+    if model:
+        token_attrs["llm.model_name"] = model
 
-    # Flush deferred LLM span(s) before Session End so strict OTLP backends see parent first.
-    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs)
+    # Flush deferred LLM span(s) before Session End so strict OTLP backends see
+    # parent first. Same at-most-once usage attribution as _handle_stop.
+    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs)
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1140,10 +1168,14 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
         attrs["cursor.session.final_status"] = final_status
     if reason:
         attrs["cursor.session.reason"] = reason
+    if model and not llm_entries:
+        attrs["llm.model_name"] = model
 
     # Fallback (no deferred afterAgentResponse): keep token attrs on Session End.
-    if not llm_entries:
+    if not usage_attributed and not llm_entries:
         attrs.update(token_attrs)
+    if not usage_attributed and any(key.startswith("llm.token_count.") for key in token_attrs):
+        generation_terminal_attribution_note_usage(gen_id)
 
     span = build_span(
         "Session End",

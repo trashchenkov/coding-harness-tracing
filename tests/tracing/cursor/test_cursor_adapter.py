@@ -289,6 +289,15 @@ class TestStateCleanupGeneration:
         with pytest.raises(OSError):
             adapter.gen_root_span_get(gen_id)
 
+    def test_root_read_fails_closed_without_dir_fd_support(self, monkeypatch):
+        """No atomic no-follow primitives → state is unavailable, never read racily."""
+        gen_id = "gen-no-dirfd"
+        adapter.gen_root_span_save(gen_id, "span_root")
+        assert adapter.gen_root_span_get(gen_id) == "span_root"
+
+        monkeypatch.setattr(adapter.os, "supports_dir_fd", frozenset())
+        assert adapter.gen_root_span_get(gen_id) == ""
+
     def test_root_read_rejects_hard_linked_state_file(self, tmp_path):
         gen_id = "gen-hardlink-read"
         token = adapter.generation_state_key(gen_id)
