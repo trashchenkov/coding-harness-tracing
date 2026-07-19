@@ -60,16 +60,16 @@ def _ensure_private_file(path) -> None:
         os.close(fd)
 
 
-def _read_private_text(path):
-    """Read one regular private file without following its final symlink."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _consume_private_file(fd, path):
+    """Validate an opened state file and return its text, closing ``fd``."""
     try:
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
             raise OSError(f"private state path is not a regular file: {path}")
+        if hasattr(os, "geteuid") and opened_stat.st_uid != os.geteuid():
+            raise OSError(f"private state file has foreign ownership: {path}")
+        if opened_stat.st_nlink != 1:
+            raise OSError(f"private state file must not be hard-linked: {path}")
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "r") as stream:
             fd = -1
@@ -77,6 +77,48 @@ def _read_private_text(path):
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _read_private_text(path):
+    """Read one regular private file without following its final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    return _consume_private_file(fd, path)
+
+
+def _read_private_shard_text(shard, name):
+    """Read ``shard/name`` without following a symlink at either component.
+
+    Lexical construction alone would follow a substituted symlink at the
+    intermediate shard directory, so the shard is opened with no-follow
+    semantics and the file is opened relative to that descriptor.
+    """
+    if os.open not in os.supports_dir_fd:
+        if shard.is_symlink():
+            raise OSError(f"generation state shard must not be a symlink: {shard}")
+        return _read_private_text(shard / name)
+    dir_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    try:
+        dir_fd = os.open(shard, dir_flags)
+    except FileNotFoundError:
+        return None
+    try:
+        shard_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(shard_stat.st_mode):
+            raise OSError(f"generation state shard is not a directory: {shard}")
+        if hasattr(os, "geteuid") and shard_stat.st_uid != os.geteuid():
+            raise OSError(f"generation state shard has foreign ownership: {shard}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        return _consume_private_file(fd, shard / name)
+    finally:
+        os.close(dir_fd)
 
 
 def _write_private_text(path, text: str) -> None:
@@ -674,8 +716,7 @@ def gen_root_span_get(gen_id: str) -> str:
     if not gen_id:
         return ""
     token = generation_state_key(gen_id)
-    root_file = STATE_DIR / token / f"root_{token}"
-    serialized = _read_private_text(root_file)
+    serialized = _read_private_shard_text(STATE_DIR / token, f"root_{token}")
     return serialized.strip() if serialized is not None else ""
 
 
