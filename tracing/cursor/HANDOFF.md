@@ -379,6 +379,16 @@ These blockers mean the branch must not be presented as ready for an upstream
 pull request despite the green 2,167-test suite. No code fix for either finding
 was included in this documentation update.
 
+**Resolution (continuation round, 2026-07-19):** both blockers were fixed in a
+later round; see "Continuation round" below. Blocker A: root-state reads now
+open the generation shard with no-follow semantics and read the root file
+relative to that descriptor; private reads additionally validate ownership and
+refuse hard-linked files. Blocker B: `_handle_session_end` shares one flush
+helper with `_handle_stop`, so whichever terminal event arrives first emits the
+deferred Agent Response entries. Regression tests cover the symlinked shard,
+the hard-linked file, the `sessionEnd -> stop` ordering with duplicates, and
+token routing in that ordering.
+
 ### 5. No upstream PR was created
 
 This branch is only a handoff branch in the fork. It was not pushed to
@@ -457,6 +467,75 @@ env -u VIRTUAL_ENV UV_PROJECT_ENVIRONMENT=.venv \
 - `tests/tracing/cursor/test_cursor_adapter.py` — durable-state primitives.
 - `tests/tracing/cursor/test_cursor_plugin.py` — plugin bootstrap behavior.
 - `tracing/cursor/README.md` — user-facing setup and limitations.
+
+## Continuation round (2026-07-19, macOS real-host smoke)
+
+A later round on macOS 24.6.0 (Darwin, arm64) fixed both blockers, fixed test
+portability, and performed the first real-host smoke with the Cursor CLI.
+
+### Code changes
+
+- Blocker A fixed: `gen_root_span_get()` reads through
+  `_read_private_shard_text()`, which opens the shard directory with
+  `O_NOFOLLOW|O_DIRECTORY` and opens the root file via `dir_fd`, so a
+  symlinked intermediate shard can no longer substitute parent span state.
+  Private file reads now also reject foreign ownership and link counts > 1.
+- Blocker B fixed: `_handle_stop` and `_handle_session_end` share
+  `_flush_deferred_llm_spans()`. Whichever terminal event arrives first emits
+  the deferred Agent Response entries and routes payload tokens to the most
+  recent LLM span, falling back to the terminal CHAIN span when no entries
+  exist.
+- Bootstrap fix found on the real host: with macOS CommandLineTools Python
+  3.9, the venv pip is 21.2.4, which builds from a temp copy of the tree and
+  breaks the relative `core` symlink (`error: package directory 'core' does
+  not exist`), so the plugin entry point silently never installed. `run-hook`
+  now retries `pip install` with `--use-feature=in-tree-build` when the plain
+  install fails.
+- Test portability: the fake bootstrap pip/python/rm scripts hardcoded
+  `/usr/bin` utility paths that only exist on usr-merged Linux; on macOS the
+  parallel-bootstrap and stale-lock tests failed. The fakes now resolve real
+  binaries and exec the running interpreter.
+
+### Validation on macOS
+
+- Full repository suite: 2,172 passed. Cursor suite: 297 passed (was 290
+  passed / 2 failed on macOS before the portability fix). All pre-commit
+  gates, compileall, and `git diff --check` pass.
+- Real-host smoke: Cursor CLI (`agent` 2026.05.16, print mode with hooks in
+  the workspace `.cursor/hooks.json`) against a local HTTP capture sink via
+  `PHOENIX_ENDPOINT`. First-fire venv bootstrap, dispatch, state, ledger
+  claims, and span export all worked end to end after the pip fix.
+
+### Real-host observations (Cursor CLI, print mode)
+
+- Events observed: `workspaceOpen`, `sessionStart`, `beforeShellExecution`,
+  `afterShellExecution`, `beforeReadFile`, `afterFileEdit`, `preToolUse`,
+  `postToolUse`, `afterAgentThought`, `sessionEnd`.
+- Events NOT observed on this surface: `beforeSubmitPrompt`,
+  `afterAgentResponse`, `stop`, MCP events, Tab events, subagent events,
+  `preCompact`. In particular, `sessionEnd` is the only terminal event on this
+  surface — the sessionEnd-first path fixed in Blocker B is the path this host
+  actually takes.
+- Correlation: session, shell, read, and edit events shared one
+  generation-derived trace and parented correctly under the Session Start
+  root. `afterAgentThought` payloads carried a different generation identity
+  per thought, so each Agent Thinking span landed in its own parentless
+  trace. Whether to re-key thoughts to the conversation trace is a contract
+  decision left open; record IDE payloads before changing it.
+- Privacy: with `ARIZE_LOG_TOOL_CONTENT=false`, shell output was exported as
+  `<redacted (0 chars)>` while the command text stayed visible — command text
+  is governed by `ARIZE_LOG_TOOL_DETAILS`, matching the documented split.
+
+### Still open after this round
+
+- Cursor IDE (GUI) surface not exercised — only the CLI. A GUI-launched
+  macOS Cursor may not inherit shell env vars; config.json remains the
+  recommended credentials path.
+- Export verified against a local capture sink in Phoenix payload shape; a
+  real Phoenix/Arize UI inspection of parent relationships has still not been
+  performed.
+- Windows bootstrap remains unexercised.
+- No upstream PR decision was made in this round.
 
 ## Safety and delivery note
 
