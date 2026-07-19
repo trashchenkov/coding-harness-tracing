@@ -611,6 +611,51 @@ recorded before export success, so a transient export failure suppresses
 redelivery) is unchanged; it predates this branch's continuation rounds and
 needs its own decision.
 
+## MCP real-host smoke (2026-07-19, same host)
+
+A local stdio MCP server (one echo tool) was registered via the workspace
+`.cursor/mcp.json`, and the Cursor CLI was driven to call it. Two more real
+defects were found and fixed.
+
+### Observations
+
+- `beforeMCPExecution` / `afterMCPExecution` fire on the real CLI; the
+  `MCP: <tool>` span pairs carry tool name, arguments, output, and correct
+  parenting. MCP is no longer an unexercised event family.
+- Even under `--trust`, MCP calls required separate approval; rejected calls
+  still fire both hook events with the rejection recorded in the output —
+  tracing captures denied MCP attempts.
+
+### Defect: duplicate spans per MCP call
+
+The host names MCP calls `MCP:<tool>` in the generic `preToolUse` /
+`postToolUse` events while also emitting the dedicated MCP pair, so every
+call produced both `MCP: echo_marker` and `Tool: MCP:echo_marker`. The
+dedicated-handler suppression only matched exact names (`mcp`,
+`mcp_execution`). Fixed with an `mcp:`-prefix match; re-verified live —
+exactly one span per call.
+
+### Defect: stale builds installed silently with a fresh marker
+
+While validating the fix, the reinstalled plugin still ran old code. Root
+cause chain: an earlier failed old-pip install had littered the plugin dir
+with `build/` and `cursor_tracing.egg-info`; the symlink-resolved copy
+carried them along; setuptools packaged the stale `build/lib` sources
+instead of the current tree; and the marker still recorded the new hash —
+silently pinning outdated code across refreshes. Fixed by always
+installing from a pruned symlink-resolved copy (`build/` and `*.egg-info`
+removed; the plugin dir itself is never built in, so it stays pristine) and
+excluding build artifacts from the source fingerprint. Regression test
+seeds a stale `build/lib` and asserts the install source is pruned and the
+marker matches the clean-tree hash. Re-verified live: fresh bootstrap
+installs current code, plugin dir stays clean.
+
+### Still unexercised on a real host
+
+Tab events (needs real IDE Tab completion), subagent events, `preCompact`
+(needs a compaction-length conversation), `postToolUseFailure`, Windows,
+and a real Phoenix/Arize UI inspection.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
