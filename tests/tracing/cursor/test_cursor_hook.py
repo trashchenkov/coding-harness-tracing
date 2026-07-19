@@ -709,6 +709,19 @@ class TestHandleStop:
         assert attrs["cursor.stop.loop_count"]["stringValue"] == "3"
         assert span["name"] == "Agent Stop"
 
+    @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+    def test_generationless_terminal_delivery_is_claimed_once(self, captured_spans, monkeypatch, event):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"conversation_id": "c1"}
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
+            mock.patch("tracing.cursor.hooks.handlers.gen_root_span_get", return_value=""),
+        ):
+            _dispatch(event, payload)
+            _dispatch(event, payload)
+
+        assert len(captured_spans) == 1
+
     def test_no_gen_id_skips_cleanup(self, captured_spans, monkeypatch):
         """Without gen_id, state_cleanup_generation is not called."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
@@ -823,6 +836,60 @@ class TestHandleStop:
             _dispatch("workspaceOpen", {"generation_id": "active"})
         handler.assert_not_called()
 
+    def test_pending_cleanup_never_uses_glob_or_path_iterdir(self):
+        gen_id = "no-directory-walk"
+        digest = adapter.stable_digest(gen_id)
+        shard = adapter.STATE_DIR / adapter.generation_state_key(gen_id)
+        shard.mkdir(parents=True)
+        (shard / "private.stack.json").write_text("private")
+        adapter.generation_mark_completed(gen_id, cleanup_pending=True)
+
+        with (
+            mock.patch("pathlib.Path.glob", side_effect=AssertionError("glob is unbounded")),
+            mock.patch("pathlib.Path.iterdir", side_effect=AssertionError("iterdir materializes the directory")),
+        ):
+            assert _sweep_pending_generation_cleanups() is True
+
+        assert not shard.exists()
+        assert adapter.generation_pending_cleanup_batch() == ([], False)
+        assert digest not in str(list(adapter.STATE_DIR.rglob("*")))
+
+    def test_pending_cleanup_filesystem_work_is_bounded_and_progresses(self):
+        gen_id = "many-private-files"
+        digest = adapter.stable_digest(gen_id)
+        token = adapter.generation_state_key(gen_id)
+        shard = adapter.STATE_DIR / token
+        shard.mkdir(parents=True)
+        file_count = 2 * adapter.STATE_CLEANUP_ENTRY_LIMIT + 1
+        for index in range(file_count):
+            (shard / f"private-{index}.stack.json").write_text("private")
+        adapter.generation_mark_completed(gen_id, cleanup_pending=True)
+
+        before = len(list(shard.iterdir()))
+        assert _sweep_pending_generation_cleanups() is False
+        after = len(list(shard.iterdir()))
+        assert 0 < before - after <= adapter.STATE_CLEANUP_ENTRY_LIMIT
+        assert adapter.generation_pending_cleanup_batch() == ([digest], False)
+
+        for _ in range(file_count + 1):
+            if _sweep_pending_generation_cleanups():
+                break
+        assert not shard.exists()
+        assert adapter.generation_pending_cleanup_batch() == ([], False)
+
+    def test_nonempty_lock_directory_keeps_pending_cleanup_durable(self):
+        gen_id = "gen-lockdir-pending"
+        digest = adapter.stable_digest(gen_id)
+        safe = adapter.generation_state_key(gen_id)
+        lock_dir = adapter.STATE_DIR / safe / f".lock_before_{safe}_shell"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "stale").write_text("private")
+        adapter.generation_mark_completed(gen_id, cleanup_pending=True)
+
+        assert _sweep_pending_generation_cleanups() is False
+        assert lock_dir.exists()
+        assert adapter.generation_pending_cleanup_batch() == ([digest], False)
+
     def test_pending_sweep_uses_one_bounded_bulk_ledger_update(self):
         digests = [f"{value:064x}" for value in range(adapter.PENDING_CLEANUP_BATCH_SIZE)]
         with (
@@ -830,16 +897,11 @@ class TestHandleStop:
                 "tracing.cursor.hooks.handlers.generation_pending_cleanup_batch",
                 return_value=(digests, True),
             ),
-            mock.patch(
-                "tracing.cursor.hooks.handlers.state_generation_digests_present",
-                return_value=set(),
-            ) as scan,
             mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation_digest") as cleanup,
             mock.patch("tracing.cursor.hooks.handlers.generation_finish_pending_cleanup_batch") as finish,
         ):
             assert _sweep_pending_generation_cleanups() is False
-        scan.assert_called_once_with()
-        cleanup.assert_not_called()
+        assert cleanup.call_count == len(digests)
         finish.assert_called_once_with(digests, [])
 
     def test_pending_cleanup_batch_is_bounded_and_preserves_remainder(self):

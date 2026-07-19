@@ -226,11 +226,12 @@ class TestStateCleanupGeneration:
         adapter.state_push(f"before_{safe}_shell", {"cmd": "ls"})
         adapter.state_push(f"before_{safe}_mcp", {"tool": "read"})
 
+        shard = adapter.STATE_DIR / safe
+        assert shard.is_dir()
+
         adapter.state_cleanup_generation(gen_id)
 
-        assert not (adapter.STATE_DIR / f"root_{safe}").exists()
-        assert not list(adapter.STATE_DIR.glob(f"*{safe}*.stack.json"))
-        assert not list(adapter.STATE_DIR.glob(f".lock_*{safe}*"))
+        assert not shard.exists()
 
     def test_cleanup_no_files_no_error(self):
         adapter.state_cleanup_generation("gen-nonexistent")  # should not raise
@@ -258,13 +259,14 @@ class TestStateCleanupGeneration:
     def test_cleanup_nonempty_lock_dir(self):
         gen_id = "gen-lockdir"
         safe = adapter.generation_state_key(gen_id)
-        lock_dir = adapter.STATE_DIR / f".lock_before_{safe}_shell"
+        lock_dir = adapter.STATE_DIR / safe / f".lock_before_{safe}_shell"
         lock_dir.mkdir(parents=True)
         # Put a file inside so rmdir fails
         (lock_dir / "stale").write_text("x")
 
-        adapter.state_cleanup_generation(gen_id)
-        # dir should still exist (rmdir fails on non-empty), but no crash
+        with pytest.raises(OSError):
+            adapter.state_cleanup_generation(gen_id)
+        # Incomplete cleanup must be observable so durable retry provenance remains.
         assert lock_dir.exists()
 
 
@@ -331,6 +333,56 @@ class TestCompletedGenerationLedger:
                 ("z" * 64,),
             )
             connection.execute("UPDATE completion_metadata SET row_count = row_count + 1")
+
+        assert adapter.generation_completion_status("unseen") == "ledger-unavailable"
+        assert adapter.generation_is_completed("unseen") is True
+
+    def test_fresh_guards_reject_blob_digest_storage_class(self):
+        adapter.generation_mark_completed("existing")
+        ledger = adapter.STATE_DIR / "completed_generations.sqlite3"
+        with sqlite3.connect(ledger) as connection, pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO completed_generations(digest) VALUES (?)",
+                (sqlite3.Binary(b"a" * 64),),
+            )
+
+    def test_legacy_blob_digest_with_old_exact_guards_fails_closed(self):
+        adapter.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        ledger = adapter.STATE_DIR / "completed_generations.sqlite3"
+        with sqlite3.connect(ledger) as connection:
+            connection.execute(
+                "CREATE TABLE completed_generations "
+                "(digest TEXT NOT NULL PRIMARY KEY CHECK(length(digest) = 64 "
+                "AND digest NOT GLOB '*[^0-9a-f]*'))"
+            )
+            connection.execute(
+                "CREATE TABLE pending_generation_cleanups "
+                "(digest TEXT NOT NULL PRIMARY KEY CHECK(length(digest) = 64 "
+                "AND digest NOT GLOB '*[^0-9a-f]*'))"
+            )
+            connection.execute(
+                "CREATE TABLE completion_metadata ("
+                "singleton INTEGER PRIMARY KEY CHECK(singleton = 1), "
+                "row_count INTEGER NOT NULL CHECK(row_count >= 0), "
+                "saturated INTEGER NOT NULL CHECK(saturated IN (0, 1)))"
+            )
+            connection.execute(
+                "INSERT INTO completed_generations(digest) VALUES (?)",
+                (sqlite3.Binary(b"a" * 64),),
+            )
+            connection.execute("INSERT INTO completion_metadata VALUES (1, 1, 0)")
+            for name, table, operation in (
+                ("completed_digest_insert_guard", "completed_generations", "INSERT"),
+                ("completed_digest_update_guard", "completed_generations", "UPDATE"),
+                ("pending_digest_insert_guard", "pending_generation_cleanups", "INSERT"),
+                ("pending_digest_update_guard", "pending_generation_cleanups", "UPDATE"),
+            ):
+                connection.execute(
+                    f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
+                    "WHEN NEW.digest IS NULL OR length(NEW.digest) != 64 OR "
+                    "NEW.digest GLOB '*[^0-9a-f]*' "
+                    "BEGIN SELECT RAISE(ABORT, 'invalid generation digest'); END"
+                )
 
         assert adapter.generation_completion_status("unseen") == "ledger-unavailable"
         assert adapter.generation_is_completed("unseen") is True

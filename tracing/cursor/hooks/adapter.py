@@ -9,6 +9,7 @@ pairs.
 Replaces cursor-tracing/hooks/common.sh (195 lines).
 """
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -32,6 +33,10 @@ COMPLETION_DB_TIMEOUT_SECONDS = 30.0
 # evicting provenance or allowing the database to grow without limit.
 COMPLETION_LEDGER_MAX_ROWS = 100_000
 PENDING_CLEANUP_BATCH_SIZE = 256
+# Each pending generation removes at most this many private entries per hook.
+# Combined with the DB batch, filesystem cleanup has a fixed upper bound.
+STATE_CLEANUP_ENTRY_LIMIT = 16
+_GENERATION_TOKEN_RE = re.compile(r"g_[0-9a-f]{64}(?![0-9a-f])")
 
 
 def _ensure_private_dir(path) -> None:
@@ -220,7 +225,8 @@ def _install_digest_guards(connection) -> None:
     def trigger_sql(name: str, table: str, operation: str) -> str:
         return (
             f"CREATE TRIGGER {name} BEFORE {operation} ON {table} "
-            "WHEN NEW.digest IS NULL OR length(NEW.digest) != 64 "
+            "WHEN NEW.digest IS NULL OR typeof(NEW.digest) != 'text' "
+            "OR length(NEW.digest) != 64 "
             "OR NEW.digest GLOB '*[^0-9a-f]*' "
             "BEGIN SELECT RAISE(ABORT, 'invalid generation digest'); END"
         )
@@ -237,7 +243,8 @@ def _install_digest_guards(connection) -> None:
     for table in ("completed_generations", "pending_generation_cleanups"):
         invalid = connection.execute(
             f"SELECT 1 FROM {table} "
-            "WHERE digest IS NULL OR length(digest) != 64 "
+            "WHERE digest IS NULL OR typeof(digest) != 'text' "
+            "OR length(digest) != 64 "
             "OR digest GLOB '*[^0-9a-f]*' LIMIT 1"
         ).fetchone()
         if invalid is not None:
@@ -284,12 +291,14 @@ def _completed_db_connect():
             )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS completed_generations "
-                "(digest TEXT NOT NULL PRIMARY KEY CHECK(length(digest) = 64 "
+                "(digest TEXT NOT NULL PRIMARY KEY CHECK(typeof(digest) = 'text' "
+                "AND length(digest) = 64 "
                 "AND digest NOT GLOB '*[^0-9a-f]*'))"
             )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS pending_generation_cleanups "
-                "(digest TEXT NOT NULL PRIMARY KEY CHECK(length(digest) = 64 "
+                "(digest TEXT NOT NULL PRIMARY KEY CHECK(typeof(digest) = 'text' "
+                "AND length(digest) = 64 "
                 "AND digest NOT GLOB '*[^0-9a-f]*'), "
                 "FOREIGN KEY(digest) REFERENCES completed_generations(digest))"
             )
@@ -337,8 +346,10 @@ def _completed_db_connect():
         connection.close()
 
 
-def generation_mark_completed(gen_id: str, *, cleanup_pending: bool = False) -> None:
-    """Durably retain completion and optional hashed cleanup work, or raise."""
+def generation_mark_digest_completed(digest: str, *, cleanup_pending: bool = False) -> None:
+    """Durably retain a pre-hashed completion identity, or raise."""
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("invalid completion digest")
     with completion_ledger_guard():
         with _completed_db_connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -351,7 +362,6 @@ def generation_mark_completed(gen_id: str, *, cleanup_pending: bool = False) -> 
                 raise sqlite3.DatabaseError("completion ledger count changed during mark")
             if saturated:
                 return
-            digest = _generation_digest(gen_id)
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO completed_generations(digest) VALUES (?)",
                 (digest,),
@@ -369,6 +379,11 @@ def generation_mark_completed(gen_id: str, *, cleanup_pending: bool = False) -> 
                     "INSERT OR IGNORE INTO pending_generation_cleanups(digest) VALUES (?)",
                     (digest,),
                 )
+
+
+def generation_mark_completed(gen_id: str, *, cleanup_pending: bool = False) -> None:
+    """Durably retain generation completion and optional cleanup work."""
+    generation_mark_digest_completed(_generation_digest(gen_id), cleanup_pending=cleanup_pending)
 
 
 def generation_pending_cleanup_batch() -> "tuple[list[str], bool] | None":
@@ -419,8 +434,10 @@ def generation_mark_cleanup_done(digest: str) -> None:
             connection.execute("DELETE FROM pending_generation_cleanups WHERE digest = ?", (digest,))
 
 
-def generation_completion_status(gen_id: str) -> str:
-    """Return ``active``, ``completed``, or fail-closed ledger state."""
+def generation_digest_completion_status(digest: str) -> str:
+    """Return completion status for a validated pre-hashed identity."""
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        return "ledger-unavailable"
     with completion_ledger_guard():
         if not _completed_db_path().exists():
             return "active"
@@ -438,11 +455,16 @@ def generation_completion_status(gen_id: str) -> str:
                     return "ledger-saturated"
                 row = connection.execute(
                     "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1",
-                    (_generation_digest(gen_id),),
+                    (digest,),
                 ).fetchone()
         except (OSError, sqlite3.DatabaseError):
             return "ledger-unavailable"
         return "completed" if row is not None else "active"
+
+
+def generation_completion_status(gen_id: str) -> str:
+    """Return ``active``, ``completed``, or fail-closed ledger state."""
+    return generation_digest_completion_status(_generation_digest(gen_id))
 
 
 def generation_is_completed(gen_id: str) -> bool:
@@ -465,6 +487,17 @@ def truncate_attr(s: str, max_chars: "int | None" = None) -> str:
 # command + start time, afterShellExecution pops it to create a merged span).
 
 
+def _state_parent_for_key(key: str):
+    """Route hashed generation state to its directly addressable private shard."""
+    _ensure_private_dir(STATE_DIR)
+    match = _GENERATION_TOKEN_RE.search(key)
+    if match is None:
+        return STATE_DIR
+    shard = STATE_DIR / match.group(0)
+    _ensure_private_dir(shard)
+    return shard
+
+
 def state_push(key: str, value: dict) -> None:
     """Push a dict onto a named stack.
 
@@ -473,9 +506,9 @@ def state_push(key: str, value: dict) -> None:
 
     Matches bash state_push() at lines 59-87.
     """
-    _ensure_private_dir(STATE_DIR)
-    stack_file = STATE_DIR / f"{key}.stack.json"
-    lock_path = STATE_DIR / f".lock_{key}"
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
     _ensure_private_file(lock_path)
 
     with FileLock(lock_path):
@@ -501,9 +534,9 @@ def state_pop(key: str) -> "dict | None":
 
     Matches bash state_pop() at lines 91-132.
     """
-    _ensure_private_dir(STATE_DIR)
-    stack_file = STATE_DIR / f"{key}.stack.json"
-    lock_path = STATE_DIR / f".lock_{key}"
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
     _ensure_private_file(lock_path)
 
     with FileLock(lock_path):
@@ -536,8 +569,8 @@ def state_pop(key: str) -> "dict | None":
 
 def gen_root_span_save(gen_id: str, span_id: str) -> None:
     """Save the root span ID under a collision-resistant generation namespace."""
-    _ensure_private_dir(STATE_DIR)
-    root_file = STATE_DIR / f"root_{generation_state_key(gen_id)}"
+    token = generation_state_key(gen_id)
+    root_file = _state_parent_for_key(token) / f"root_{token}"
     _write_private_text(root_file, span_id)
 
 
@@ -545,7 +578,8 @@ def gen_root_span_get(gen_id: str) -> str:
     """Get the root span ID for a generation. Returns "" if not found."""
     if not gen_id:
         return ""
-    root_file = STATE_DIR / f"root_{generation_state_key(gen_id)}"
+    token = generation_state_key(gen_id)
+    root_file = STATE_DIR / token / f"root_{token}"
     if root_file.exists():
         root_file.chmod(0o600)
         return root_file.read_text().strip()
@@ -556,45 +590,40 @@ def gen_root_span_get(gen_id: str) -> str:
 # Replaces bash state_cleanup_generation() at lines 159-176.
 
 
-def state_generation_digests_present() -> set[str]:
-    """Find hashed generation tokens appearing in current state filenames once."""
-    if not STATE_DIR.exists():
-        return set()
-    present: set[str] = set()
-    for path in STATE_DIR.iterdir():
-        present.update(re.findall(r"g_([0-9a-f]{64})(?![0-9a-f])", path.name))
-    return present
-
-
 def state_cleanup_generation(gen_id: str) -> None:
-    """Remove only state files belonging to the hashed generation namespace."""
+    """Remove one bounded slice of a generation's private state shard."""
     state_cleanup_generation_digest(_generation_digest(gen_id))
 
 
 def state_cleanup_generation_digest(digest: str) -> None:
-    """Remove state for a trusted SHA-256 completion digest without recovering raw IDs."""
+    """Remove bounded state for a trusted digest without recovering raw IDs.
+
+    New hashed state is stored under a directly addressable generation shard.
+    Ambiguous legacy flat names are intentionally untouched: guessing ownership
+    could delete another active generation's private state.
+    """
     if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
         raise ValueError("invalid generation digest")
-    # Legacy sanitized names are inherently ambiguous (generation and tool IDs
-    # shared underscore delimiters), so guessing their owner can delete another
-    # active generation. Leave them untouched for explicit offline migration.
-    token = f"g_{digest}"
-    (STATE_DIR / f"root_{token}").unlink(missing_ok=True)
-    patterns = (
-        f"*_{token}.stack.json",
-        f"*_{token}_*.stack.json",
-        f".lock_*_{token}",
-        f".lock_*_{token}_*",
-    )
-    for pattern in patterns:
-        for path in STATE_DIR.glob(pattern):
-            if path.is_dir():
-                try:
-                    path.rmdir()
-                except OSError:
-                    pass
+    shard = STATE_DIR / f"g_{digest}"
+    if not shard.exists():
+        return
+    if not shard.is_dir():
+        raise OSError(f"generation state shard is not a directory: {shard}")
+
+    # os.scandir is lazy; islice prevents pathlib.iterdir/os.listdir from
+    # materializing an unbounded directory. A fresh one-entry probe below
+    # determines completion without walking the remaining shard.
+    with os.scandir(shard) as entries:
+        for entry in itertools.islice(entries, STATE_CLEANUP_ENTRY_LIMIT):
+            if entry.is_dir(follow_symlinks=False):
+                os.rmdir(entry.path)
             else:
-                path.unlink(missing_ok=True)
+                os.unlink(entry.path)
+
+    with os.scandir(shard) as remaining:
+        if next(remaining, None) is not None:
+            raise OSError("generation state cleanup incomplete; retry required")
+    shard.rmdir()
 
 
 # --- Requirements check ---
