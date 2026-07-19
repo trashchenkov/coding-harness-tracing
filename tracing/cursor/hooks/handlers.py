@@ -1218,6 +1218,18 @@ _DEDICATED_TOOL_NAMES = frozenset(
 )
 
 
+def _is_dedicated_tool_name(tool_name: str) -> bool:
+    """Whether generic tool events for this name duplicate a dedicated pair.
+
+    Real hosts name MCP calls ``MCP:<tool>`` in the generic tool events while
+    also emitting the dedicated beforeMCPExecution/afterMCPExecution pair
+    (observed on Cursor CLI 2026.05.16), so the prefix match is required to
+    avoid duplicate spans per MCP call.
+    """
+    lowered = tool_name.lower()
+    return lowered in _DEDICATED_TOOL_NAMES or lowered.startswith("mcp:")
+
+
 def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
     """Parallel-safe key preserving exact authoritative tool-use identity."""
     tool_digest = stable_digest(tool_use_id)
@@ -1278,7 +1290,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
     # Dedicated hooks provide richer fields. Still pop generic state so a host
     # emitting both APIs does not leave dangling files.
-    if tool_name.lower() in _DEDICATED_TOOL_NAMES:
+    if _is_dedicated_tool_name(tool_name):
         log(f"postToolUse: skipping {tool_name!r} — covered by dedicated handler")
         return
 
