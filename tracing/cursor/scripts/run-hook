@@ -196,7 +196,15 @@ for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         dirnames[:] = []
         continue
     seen_dirs.add(real_dir)
-    dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+    # Skip build artifacts a failed pip attempt may have left in the tree:
+    # their stale .py copies must affect neither the fingerprint nor installs.
+    dirnames[:] = sorted(
+        name
+        for name in dirnames
+        if name != "__pycache__"
+        and not name.endswith(".egg-info")
+        and not (name == "build" and dirpath == root)
+    )
     files.extend(os.path.join(dirpath, name) for name in sorted(filenames) if name.endswith(".py"))
 
 digest = hashlib.sha256()
@@ -272,26 +280,30 @@ bootstrap() {
         rm -f "$MARKER"
         return 1
     }
-    if ! "$PIP" install --quiet "$PLUGIN_ROOT" >&2; then
-        # pip < 21.3 (e.g. macOS CommandLineTools Python 3.9 ships 21.2.4;
-        # older 3.9 builds ship 20.x) builds local directories from a temp
-        # copy of the tree, which breaks the relative core symlink. Retrying
-        # from a symlink-resolved copy works on every supported pip, unlike
-        # --use-feature=in-tree-build which only pip 21.1-21.2 accepts.
-        resolved_src=$(mktemp -d "$DATA_DIR/.cursor-plugin-src.XXXXXX") || resolved_src=""
-        install_ok=1
-        if [ -n "$resolved_src" ]; then
-            if cp -RL "$PLUGIN_ROOT/." "$resolved_src/" 2>/dev/null \
-                && "$PIP" install --quiet "$resolved_src" >&2; then
+    # Always install from a pruned, symlink-resolved copy of the plugin tree:
+    #   - pip < 21.3 (macOS CommandLineTools 3.9 ships 21.2.4, older 3.9
+    #     builds ship 20.x) builds local dirs from a temp copy that breaks the
+    #     relative core symlink;
+    #   - building in or from PLUGIN_ROOT litters the marketplace-managed dir
+    #     with build/ and *.egg-info artifacts;
+    #   - worst, a stale build/lib left by an earlier failed attempt gets
+    #     packaged by setuptools instead of the current sources, silently
+    #     installing outdated code while the marker records the new hash.
+    resolved_src=$(mktemp -d "$DATA_DIR/.cursor-plugin-src.XXXXXX") || resolved_src=""
+    install_ok=1
+    if [ -n "$resolved_src" ]; then
+        if cp -RL "$PLUGIN_ROOT/." "$resolved_src/" 2>/dev/null; then
+            rm -rf "$resolved_src/build" "$resolved_src"/*.egg-info
+            if "$PIP" install --quiet "$resolved_src" >&2; then
                 install_ok=0
             fi
-            rm -rf "$resolved_src"
         fi
-        if [ "$install_ok" -ne 0 ]; then
-            echo "[arize] pip install failed" >&2
-            rm -f "$MARKER"
-            return 1
-        fi
+        rm -rf "$resolved_src"
+    fi
+    if [ "$install_ok" -ne 0 ]; then
+        echo "[arize] pip install failed" >&2
+        rm -f "$MARKER"
+        return 1
     fi
 
     # Publish only the fingerprint selected before installation. This also
