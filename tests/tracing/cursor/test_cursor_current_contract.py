@@ -8,7 +8,7 @@ from unittest import mock
 import pytest
 
 from tracing.cursor.hooks import adapter
-from tracing.cursor.hooks.handlers import _dispatch
+from tracing.cursor.hooks.handlers import _dispatch, _subagent_state_key, _tool_state_key
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +36,22 @@ def _span(payload):
 
 def _attrs(span):
     return {item["key"]: next(iter(item["value"].values())) for item in span["attributes"]}
+
+
+def test_json_string_surrogates_are_safe_for_all_correlation_keys(captured_spans):
+    surrogate = "identity-\ud800"
+    assert len(_tool_state_key(surrogate, surrogate).rsplit("_", 1)[-1]) == 64
+    assert _subagent_state_key(surrogate, surrogate, surrogate).startswith("subagent_g_")
+
+    _dispatch(
+        "beforeSubmitPrompt",
+        {"conversation_id": "c", "generation_id": surrogate, "prompt": "prompt"},
+    )
+    _dispatch(
+        "afterAgentResponse",
+        {"conversation_id": "c", "generation_id": surrogate, "text": surrogate},
+    )
+    assert captured_spans
 
 
 def test_dispatch_supports_all_new_events(monkeypatch):
@@ -73,6 +89,20 @@ def test_generic_tool_pairs_by_tool_use_id_and_serializes_json(captured_spans):
     assert second["startTimeUnixNano"].startswith("1000")
 
 
+def test_generic_tool_ids_that_sanitize_identically_do_not_cross_pair(captured_spans):
+    common = {"conversation_id": "c", "generation_id": "g", "tool_name": "Grep"}
+    _dispatch("preToolUse", {**common, "tool_use_id": "call/a", "tool_input": "INPUT_A"})
+    _dispatch("preToolUse", {**common, "tool_use_id": "call?a", "tool_input": "INPUT_B"})
+    _dispatch("postToolUse", {**common, "tool_use_id": "call/a", "tool_output": "OUTPUT_A"})
+    _dispatch("postToolUse", {**common, "tool_use_id": "call?a", "tool_output": "OUTPUT_B"})
+
+    spans = [_span(payload) for payload in captured_spans]
+    assert [(_attrs(span)["input.value"], _attrs(span)["output.value"]) for span in spans] == [
+        ("INPUT_A", "OUTPUT_A"),
+        ("INPUT_B", "OUTPUT_B"),
+    ]
+
+
 def test_tool_failure_emits_error_span_and_cleans_pair(captured_spans, _state_dir):
     common = {
         "conversation_id": "c",
@@ -95,8 +125,8 @@ def test_tool_failure_emits_error_span_and_cleans_pair(captured_spans, _state_di
     assert attrs["cursor.tool.status"] == "error"
     assert attrs["cursor.tool.failure_type"] == "error"
     assert attrs["cursor.tool.is_interrupt"] is False
-    remaining = list(_state_dir.glob("*failed-tool*.stack.json"))
-    assert remaining
+    remaining = list(_state_dir.glob("tool_*_privacy.stack.json"))
+    assert len(remaining) == 1
     assert all("_privacy.stack.json" in path.name for path in remaining)
     tombstone_text = "\n".join(path.read_text() for path in remaining)
     assert '"command"' not in tombstone_text
