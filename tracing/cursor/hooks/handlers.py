@@ -22,17 +22,18 @@ from tracing.cursor.hooks.adapter import (
     gen_root_span_get,
     gen_root_span_save,
     generation_completion_status,
+    generation_digest_completion_status,
     generation_finish_pending_cleanup_batch,
     generation_guard,
     generation_mark_cleanup_done,
     generation_mark_completed,
+    generation_mark_digest_completed,
     generation_pending_cleanup_batch,
     generation_state_key,
     span_id_16,
     stable_digest,
     state_cleanup_generation,
     state_cleanup_generation_digest,
-    state_generation_digests_present,
     state_pop,
     state_push,
     trace_id_from_generation,
@@ -217,16 +218,8 @@ def _sweep_pending_generation_cleanups() -> bool:
         digests, has_more = batch
         if not digests:
             return True
-        try:
-            present = state_generation_digests_present()
-        except OSError as exc:
-            log(f"Pending generation state scan failed: {exc}")
-            return False
-
         failed = []
         for digest in digests:
-            if digest not in present:
-                continue
             try:
                 state_cleanup_generation_digest(digest)
             except Exception as exc:
@@ -290,10 +283,23 @@ def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> No
 
     if not gen_id:
         with completion_ledger_guard():
-            completion_status = generation_completion_status("")
-            if completion_status != "active":
-                log(f"Ignoring {event} without generation: {completion_status}")
-                return
+            if event in {"stop", "sessionEnd"}:
+                if not conversation_id:
+                    log(f"Ignoring {event} without generation or conversation identity")
+                    return
+                fallback_digest = stable_digest(f"cursor-terminal-fallback\0{conversation_id}")
+                completion_status = generation_digest_completion_status(fallback_digest)
+                if completion_status != "active":
+                    log(f"Ignoring {event} without generation: {completion_status}")
+                    return
+                # Claim before terminal telemetry effects. No generation-scoped
+                # cleanup is possible because this degraded payload has no generation.
+                generation_mark_digest_completed(fallback_digest)
+            else:
+                completion_status = generation_completion_status("")
+                if completion_status != "active":
+                    log(f"Ignoring {event} without generation: {completion_status}")
+                    return
             handler(input_json, conversation_id, gen_id, trace_id, now_ms)
         return
 

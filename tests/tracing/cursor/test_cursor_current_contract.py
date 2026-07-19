@@ -125,7 +125,7 @@ def test_tool_failure_emits_error_span_and_cleans_pair(captured_spans, _state_di
     assert attrs["cursor.tool.status"] == "error"
     assert attrs["cursor.tool.failure_type"] == "error"
     assert attrs["cursor.tool.is_interrupt"] is False
-    remaining = list(_state_dir.glob("tool_*_privacy.stack.json"))
+    remaining = list(_state_dir.rglob("tool_*_privacy.stack.json"))
     assert len(remaining) == 1
     assert all("_privacy.stack.json" in path.name for path in remaining)
     tombstone_text = "\n".join(path.read_text() for path in remaining)
@@ -148,7 +148,7 @@ def test_subagents_pair_from_declared_shared_fields(captured_spans, _state_dir):
     assert [_attrs(span)["output.value"] for span in spans] == ["A", "B"]
     assert [_attrs(span)["cursor.subagent.id"] for span in spans] == ["a", "b"]
     assert all(span["startTimeUnixNano"].startswith("1000") for span in spans)
-    remaining = list(_state_dir.glob("subagent_*.stack.json"))
+    remaining = list(_state_dir.rglob("subagent_*.stack.json"))
     assert len(remaining) == 2
     assert all("_privacy.stack.json" in path.name for path in remaining)
     tombstone_text = "\n".join(path.read_text() for path in remaining)
