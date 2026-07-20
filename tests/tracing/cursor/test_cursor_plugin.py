@@ -636,11 +636,13 @@ class TestRunHook:
         shutil.copytree(PLUGIN_DIR, plugin_root)
         run_hook = plugin_root / "scripts" / "run-hook"
         # Simulate artifacts left in the plugin dir by an earlier failed pip.
+        # exist_ok: the copied source tree may itself already carry such
+        # leftovers — exactly the state this regression exists for.
         stale_build = plugin_root / "build" / "lib" / "tracing" / "cursor" / "hooks"
-        stale_build.mkdir(parents=True)
+        stale_build.mkdir(parents=True, exist_ok=True)
         (stale_build / "handlers.py").write_text("STALE = True\n")
         egg_info = plugin_root / "cursor_tracing.egg-info"
-        egg_info.mkdir()
+        egg_info.mkdir(exist_ok=True)
         (egg_info / "PKG-INFO").write_text("Name: cursor-tracing\n")
 
         home = tmp_path / "home"
