@@ -764,6 +764,42 @@ later `postToolUseFailure`, the failure detail lands in logs, not on the
 already-sent dedicated span. No observed surface does this; revisit only
 with host evidence.
 
+## Third review response (2026-07-20)
+
+Review of SHA `de07649` accepted the direct matrix but found the marker was
+keyed by `(generation, tool_name)` — a *name*, not an invocation. Two real
+consequences were reproduced: a stale marker from one call suppressed a
+separate generic-only call of the same tool, and a retried generic
+completion produced a duplicate span because the marker was already
+consumed. Both are fixed by making correlation invocation-aware.
+
+- **Identity is now the invocation.** `preToolUse` records the generic
+  `tool_use_id` of an `MCP:<tool>` call on a pending stack (real hosts
+  interleave it between the dedicated pair, so the result knows which
+  invocation it belongs to). `afterMCPExecution` pops that pending id and
+  claims *that invocation's* completion. A dedicated call with no generic
+  pre-event claims nothing, so it can never suppress a different call.
+- **Duplicate delivery is once-only.** Completion is a durable
+  exclusive-create claim keyed by `(generation, tool_use_id)`
+  (`state_claim_once`, atomic `O_EXCL`, cleaned with the generation).
+  `postToolUse` and `postToolUseFailure` share this single identity, so a
+  retry of either — or a mix of both — yields exactly one span.
+- **Fail toward keeping telemetry.** Payloads without a generation or
+  invocation id are never suppressed: losing a separate call is worse than
+  a rare duplicate.
+
+This also closes a pre-existing gap beyond MCP: duplicate delivery of any
+generic tool completion previously emitted a second span. The privacy
+regression that asserted two spans now asserts one (a policy loosened
+between deliveries can no longer expose creation-time redacted content).
+
+Reviewer probes re-run against the fix: `stale-marker` → 2 spans (the
+separate call survives), `duplicate-generic-success` → 1,
+`duplicate-generic-failure` → 1, `generic-only` → 1. Re-verified on the
+real CLI with a fresh bootstrap: one `MCP: echo_marker` span, with the log
+showing the invocation-keyed claim suppressing the generic follow-up.
+Suite: 2,181 passed.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
