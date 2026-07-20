@@ -2127,6 +2127,65 @@ class TestHandlePostToolUse:
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
         assert names == ["MCP: beta", "Tool: MCP:alpha"]
 
+    def test_unmatched_after_event_does_not_steal_another_calls_state(self, captured_spans, monkeypatch):
+        """An after-event whose before-event was lost must not take a record
+        belonging to a different call.
+
+        The payload identifies its own call, so a missing match is evidence
+        the record is absent — not licence to pop whatever is on the stack.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        alpha = {**gen, "tool_name": "alpha", "tool_input": '{"call":"A"}'}
+        beta = {**gen, "tool_name": "beta", "tool_input": '{"call":"B"}'}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", side_effect=itertools.count(1000, 10)):
+            _dispatch("beforeMCPExecution", beta)  # alpha's before-event is lost
+            _dispatch("afterMCPExecution", {**alpha, "result": "result-A"})
+            _dispatch("afterMCPExecution", {**beta, "result": "result-B"})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        by_name = {span["name"]: _attrs(span) for span in spans}
+        assert set(by_name) == {"MCP: alpha", "MCP: beta"}
+        # alpha falls back to its own payload's arguments, not beta's record.
+        assert by_name["MCP: alpha"]["input.value"]["stringValue"] == '{"call":"A"}'
+        assert by_name["MCP: alpha"]["output.value"]["stringValue"] == "result-A"
+        # beta's record survived the unmatched after-event and is still its own.
+        assert by_name["MCP: beta"]["input.value"]["stringValue"] == '{"call":"B"}'
+        assert by_name["MCP: beta"]["output.value"]["stringValue"] == "result-B"
+
+    def test_dedicated_success_does_not_hide_a_generic_failure(self, captured_spans, monkeypatch):
+        """Same text, different outcome, different call — both must be kept."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"t"}'}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "t"}, "tool_use_id": "B"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("afterMCPExecution", {**dedicated, "result": "same"})
+            _dispatch("postToolUseFailure", {**generic, "error_message": "same"})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        assert [span["name"] for span in spans] == ["MCP: echo", "Tool: MCP:echo"]
+        assert spans[0]["status"] == {"code": 1}
+        assert spans[1]["status"] == {"code": 2, "message": "same"}
+
+    def test_dedicated_failure_does_not_hide_a_generic_success(self, captured_spans, monkeypatch):
+        """The mirror case: a failed call must not absorb a successful one."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"t"}'}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "t"}, "tool_use_id": "B"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("afterMCPExecution", {**dedicated, "error": "same"})
+            _dispatch("postToolUse", {**generic, "tool_output": "same"})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        assert [span["name"] for span in spans] == ["MCP: echo", "Tool: MCP:echo"]
+        assert spans[0]["status"] == {"code": 2, "message": "same"}
+        assert spans[1]["status"] == {"code": 1}
+
     def test_concurrent_identical_calls_get_one_span_each(self, captured_spans, monkeypatch):
         """Two identical calls in flight at once yield one span per call.
 
