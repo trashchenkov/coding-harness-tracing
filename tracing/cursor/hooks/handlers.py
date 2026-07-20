@@ -785,12 +785,18 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
         status_code=2 if raw_error else 1,
         status_message=truncate_attr(error_message, 256) if raw_error else "",
     )
-    send_span(span)
-    if gen_id and after_tool:
+    sent = send_span(span)
+    if sent and gen_id and after_tool:
         # Record that this exact call — arguments and result — has a span. The
         # generic follow-up decides for itself whether it is the same call, by
         # matching its own result against this record. Nothing is suppressed
         # here, so a dedicated pair can never silence an unrelated invocation.
+        #
+        # Only a confirmed export records anything: the marker asserts that a
+        # span exists, and a backend that reported failure did not create one.
+        # Leaving it unwritten lets the generic completion act as the fallback
+        # it naturally is, rather than being suppressed by a span that was
+        # never delivered.
         state_push(
             _mcp_dedicated_reported_key(
                 gen_id,
