@@ -1954,20 +1954,7 @@ class TestHandlePostToolUse:
 
     @pytest.mark.parametrize(
         "tool_name",
-        [
-            "shell",
-            "Shell",
-            "TERMINAL",
-            "bash",
-            "read_file",
-            "edit_file",
-            "tab_file_read",
-            "mcp",
-            # Real hosts name MCP calls "MCP:<tool>" in generic tool events while
-            # also emitting the dedicated MCP pair (observed on Cursor CLI).
-            "MCP:echo_marker",
-            "mcp:server_tool",
-        ],
+        ["shell", "Shell", "TERMINAL", "bash", "read_file", "edit_file", "tab_file_read", "mcp"],
     )
     def test_post_tool_use_skips_each_dedicated_tool_name(self, captured_spans, monkeypatch, tool_name):
         """postToolUse short-circuits for each known dedicated tool name (case-insensitive)."""
@@ -1986,6 +1973,56 @@ class TestHandlePostToolUse:
             )
 
         assert len(captured_spans) == 0, f"Expected no span for tool_name={tool_name!r}"
+
+    def test_post_tool_use_mcp_dedup_matrix(self, captured_spans, monkeypatch):
+        """Delivery-aware MCP de-duplication: generic spans are suppressed only
+        when the dedicated pair demonstrably emitted the span (real hosts name
+        MCP calls "MCP:<tool>" in generic events); a generic-only surface must
+        keep its telemetry, and failure paths must not duplicate either."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
+        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            # 1. generic-only success → generic span survives
+            _dispatch("preToolUse", {**common, "tool_use_id": "m1"})
+            _dispatch("postToolUse", {**common, "tool_use_id": "m1", "tool_output": "ok"})
+            # 2. dedicated + generic success → only the dedicated span
+            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("preToolUse", {**common, "tool_use_id": "m2"})
+            _dispatch("afterMCPExecution", {**mcp_common, "result": "echoed"})
+            _dispatch("postToolUse", {**common, "tool_use_id": "m2", "tool_output": "echoed"})
+            # 3. generic-only failure → generic error span survives
+            _dispatch("preToolUse", {**common, "tool_use_id": "m3"})
+            _dispatch("postToolUseFailure", {**common, "tool_use_id": "m3", "error_message": "boom"})
+            # 4. dedicated + generic failure → only the dedicated span, as error
+            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("preToolUse", {**common, "tool_use_id": "m4"})
+            _dispatch("afterMCPExecution", {**mcp_common, "error": "deliberate failure"})
+            _dispatch("postToolUseFailure", {**common, "tool_use_id": "m4", "error_message": "deliberate failure"})
+            # 5. denied call (observed CLI shape: rejection in the result)
+            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("preToolUse", {**common, "tool_use_id": "m5"})
+            _dispatch("afterMCPExecution", {**mcp_common, "result": '{"rejected":true,"reason":"User rejected"}'})
+            _dispatch("postToolUse", {**common, "tool_use_id": "m5", "tool_output": '{"rejected":true}'})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        names = [s["name"] for s in spans]
+        assert names == [
+            "Tool: MCP:echo_marker",  # 1: generic-only success
+            "MCP: echo_marker",  # 2: dedicated wins
+            "Tool: MCP:echo_marker",  # 3: generic-only failure
+            "MCP: echo_marker",  # 4: dedicated failure wins
+            "MCP: echo_marker",  # 5: denied
+        ]
+        # 3: generic-only failure carries OTLP ERROR
+        assert spans[2]["status"] == {"code": 2, "message": "boom"}
+        # 4: the surviving dedicated failure span carries the error itself
+        assert spans[3]["status"] == {"code": 2, "message": "deliberate failure"}
+        failure_attrs = _attrs(spans[3])
+        assert failure_attrs["cursor.tool.status"]["stringValue"] == "error"
+        # 5: rejection reason survives on the dedicated span
+        denied_attrs = _attrs(spans[4])
+        assert "rejected" in denied_attrs["output.value"]["stringValue"]
 
     def test_post_tool_use_emits_for_unknown_tool_name(self, captured_spans, monkeypatch):
         """postToolUse emits a span for tools not in the dedup set."""

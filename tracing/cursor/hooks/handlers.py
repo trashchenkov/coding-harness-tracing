@@ -735,6 +735,14 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     if user_id:
         attrs["user.id"] = user_id
 
+    # If the after payload declares a failure, the dedicated span is the only
+    # span for this call (the generic follow-up is suppressed), so it must
+    # carry the error itself.
+    raw_error = _jq_str(input_json, "error", "error_message", "errorMessage")
+    error_message = redact_content(env.log_tool_content, raw_error)
+    if raw_error:
+        attrs["cursor.tool.status"] = "error"
+
     span = build_span(
         f"MCP: {tool_name}",
         "TOOL",
@@ -746,8 +754,15 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
         attrs,
         SERVICE_NAME,
         SCOPE_NAME,
+        status_code=2 if raw_error else 1,
+        status_message=truncate_attr(error_message, 256) if raw_error else "",
     )
     send_span(span)
+    if gen_id:
+        # Durable evidence for generic-event de-duplication: one marker per
+        # emitted dedicated span, consumed by the matching postToolUse or
+        # postToolUseFailure. Content-free (span id only).
+        state_push(_mcp_span_marker_key(gen_id, tool_name), {"span_id": sid})
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
 
 
@@ -1218,16 +1233,28 @@ _DEDICATED_TOOL_NAMES = frozenset(
 )
 
 
-def _is_dedicated_tool_name(tool_name: str) -> bool:
-    """Whether generic tool events for this name duplicate a dedicated pair.
+def _mcp_span_marker_key(gen_id: str, mcp_tool_name: str) -> str:
+    """Content-free per-generation key recording emitted dedicated MCP spans."""
+    return f"mcpspan_{generation_state_key(gen_id)}_{stable_digest(mcp_tool_name)[:24]}"
+
+
+def _consume_dedicated_mcp_span(gen_id: str, tool_name: str) -> bool:
+    """Consume evidence that the dedicated MCP pair already emitted this span.
 
     Real hosts name MCP calls ``MCP:<tool>`` in the generic tool events while
     also emitting the dedicated beforeMCPExecution/afterMCPExecution pair
-    (observed on Cursor CLI 2026.05.16), so the prefix match is required to
-    avoid duplicate spans per MCP call.
+    (observed on Cursor CLI 2026.05.16). The name prefix alone is not proof:
+    a surface may deliver only the generic events, and suppressing on the
+    prefix would silently drop all MCP telemetry there. Suppress only when
+    ``afterMCPExecution`` durably recorded that it emitted the span for this
+    generation and tool; each marker covers exactly one generic follow-up.
+    Generation-less payloads cannot be correlated and are never suppressed.
     """
     lowered = tool_name.lower()
-    return lowered in _DEDICATED_TOOL_NAMES or lowered.startswith("mcp:")
+    if not lowered.startswith("mcp:") or not gen_id:
+        return False
+    bare_name = tool_name[len("MCP:") :]
+    return state_pop(_mcp_span_marker_key(gen_id, bare_name)) is not None
 
 
 def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
@@ -1290,8 +1317,11 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
     # Dedicated hooks provide richer fields. Still pop generic state so a host
     # emitting both APIs does not leave dangling files.
-    if _is_dedicated_tool_name(tool_name):
+    if tool_name.lower() in _DEDICATED_TOOL_NAMES:
         log(f"postToolUse: skipping {tool_name!r} — covered by dedicated handler")
+        return
+    if _consume_dedicated_mcp_span(gen_id, tool_name):
+        log(f"postToolUse: skipping {tool_name!r} — dedicated MCP span already emitted")
         return
 
     sid = span_id_16()
@@ -1374,6 +1404,12 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     failure_type = _jq_str(input_json, "failure_type")
     duration = _to_int(input_json.get("duration"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+
+    # Generic state above is still popped so no dangling files remain, but a
+    # failure already reported by the dedicated MCP span must not duplicate.
+    if _consume_dedicated_mcp_span(gen_id, tool_name):
+        log(f"postToolUseFailure: skipping {tool_name!r} — dedicated MCP span already emitted")
+        return
 
     attrs = {
         "openinference.span.kind": "TOOL",
