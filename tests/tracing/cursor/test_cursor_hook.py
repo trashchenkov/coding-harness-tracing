@@ -2024,6 +2024,45 @@ class TestHandlePostToolUse:
         denied_attrs = _attrs(spans[4])
         assert "rejected" in denied_attrs["output.value"]["stringValue"]
 
+    def test_mcp_dedup_does_not_suppress_a_different_invocation(self, captured_spans, monkeypatch):
+        """A dedicated call whose generic follow-up never arrives must not
+        suppress a later, separate generic-only call of the same tool."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
+        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            # Call A: dedicated pair only — its generic follow-up never lands.
+            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("afterMCPExecution", {**mcp_common, "result": "first"})
+            # Call B: a genuinely separate invocation, generic events only.
+            _dispatch("preToolUse", {**common, "tool_use_id": "generic-2"})
+            _dispatch("postToolUse", {**common, "tool_use_id": "generic-2", "tool_output": "second"})
+
+        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
+        assert names == ["MCP: echo_marker", "Tool: MCP:echo_marker"]
+
+    @pytest.mark.parametrize("completion_event", ["postToolUse", "postToolUseFailure"])
+    def test_duplicate_generic_completion_emits_once(self, captured_spans, monkeypatch, completion_event):
+        """Retried generic completion of an invocation already reported by the
+        dedicated MCP span must not produce a second span."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
+        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        completion = {**common, "tool_use_id": "generic-1"}
+        if completion_event == "postToolUse":
+            completion["tool_output"] = "ok"
+        else:
+            completion["error_message"] = "boom"
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("preToolUse", {**common, "tool_use_id": "generic-1"})
+            _dispatch("afterMCPExecution", {**mcp_common, "result": "ok"})
+            _dispatch(completion_event, completion)
+            _dispatch(completion_event, completion)  # duplicate delivery
+
+        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
+        assert names == ["MCP: echo_marker"]
+
     def test_post_tool_use_emits_for_unknown_tool_name(self, captured_spans, monkeypatch):
         """postToolUse emits a span for tools not in the dedup set."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
@@ -2308,7 +2347,10 @@ class TestDeferredStatePrivacy:
             assert task not in json.dumps(subagent_payload)
             assert "SUBAGENT_SUMMARY_SECRET" not in json.dumps(subagent_payload)
 
-    def test_generic_tool_creation_redaction_survives_duplicate_post(self, captured_spans, monkeypatch):
+    def test_generic_tool_duplicate_post_is_suppressed_without_leaking(self, captured_spans, monkeypatch):
+        """Duplicate delivery of one invocation's completion emits no second
+        span, so a privacy policy loosened in between cannot expose content
+        that was redacted when the invocation was created."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
         tool_input = {"q": "GENERIC_DUPLICATE_SECRET"}
@@ -2331,14 +2373,13 @@ class TestDeferredStatePrivacy:
             for payload in captured_spans
             if payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] == "Tool: browser"
         ]
-        assert len(tool_payloads) == 2
-        for tool_payload in tool_payloads:
-            tool_span = tool_payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
-            attrs = {item["key"]: item["value"]["stringValue"] for item in tool_span["attributes"]}
-            assert attrs["input.value"].startswith("<redacted")
-            assert attrs["output.value"].startswith("<redacted")
-            assert "GENERIC_DUPLICATE_SECRET" not in json.dumps(tool_payload)
-            assert "GENERIC_OUTPUT_SECRET" not in json.dumps(tool_payload)
+        assert len(tool_payloads) == 1
+        tool_span = tool_payloads[0]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        attrs = {item["key"]: item["value"]["stringValue"] for item in tool_span["attributes"]}
+        assert attrs["input.value"].startswith("<redacted")
+        assert attrs["output.value"].startswith("<redacted")
+        assert "GENERIC_DUPLICATE_SECRET" not in json.dumps(captured_spans)
+        assert "GENERIC_OUTPUT_SECRET" not in json.dumps(captured_spans)
 
     def test_model_output_redaction_survives_duplicate_response(self, captured_spans, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")

@@ -724,6 +724,24 @@ def state_push(key: str, value: dict) -> None:
         _write_private_text(stack_file, json.dumps(data, indent=2))
 
 
+def state_claim_once(key: str) -> bool:
+    """Atomically claim a named one-shot slot; True only for the first caller.
+
+    Exclusive creation makes the claim atomic without a lock, so concurrent
+    hook processes cannot both win. The claim file lives in the generation
+    shard and is removed by ordinary generation cleanup.
+    """
+    state_parent = _state_parent_for_key(key)
+    claim_path = state_parent / f"{key}.claim"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(claim_path, flags, 0o600)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
 def state_pop(key: str) -> "dict | None":
     """Pop the last value from a named stack. Returns None if empty.
 

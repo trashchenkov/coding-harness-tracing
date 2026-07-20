@@ -234,6 +234,19 @@ class TestStateCleanupGeneration:
 
         assert not shard.exists()
 
+    def test_state_claim_once_is_exclusive_and_generation_scoped(self):
+        gen_key = adapter.generation_state_key("gen-claim")
+        key = f"tooldone_{gen_key}_abc"
+
+        assert adapter.state_claim_once(key) is True
+        assert adapter.state_claim_once(key) is False
+        # A different invocation's claim is independent.
+        assert adapter.state_claim_once(f"tooldone_{gen_key}_def") is True
+
+        # Claims live in the generation shard, so ordinary cleanup removes them.
+        adapter.state_cleanup_generation("gen-claim")
+        assert adapter.state_claim_once(key) is True
+
     def test_cleanup_no_files_no_error(self):
         adapter.state_cleanup_generation("gen-nonexistent")  # should not raise
 
