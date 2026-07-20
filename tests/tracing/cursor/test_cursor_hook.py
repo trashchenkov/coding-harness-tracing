@@ -49,7 +49,14 @@ def _patch_cursor_state(tmp_path, monkeypatch):
 def captured_spans():
     """Mock send_span and collect all payloads sent."""
     sent = []
-    with mock.patch("tracing.cursor.hooks.handlers.send_span", side_effect=lambda s: sent.append(s)):
+
+    def record(payload):
+        sent.append(payload)
+        # send_span reports delivery; returning True keeps the double captured
+        # here faithful to the real contract handlers branch on.
+        return True
+
+    with mock.patch("tracing.cursor.hooks.handlers.send_span", side_effect=record):
         yield sent
 
 
@@ -2126,6 +2133,48 @@ class TestHandlePostToolUse:
 
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
         assert names == ["MCP: beta", "Tool: MCP:alpha"]
+
+    @pytest.mark.parametrize("outcome", ["success", "failure"])
+    def test_failed_dedicated_export_leaves_the_generic_fallback(self, monkeypatch, outcome):
+        """A dedicated span the backend refused must not suppress anything.
+
+        The marker asserts a span exists; a send that reported failure did not
+        create one, so the generic completion has to remain available as the
+        fallback it naturally is.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"t"}'}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "t"}, "tool_use_id": "A"}
+        if outcome == "success":
+            dedicated_end, completion_event = {"result": "same"}, "postToolUse"
+            completion = {**generic, "tool_output": "same"}
+            expected_status = {"code": 1}
+        else:
+            dedicated_end, completion_event = {"error": "same"}, "postToolUseFailure"
+            completion = {**generic, "error_message": "same"}
+            expected_status = {"code": 2, "message": "same"}
+
+        attempts = []
+
+        def failing_dedicated_send(payload):
+            name = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"]
+            attempts.append(payload)
+            return not name.startswith("MCP: ")
+
+        with (
+            mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000),
+            mock.patch("tracing.cursor.hooks.handlers.send_span", side_effect=failing_dedicated_send),
+        ):
+            _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("afterMCPExecution", {**dedicated, **dedicated_end})
+            _dispatch(completion_event, completion)
+
+        names = [payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for payload in attempts]
+        assert names == ["MCP: echo", "Tool: MCP:echo"], "the generic completion must still reach the backend"
+        assert attempts[1]["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"] == expected_status
+        # The refused export left no marker behind to suppress a later call.
+        assert not [path for path in adapter.STATE_DIR.rglob("mcpdone_*") if path.is_file()]
 
     def test_unmatched_after_event_does_not_steal_another_calls_state(self, captured_spans, monkeypatch):
         """An after-event whose before-event was lost must not take a record

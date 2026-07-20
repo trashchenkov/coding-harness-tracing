@@ -985,6 +985,40 @@ but opposite statuses, which cannot be provoked reliably from a prompt.
 
 Suite: 2,193 passed; pre-commit clean; `git diff --check` clean.
 
+## Seventh review response (2026-07-20)
+
+Review of SHA `5a7ebd7` confirmed the previous round and found one narrow
+P1, which is correct and is a defect this work introduced.
+
+**The marker was written even when the dedicated export failed.**
+`send_span` reports delivery through its return value and does not raise, so
+ignoring it meant a backend failure still recorded "a span exists for this
+call". The matching generic completion then consumed that marker and
+suppressed itself, and nothing was exported at all — the one case where the
+generic completion is a ready-made fallback was the case that lost
+everything. The marker is now written only after a confirmed send, so a
+refused export leaves the fallback intact and the system fails toward a
+duplicate rather than silence.
+
+This is distinct from the pre-existing "claim before export success"
+behaviour that review 1 placed out of scope: that concerns the terminal
+claim ledger, whereas this marker is new in this branch and its contract
+(HANDOFF: *"marker only when it actually emitted the dedicated span"*) was
+simply not honoured by the code.
+
+The `captured_spans` test double was also returning `None` from
+`list.append`, i.e. reporting failure for every send. Handlers had no reason
+to branch on it before, so the suite never noticed; it now returns `True`,
+matching the real contract.
+
+Regression added, parametrized over both outcome domains and verified to
+fail against `5a7ebd7`:
+`test_failed_dedicated_export_leaves_the_generic_fallback` — the dedicated
+send is refused, the generic completion must still reach the backend with
+the correct OK/ERROR status, and no marker may be left on disk.
+
+Suite: 2,195 passed; pre-commit clean; `git diff --check` clean.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
