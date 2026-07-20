@@ -694,6 +694,42 @@ Arize AX remains unexercised end to end (needs real credentials): its
 OTLP JSON transport, auth headers, and `arize.project.name` injection have
 never run against the real service.
 
+## Event-coverage closure round (2026-07-20, real hosts)
+
+A final round closed the remaining event families that could be exercised
+locally.
+
+- **`postToolUseFailure` — validated live.** A deliberately invalid Grep
+  regex on the CLI fired the event; the span carries the rg error output,
+  `cursor.tool.status=error`, and `cursor.tool.failure_type`. This smoke
+  also exposed a defect: failure spans were exported with OTLP status OK,
+  so backend error metrics (e.g. Phoenix "spans by status") never counted
+  them. Fixed: `postToolUseFailure` spans now carry OTLP status ERROR with
+  the privacy-redacted error message (matches the omp/opencode convention);
+  regression added.
+- **Tab events — validated live.** Real typing with Cursor Tab completions
+  in the IDE fired `beforeTabFileRead` (12×) and `afterTabFileEdit` (3×);
+  exported spans carry the file path and exact edit ranges/diffs. Note: Tab
+  events have no generation context, so Tab spans are parentless in their
+  own trace — Tab activity is not part of an agent turn.
+- **Subagent events — the host does not emit them.** Even when the CLI
+  demonstrably used its Task tool to spawn a subagent (forced via prompt;
+  the subagent's own read/shell actions flowed through the session's normal
+  hooks), no `subagentStart`/`subagentStop` was delivered, and the Task
+  call's `preToolUse` never received a closing `postToolUse`. The subagent
+  handlers remain validated by payload replay only; this is a host contract
+  gap for maintainers, not an integration defect. Models also happily
+  *claim* subagent use without emitting anything — do not trust prompt
+  output as evidence here.
+- **`preCompact` — not deterministically triggerable.** `/compact`,
+  `/compress`, and `/summarize` in the interactive TUI do not fire it, and
+  print mode treats them as prompts. Forcing a real compaction requires
+  filling the context window, which is expensive and non-deterministic.
+  The handler remains validated by payload replay only.
+
+Per an explicit scoping decision, Arize AX and Windows are left to the
+upstream maintainers.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch
