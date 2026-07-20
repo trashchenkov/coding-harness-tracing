@@ -936,6 +936,55 @@ They are de-duplicated one-for-one, which is correct when both are real
 calls; if such a pair were also half-delivered on both sides, one span could
 still be lost. No field in the observed payloads can separate that case.
 
+## Sixth review response (2026-07-20)
+
+Review of SHA `5519811` confirmed the previous two P1s closed and found two
+more, both in the partial-delivery paths. Both were real and are fixed.
+
+**An unmatched after-event still fell through to the arrival-order pop.**
+The fallback was meant for hosts that omit the arguments on the after-event,
+but it also ran when the arguments were present and had just *proved* no
+matching record existed. With `before B → after A → after B`, A's lookup
+correctly found nothing and then took B's record anyway: A reported B's
+arguments and B was left with none. The fallback is now reached only when
+the payload identifies nothing at all. When it does identify a call but no
+record matches, the before-event was lost: no record is taken, the other
+calls' records survive, the span is described by the after payload's own
+arguments, and the start time falls back to now.
+
+**The outcome digest ignored success vs failure.** `raw_error or
+raw_result` collapsed both into one text digest, so a dedicated *success*
+returning `"same"` and an unrelated generic *failure* reporting `"same"`
+shared an identity — and the ERROR span was dropped entirely. The mirror
+case dropped a successful call. Unlike the same-name/same-input/same-result
+limitation recorded above, this one *was* distinguishable in the payloads;
+the discriminator simply was not in the key. The digest is now domain
+separated (`success\0…` / `failure\0…`), and the domain is passed
+symmetrically: dedicated result → success, dedicated error → failure,
+`postToolUse` → success, `postToolUseFailure` → failure.
+
+Also applied, from the non-blocking note: the record no longer stores the
+raw OTLP span id. It is used purely as a one-for-one marker, so it now holds
+`{"reported": true}` and carries no identifier at all.
+
+Regressions added, each verified to fail against `5519811`:
+
+- `test_unmatched_after_event_does_not_steal_another_calls_state` —
+  `before B → after A → after B`, asserting name ↔ input ↔ output for both
+  and that B's record survived A's unmatched after-event.
+- `test_dedicated_success_does_not_hide_a_generic_failure` — two spans, the
+  generic one keeping OTLP ERROR with its message.
+- `test_dedicated_failure_does_not_hide_a_generic_success` — the mirror
+  case, the dedicated span keeping ERROR and the generic one OK.
+
+Real-host re-check (fresh bootstrap): an ordinary dual-channel call still
+produces exactly one `MCP: echo_marker` span with the generic follow-up
+suppressed. The cross-domain cases are unit-tested rather than host-tested —
+they require two calls with identical arguments and identical outcome text
+but opposite statuses, which cannot be provoked reliably from a prompt.
+
+Suite: 2,193 passed; pre-commit clean; `git diff --check` clean.
+
 ## Safety and delivery note
 
 Do not push this branch directly to upstream or merge it into a default branch

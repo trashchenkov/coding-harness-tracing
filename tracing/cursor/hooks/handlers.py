@@ -709,14 +709,18 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     state_key = _mcp_pair_state_key(gen_id) if gen_id else ""
 
     # This payload names the call itself, so its own before-record is claimed
-    # by content: two calls in flight at once can no longer adopt each other's
-    # arguments and start time. Hosts that omit the arguments here have
-    # nothing to match on, and fall back to the arrival-order pairing.
+    # by content: two calls in flight at once cannot adopt each other's
+    # arguments and start time. When it names the call but no record matches,
+    # the before-event was lost — taking whatever is on the stack would steal
+    # a *different* call's record, so nothing is taken. Only a payload that
+    # identifies nothing falls back to arrival-order pairing.
+    has_after_identity = bool(after_tool) and after_input not in (None, "")
     popped = None
-    if state_key and after_tool and after_input not in (None, ""):
-        popped = state_pop_matching(state_key, "correlation", _mcp_correlation_digest(after_tool, after_input))
-    if popped is None and state_key:
-        popped = state_pop(state_key)
+    if state_key:
+        if has_after_identity:
+            popped = state_pop_matching(state_key, "correlation", _mcp_correlation_digest(after_tool, after_input))
+        else:
+            popped = state_pop(state_key)
 
     if popped:
         start_ms = popped.get("start_ms", "")
@@ -724,7 +728,13 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     else:
         start_ms = ""
         tool_name = ""
-    tool_input, _ = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+    tool_input, tool_input_redacted = (
+        _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+    )
+    # Without a before-record the after payload's own arguments are the only
+    # description of the call, and the elapsed time is unknown.
+    if popped is None and has_after_identity and not tool_input and not tool_input_redacted:
+        tool_input = redact_content(env.log_tool_content, _json_string(after_input))
     start_ms = start_ms or str(now_ms)
 
     # Override tool name from after-event if present
@@ -785,9 +795,9 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
             _mcp_dedicated_reported_key(
                 gen_id,
                 _mcp_correlation_digest(after_tool, after_input),
-                _mcp_outcome_digest(raw_error or raw_result),
+                _mcp_outcome_digest(bool(raw_error), raw_error or raw_result),
             ),
-            {"span_id": sid},
+            {"reported": True},
         )
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
 
@@ -1303,9 +1313,15 @@ def _mcp_pair_state_key(gen_id: str) -> str:
     return f"mcp_{generation_state_key(gen_id)}"
 
 
-def _mcp_outcome_digest(outcome) -> str:
-    """Digest of a call's result, the field both channels report identically."""
-    return stable_digest(_canonical_tool_input(outcome))
+def _mcp_outcome_digest(failed: bool, outcome) -> str:
+    """Digest of how a call ended, the field both channels report identically.
+
+    Success and failure are separate domains: a call that returned ``"same"``
+    and a *different* call that failed with ``"same"`` are distinguishable in
+    the payloads, so they must not share an identity.
+    """
+    domain = "failure" if failed else "success"
+    return stable_digest(f"{domain}\0{_canonical_tool_input(outcome)}")
 
 
 def _mcp_dedicated_reported_key(gen_id: str, correlation: str, outcome_digest: str) -> str:
@@ -1333,7 +1349,7 @@ def _claim_generic_completion_digest(gen_id: str, invocation_digest: str) -> boo
     return state_claim_once(_generic_completion_claim_key(gen_id, invocation_digest))
 
 
-def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, outcome) -> bool:
+def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, failed: bool, outcome) -> bool:
     """Whether a dedicated span already reported *this exact* generic call.
 
     The decision is deferred to the generic completion so it can be matched on
@@ -1346,7 +1362,7 @@ def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, ou
     if not gen_id or not _is_mcp_generic_tool_name(tool_name):
         return False
     correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), tool_input)
-    key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(outcome))
+    key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(failed, outcome))
     return state_pop(key) is not None
 
 
@@ -1436,7 +1452,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     raw_output = input_json.get("tool_output")
     if raw_output is None:
         raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
-    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), raw_output):
+    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), False, raw_output):
         log(f"postToolUse: skipping {tool_name!r} — this exact call already reported by its dedicated span")
         return
 
@@ -1525,7 +1541,7 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
         return
 
     # A dedicated span that already reported this exact failure covers it.
-    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), raw_error):
+    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), True, raw_error):
         log(f"postToolUseFailure: skipping {tool_name!r} — this exact call already reported by its dedicated span")
         return
 
