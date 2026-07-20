@@ -644,11 +644,13 @@ carried them along; setuptools packaged the stale `build/lib` sources
 instead of the current tree; and the marker still recorded the new hash —
 silently pinning outdated code across refreshes. Fixed by always
 installing from a pruned symlink-resolved copy (`build/` and `*.egg-info`
-removed; the plugin dir itself is never built in, so it stays pristine) and
-excluding build artifacts from the source fingerprint. Regression test
-seeds a stale `build/lib` and asserts the install source is pruned and the
-marker matches the clean-tree hash. Re-verified live: fresh bootstrap
-installs current code, plugin dir stays clean.
+removed) and excluding build artifacts from the source fingerprint. Fresh
+installs no longer build inside the plugin dir; legacy artifacts left by
+older failed installs are not deleted — they are neutralized by the
+fingerprint/pruning exclusions instead. Regression test seeds a stale
+`build/lib` and asserts the install source is pruned and the marker matches
+the clean-tree hash. Re-verified live: fresh bootstrap installs current
+code and creates no new artifacts in the plugin dir.
 
 ### Still unexercised on a real host
 
@@ -729,6 +731,38 @@ locally.
 
 Per an explicit scoping decision, Arize AX and Windows are left to the
 upstream maintainers.
+
+## Second review response (2026-07-20)
+
+An independent review of SHA `a5be1b3` returned REQUEST CHANGES against the
+MCP de-duplication and the bootstrap regression test. All findings fixed:
+
+- **P1: name-prefix suppression could drop generic-only MCP telemetry.**
+  Suppression is now delivery-aware: `afterMCPExecution` records a
+  content-free per-generation marker only when it actually emitted the
+  dedicated span, and the generic `postToolUse` / `postToolUseFailure`
+  handlers suppress only by consuming that marker. A surface delivering
+  only generic events keeps full MCP telemetry; generation-less payloads
+  are never suppressed.
+- **P1: the failure path could still duplicate.** `postToolUseFailure` now
+  consumes the same marker (after popping generic state, so no dangling
+  files). When the after payload declares an error, the surviving dedicated
+  span itself carries OTLP ERROR status, `cursor.tool.status=error`, and
+  the redacted message. The reviewer's full matrix is encoded as a
+  regression test: generic-only success, dedicated+generic success,
+  generic-only failure, dedicated+generic failure, and the observed denied
+  case — one span each, with correct status.
+- **P2: the bootstrap regression test failed on a polluted source tree**
+  (exactly the state it protects against). Fixed with `exist_ok` mkdirs and
+  re-verified with `build/` + `*.egg-info` seeded into the plugin tree.
+  The "plugin dir stays clean" claim was narrowed: fresh installs create no
+  artifacts, but legacy artifacts are neutralized, not deleted.
+
+Residual limitation, documented deliberately: if a host emits a
+successful-looking `afterMCPExecution` and only signals the failure in the
+later `postToolUseFailure`, the failure detail lands in logs, not on the
+already-sent dedicated span. No observed surface does this; revisit only
+with host evidence.
 
 ## Safety and delivery note
 
