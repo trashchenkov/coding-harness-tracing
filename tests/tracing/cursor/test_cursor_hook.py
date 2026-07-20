@@ -1980,14 +1980,27 @@ class TestHandlePostToolUse:
         MCP calls "MCP:<tool>" in generic events); a generic-only surface must
         keep its telemetry, and failure paths must not duplicate either."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
-        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
-        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        # Real payload shapes (Cursor 2026.07.16): the generic events carry the
+        # arguments as an object, the dedicated pair the same arguments as a
+        # JSON string, and only the generic events carry a tool_use_id.
+        common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "MCP:echo_marker",
+            "tool_input": {"text": "idcheck"},
+        }
+        mcp_common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "echo_marker",
+            "tool_input": '{"text":"idcheck"}',
+        }
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
             # 1. generic-only success → generic span survives
             _dispatch("preToolUse", {**common, "tool_use_id": "m1"})
             _dispatch("postToolUse", {**common, "tool_use_id": "m1", "tool_output": "ok"})
             # 2. dedicated + generic success → only the dedicated span
-            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "m2"})
             _dispatch("afterMCPExecution", {**mcp_common, "result": "echoed"})
             _dispatch("postToolUse", {**common, "tool_use_id": "m2", "tool_output": "echoed"})
@@ -1995,12 +2008,12 @@ class TestHandlePostToolUse:
             _dispatch("preToolUse", {**common, "tool_use_id": "m3"})
             _dispatch("postToolUseFailure", {**common, "tool_use_id": "m3", "error_message": "boom"})
             # 4. dedicated + generic failure → only the dedicated span, as error
-            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "m4"})
             _dispatch("afterMCPExecution", {**mcp_common, "error": "deliberate failure"})
             _dispatch("postToolUseFailure", {**common, "tool_use_id": "m4", "error_message": "deliberate failure"})
             # 5. denied call (observed CLI shape: rejection in the result)
-            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "m5"})
             _dispatch("afterMCPExecution", {**mcp_common, "result": '{"rejected":true,"reason":"User rejected"}'})
             _dispatch("postToolUse", {**common, "tool_use_id": "m5", "tool_output": '{"rejected":true}'})
@@ -2028,11 +2041,24 @@ class TestHandlePostToolUse:
         """A dedicated call whose generic follow-up never arrives must not
         suppress a later, separate generic-only call of the same tool."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
-        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
-        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        # Real payload shapes (Cursor 2026.07.16): the generic events carry the
+        # arguments as an object, the dedicated pair the same arguments as a
+        # JSON string, and only the generic events carry a tool_use_id.
+        common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "MCP:echo_marker",
+            "tool_input": {"text": "idcheck"},
+        }
+        mcp_common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "echo_marker",
+            "tool_input": '{"text":"idcheck"}',
+        }
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
             # Call A: dedicated pair only — its generic follow-up never lands.
-            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("afterMCPExecution", {**mcp_common, "result": "first"})
             # Call B: a genuinely separate invocation, generic events only.
             _dispatch("preToolUse", {**common, "tool_use_id": "generic-2"})
@@ -2046,15 +2072,28 @@ class TestHandlePostToolUse:
         """Retried generic completion of an invocation already reported by the
         dedicated MCP span must not produce a second span."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
-        common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "MCP:echo_marker"}
-        mcp_common = {"conversation_id": "c1", "generation_id": "g1", "tool_name": "echo_marker"}
+        # Real payload shapes (Cursor 2026.07.16): the generic events carry the
+        # arguments as an object, the dedicated pair the same arguments as a
+        # JSON string, and only the generic events carry a tool_use_id.
+        common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "MCP:echo_marker",
+            "tool_input": {"text": "idcheck"},
+        }
+        mcp_common = {
+            "conversation_id": "c1",
+            "generation_id": "g1",
+            "tool_name": "echo_marker",
+            "tool_input": '{"text":"idcheck"}',
+        }
         completion = {**common, "tool_use_id": "generic-1"}
         if completion_event == "postToolUse":
             completion["tool_output"] = "ok"
         else:
             completion["error_message"] = "boom"
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
-            _dispatch("beforeMCPExecution", {**mcp_common, "tool_input": "{}"})
+            _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "generic-1"})
             _dispatch("afterMCPExecution", {**mcp_common, "result": "ok"})
             _dispatch(completion_event, completion)
@@ -2062,6 +2101,88 @@ class TestHandlePostToolUse:
 
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
         assert names == ["MCP: echo_marker"]
+
+    def test_interleaved_distinct_mcp_calls_each_keep_a_span(self, captured_spans, monkeypatch):
+        """A dedicated pair for one call must never claim a different call.
+
+        Delivery can interleave two operations (here the dedicated pair for B
+        lands inside A's generic invocation). Correlation is by call content,
+        so B's result cannot consume A's invocation and both stay observable.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("preToolUse", {**gen, "tool_name": "MCP:alpha", "tool_input": {"a": 1}, "tool_use_id": "A"})
+            _dispatch("beforeMCPExecution", {**gen, "tool_name": "beta", "tool_input": '{"b":2}'})
+            _dispatch("afterMCPExecution", {**gen, "tool_name": "beta", "tool_input": '{"b":2}', "result": "B"})
+            _dispatch(
+                "postToolUse",
+                {**gen, "tool_name": "MCP:alpha", "tool_input": {"a": 1}, "tool_use_id": "A", "tool_output": "A"},
+            )
+
+        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
+        assert names == ["MCP: beta", "Tool: MCP:alpha"]
+
+    def test_ambiguous_concurrent_identical_calls_keep_telemetry(self, captured_spans, monkeypatch):
+        """Two indistinguishable calls open at once must not be de-duplicated.
+
+        Nothing in the payloads says which invocation a result belongs to, so
+        no claim is made: an extra span is preferable to dropping a call.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "same"}}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"same"}'}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("preToolUse", {**generic, "tool_use_id": "one"})
+            _dispatch("preToolUse", {**generic, "tool_use_id": "two"})
+            _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
+            _dispatch("postToolUse", {**generic, "tool_use_id": "one", "tool_output": "r"})
+            _dispatch("postToolUse", {**generic, "tool_use_id": "two", "tool_output": "r"})
+
+        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
+        assert names == ["MCP: echo", "Tool: MCP:echo", "Tool: MCP:echo"]
+
+    def test_sequential_identical_calls_each_correlate(self, captured_spans, monkeypatch):
+        """Identical calls that do not overlap stay unambiguous one at a time.
+
+        The first invocation is closed before the second opens, so each result
+        correlates to exactly one invocation and neither generic span emits.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "same"}}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"same"}'}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            for invocation in ("one", "two"):
+                _dispatch("preToolUse", {**generic, "tool_use_id": invocation})
+                _dispatch("beforeMCPExecution", dedicated)
+                _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
+                _dispatch("postToolUse", {**generic, "tool_use_id": invocation, "tool_output": "r"})
+
+        names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
+        assert names == ["MCP: echo", "MCP: echo"]
+
+    def test_mcp_correlation_state_never_stores_raw_invocation_ids(self, captured_spans, monkeypatch):
+        """Correlation bookkeeping persists digests only, never the raw ids."""
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        generic = {"tool_name": "MCP:echo", "tool_input": {"secret": "s3cret-arg"}}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("preToolUse", {**gen, **generic, "tool_use_id": "raw-invocation-id"})
+
+        files = [path for path in adapter.STATE_DIR.rglob("*") if path.is_file()]
+        persisted = "\n".join(path.read_text(errors="replace") + str(path) for path in files)
+        assert "raw-invocation-id" not in persisted
+
+        # The correlation bookkeeping itself is digest-only: unlike the tool
+        # state file (whose captured arguments the privacy switches govern), it
+        # carries neither the invocation id nor the argument text.
+        correlation = [path for path in files if path.name.startswith("mcpopen_")]
+        assert correlation, "expected the open-invocation record to be written"
+        for path in correlation:
+            assert "s3cret-arg" not in path.read_text()
 
     def test_post_tool_use_emits_for_unknown_tool_name(self, captured_spans, monkeypatch):
         """postToolUse emits a span for tools not in the dedup set."""
