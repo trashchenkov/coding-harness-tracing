@@ -1402,6 +1402,10 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
         attrs,
         SERVICE_NAME,
         SCOPE_NAME,
+        # OTLP ERROR status so backends count these in error metrics instead
+        # of rendering failures as OK; the message is already privacy-redacted.
+        status_code=2,
+        status_message=truncate_attr(error_message, 256),
     )
     send_span(span)
     log(f"postToolUseFailure: span for tool={tool_name}")

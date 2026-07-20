@@ -125,6 +125,8 @@ def test_tool_failure_emits_error_span_and_cleans_pair(captured_spans, _state_di
     assert attrs["cursor.tool.status"] == "error"
     assert attrs["cursor.tool.failure_type"] == "error"
     assert attrs["cursor.tool.is_interrupt"] is False
+    # Failures must report OTLP ERROR status so backends count them as errors.
+    assert span["status"] == {"code": 2, "message": "exit 1"}
     remaining = list(_state_dir.rglob("tool_*_privacy.stack.json"))
     assert len(remaining) == 1
     assert all("_privacy.stack.json" in path.name for path in remaining)
