@@ -776,6 +776,66 @@ def state_pop(key: str) -> "dict | None":
     return value if isinstance(value, dict) else None
 
 
+def _rewrite_stack(stack_file, data) -> None:
+    """Persist a stack list, removing the file once it is empty."""
+    if data:
+        _write_private_text(stack_file, json.dumps(data, indent=2))
+    else:
+        stack_file.unlink(missing_ok=True)
+
+
+def _load_stack(stack_file) -> list:
+    """Return a named stack's entries, or [] when absent or unreadable."""
+    serialized = _read_private_text(stack_file)
+    if serialized is None:
+        return []
+    try:
+        data = json.loads(serialized) or []
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def state_take_sole(key: str) -> "dict | None":
+    """Remove and return a stack's only entry; None unless exactly one exists.
+
+    Callers use this to act solely on an unambiguous correlation: with zero or
+    several candidates the stack is left untouched and the caller keeps its
+    default behaviour rather than guessing which entry was meant.
+    """
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
+    _ensure_private_file(lock_path)
+
+    with FileLock(lock_path):
+        data = _load_stack(stack_file)
+        if len(data) != 1 or not isinstance(data[0], dict):
+            return None
+        value = data[0]
+        _rewrite_stack(stack_file, [])
+
+    return value
+
+
+def state_discard(key: str, value: dict) -> bool:
+    """Remove the last entry equal to ``value``; False when none matched."""
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
+    _ensure_private_file(lock_path)
+
+    with FileLock(lock_path):
+        data = _load_stack(stack_file)
+        for index in range(len(data) - 1, -1, -1):
+            if data[index] == value:
+                del data[index]
+                _rewrite_stack(stack_file, data)
+                return True
+
+    return False
+
+
 # --- Root span tracking per generation ---
 # Replaces bash lines 138-155.
 

@@ -776,7 +776,9 @@ consumed. Both are fixed by making correlation invocation-aware.
 - **Identity is now the invocation.** `preToolUse` records the generic
   `tool_use_id` of an `MCP:<tool>` call on a pending stack (real hosts
   interleave it between the dedicated pair, so the result knows which
-  invocation it belongs to). `afterMCPExecution` pops that pending id and
+  invocation it belongs to — **this claim was wrong; see the fourth review
+  response for the captured ordering and what replaced it**).
+  `afterMCPExecution` pops that pending id and
   claims *that invocation's* completion. A dedicated call with no generic
   pre-event claims nothing, so it can never suppress a different call.
 - **Duplicate delivery is once-only.** Completion is a durable
@@ -799,6 +801,64 @@ separate call survives), `duplicate-generic-success` → 1,
 real CLI with a fresh bootstrap: one `MCP: echo_marker` span, with the log
 showing the invocation-keyed claim suppressing the generic follow-up.
 Suite: 2,181 passed.
+
+## Fourth review response (2026-07-20)
+
+Review of SHA `3f60767` found that invocation-*aware* was not invocation-
+*correlated*: the pending stack was popped positionally, so a dedicated
+result could adopt whichever invocation happened to be on top. The probe
+`preToolUse(A) → beforeMCPExecution(B) → afterMCPExecution(B) →
+postToolUse(A)` collapsed to 1 span where 2 were owed. It also found the raw
+`tool_use_id` persisted in durable JSON, breaking the digest-only contract.
+
+Both were symptoms of one wrong assumption, which raw payload capture on
+this host settled (Cursor CLI 2026.07, hooks tee'd to a file):
+
+- The real ordering is `preToolUse → beforeMCPExecution → afterMCPExecution
+  → postToolUse` — the dedicated pair is *nested inside* the generic
+  invocation. The previous code comment claimed the opposite.
+- The dedicated MCP payloads carry **no `tool_use_id` at all**. There is no
+  shared id to correlate on. They do carry the same `tool_name` and
+  `tool_input` as the generic events (the generic side as an object, the
+  dedicated side as the equivalent JSON string).
+
+So correlation is now by *call content*, with an explicit ambiguity rule:
+
+- `preToolUse` for an `MCP:<tool>` call registers the invocation as open
+  under a key derived from `sha256(tool_name + canonical(tool_input))`. The
+  stored value is `sha256(tool_use_id)` — the raw id never reaches disk, and
+  the key holds no argument text.
+- `afterMCPExecution` claims the generic follow-up **only when exactly one
+  invocation of that call shape is open** (`state_take_sole`, atomic under
+  the stack lock). With none open — a host emitting no generic events — or
+  several open, nothing is claimed and the generic spans still emit. An
+  extra span is preferable to dropping a distinct call.
+- `postToolUse` / `postToolUseFailure` remove their own entry, so a finished
+  invocation cannot make a later identical call look ambiguous.
+- `_generic_completion_claim_key` validates its argument is 64 hex chars, so
+  a claim key can only ever be built from a digest.
+
+Real-host re-verification (fresh bootstrap, local span sink), both branches
+hit naturally:
+
+- Single call → `preToolUse, beforeMCPExecution, afterMCPExecution,
+  postToolUse` → **1** `MCP: echo_marker`, no generic span. Correlated and
+  suppressed.
+- Asked for two identical calls, the model issued them *concurrently* —
+  both `preToolUse`s before either `afterMCPExecution`, and the
+  `postToolUse`s arriving in the opposite order to the `preToolUse`s. Two
+  indistinguishable invocations were open, so nothing was claimed: **2**
+  `MCP: echo_marker` + **2** `Tool: MCP:echo_marker`. Nothing was lost, and
+  that reversed post ordering is direct evidence that positional
+  correlation was unsound on this host.
+
+New regressions: the reviewer's interleaving probe (now 2 spans), concurrent
+identical calls (telemetry kept), sequential identical calls (each
+correlated, no generic span), digest-only correlation state, plus adapter
+unit tests for `state_take_sole` and `state_discard`. The MCP fixtures now
+use the captured real payload shapes rather than hand-written ones — the old
+fixtures omitted `tool_input` on generic events, which no real host does.
+Suite: 2,187 passed; pre-commit clean.
 
 ## Safety and delivery note
 

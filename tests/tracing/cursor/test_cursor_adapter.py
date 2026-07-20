@@ -247,6 +247,30 @@ class TestStateCleanupGeneration:
         adapter.state_cleanup_generation("gen-claim")
         assert adapter.state_claim_once(key) is True
 
+    def test_state_take_sole_acts_only_on_an_unambiguous_stack(self):
+        key = f"mcpopen_{adapter.generation_state_key('gen-sole')}_abc"
+
+        assert adapter.state_take_sole(key) is None  # empty
+
+        adapter.state_push(key, {"invocation": "one"})
+        adapter.state_push(key, {"invocation": "two"})
+        # Ambiguous: nothing is taken and nothing is lost.
+        assert adapter.state_take_sole(key) is None
+        assert adapter.state_pop(key) == {"invocation": "two"}
+
+        assert adapter.state_take_sole(key) == {"invocation": "one"}
+        assert adapter.state_take_sole(key) is None  # consumed
+
+    def test_state_discard_removes_only_the_matching_entry(self):
+        key = f"mcpopen_{adapter.generation_state_key('gen-discard')}_abc"
+        adapter.state_push(key, {"invocation": "one"})
+        adapter.state_push(key, {"invocation": "two"})
+
+        assert adapter.state_discard(key, {"invocation": "one"}) is True
+        assert adapter.state_discard(key, {"invocation": "one"}) is False
+        # The unrelated entry survives and is now the sole candidate.
+        assert adapter.state_take_sole(key) == {"invocation": "two"}
+
     def test_cleanup_no_files_no_error(self):
         adapter.state_cleanup_generation("gen-nonexistent")  # should not raise
 

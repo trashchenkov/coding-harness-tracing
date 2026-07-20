@@ -37,8 +37,10 @@ from tracing.cursor.hooks.adapter import (
     state_claim_once,
     state_cleanup_generation,
     state_cleanup_generation_digest,
+    state_discard,
     state_pop,
     state_push,
+    state_take_sole,
     trace_id_from_generation,
     truncate_attr,
 )
@@ -683,6 +685,10 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
             "tool_name": tool_name,
             "tool_input": redact_content(tool_content_allowed, tool_input),
             "tool_input_redacted": not tool_content_allowed,
+            # Correlation is derived here, where the arguments are still raw,
+            # and persisted as a digest so the after-event can match the
+            # generic invocation even under a redaction policy.
+            "correlation": _mcp_correlation_digest(tool_name, tool_input),
             "url": redact_content(env.log_tool_details, mcp_url),
             "command": redact_content(env.log_tool_details, mcp_cmd),
             "start_ms": str(now_ms),
@@ -703,9 +709,11 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     if popped:
         start_ms = popped.get("start_ms", "")
         tool_name = popped.get("tool_name", "")
+        correlation = popped.get("correlation", "")
     else:
         start_ms = ""
         tool_name = ""
+        correlation = ""
     tool_input, _ = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
     start_ms = start_ms or str(now_ms)
 
@@ -714,6 +722,15 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     if after_tool:
         tool_name = after_tool
     tool_name = tool_name or "unknown"
+
+    # Hosts that deliver only the after-event, or drop the before state, still
+    # correlate: this payload repeats the call's own name and arguments.
+    if not correlation:
+        after_input = input_json.get("tool_input")
+        if after_input is None:
+            after_input = _jq_str(input_json, "toolInput", "input", "arguments")
+        if after_tool and after_input not in (None, ""):
+            correlation = _mcp_correlation_digest(after_tool, after_input)
 
     raw_result = _jq_str(input_json, "result", "output", "result_json")
     result = (
@@ -759,16 +776,17 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
         status_message=truncate_attr(error_message, 256) if raw_error else "",
     )
     send_span(span)
-    if gen_id:
-        # Claim the completion of the generic invocation this result belongs
-        # to, identified by the tool_use_id its preToolUse recorded. Keying on
-        # the invocation (not the tool name) means this cannot suppress a
-        # different call, and a call with no generic pre-event claims nothing
-        # — that surface keeps its own generic span.
-        pending = state_pop(_pending_mcp_invocation_key(gen_id, tool_name))
-        pending_id = pending.get("tool_use_id", "") if pending else ""
-        if pending_id:
-            _claim_generic_completion(gen_id, pending_id)
+    if gen_id and correlation:
+        # Claim the generic follow-up only when exactly one invocation of this
+        # call shape is open, i.e. the correlation is unambiguous. With none
+        # open (a host that emits no generic events) or several concurrently
+        # open (indistinguishable identical calls) nothing is claimed, so the
+        # generic spans still emit: a duplicate is preferable to silently
+        # dropping a distinct call's telemetry.
+        sole = state_take_sole(_mcp_open_invocations_key(gen_id, correlation))
+        invocation = sole.get("invocation", "") if sole else ""
+        if invocation:
+            _claim_generic_completion_digest(gen_id, invocation)
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
 
 
@@ -1244,30 +1262,87 @@ def _is_mcp_generic_tool_name(tool_name: str) -> bool:
     return tool_name.lower().startswith("mcp:")
 
 
-def _pending_mcp_invocation_key(gen_id: str, mcp_tool_name: str) -> str:
-    """Per-generation stack of generic invocation ids awaiting an MCP result."""
-    return f"mcppending_{generation_state_key(gen_id)}_{stable_digest(mcp_tool_name)[:24]}"
+def _canonical_tool_input(value) -> str:
+    """Canonicalize a tool argument payload so both channels hash alike.
+
+    The generic events carry ``tool_input`` as an object while the dedicated
+    MCP events carry the same arguments as a JSON string, so both are parsed
+    and re-serialized deterministically before hashing.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+    return _json_string(value)
 
 
-def _generic_completion_claim_key(gen_id: str, tool_use_id: str) -> str:
-    """Once-only claim identifying one generic tool invocation's completion."""
-    return f"tooldone_{generation_state_key(gen_id)}_{stable_digest(tool_use_id)[:24]}"
+def _mcp_correlation_digest(mcp_tool_name: str, tool_input) -> str:
+    """Digest identifying *what* was called, shared by both event channels.
+
+    The dedicated MCP payloads carry no ``tool_use_id`` (verified against
+    Cursor 2026.07.16 raw hook payloads), so correlation cannot use a shared
+    id. They do carry the same ``tool_name``/``tool_input`` as the generic
+    events, which ties a result to a call by content rather than by arrival
+    order. Only this digest is persisted — never raw ids or argument text.
+    """
+    return stable_digest(f"{mcp_tool_name}\0{_canonical_tool_input(tool_input)}")
+
+
+def _mcp_open_invocations_key(gen_id: str, correlation: str) -> str:
+    """State key holding the generic invocations still open for one call shape."""
+    return f"mcpopen_{generation_state_key(gen_id)}_{correlation}"
+
+
+def _generic_mcp_open_key(gen_id: str, generic_tool_name: str, tool_input) -> str:
+    """Open-invocation key derived from a generic ``MCP:<tool>`` event."""
+    mcp_tool_name = (
+        generic_tool_name[len("MCP:") :] if _is_mcp_generic_tool_name(generic_tool_name) else generic_tool_name
+    )
+    return _mcp_open_invocations_key(gen_id, _mcp_correlation_digest(mcp_tool_name, tool_input))
+
+
+def _generic_completion_claim_key(gen_id: str, invocation_digest: str) -> str:
+    """Once-only claim key for one generic invocation, from a validated digest."""
+    if len(invocation_digest) != 64 or any(char not in "0123456789abcdef" for char in invocation_digest):
+        raise ValueError("invalid invocation digest")
+    return f"tooldone_{generation_state_key(gen_id)}_{invocation_digest}"
+
+
+def _claim_generic_completion_digest(gen_id: str, invocation_digest: str) -> bool:
+    """Whether this delivery owns the single span for a digested invocation."""
+    if not gen_id or not invocation_digest:
+        return True
+    return state_claim_once(_generic_completion_claim_key(gen_id, invocation_digest))
+
+
+def _close_generic_mcp_invocation(gen_id: str, tool_name: str, tool_use_id: str, tool_input) -> None:
+    """Drop this invocation from the open set once its generic event arrived.
+
+    A finished invocation left open would make a later identical call look
+    ambiguous, needlessly costing that call its correlation.
+    """
+    if not gen_id or not tool_use_id or not _is_mcp_generic_tool_name(tool_name):
+        return
+    state_discard(
+        _generic_mcp_open_key(gen_id, tool_name, tool_input),
+        {"invocation": stable_digest(tool_use_id)},
+    )
 
 
 def _claim_generic_completion(gen_id: str, tool_use_id: str) -> bool:
     """Whether this delivery owns the single span for a generic invocation.
 
-    The claim is keyed by the invocation's own ``tool_use_id``, so it is
-    invocation-aware rather than name-aware: one call's dedicated span can
-    never suppress a different call, and a retried ``postToolUse`` /
-    ``postToolUseFailure`` for the same id is recognized as duplicate delivery
-    instead of emitting twice. Success and failure share this one identity.
-    Payloads without a generation or invocation id cannot be correlated, so
-    they always emit — losing a separate call is worse than a rare duplicate.
+    The claim is keyed by the invocation's own ``tool_use_id``, so a retried
+    ``postToolUse`` / ``postToolUseFailure`` for the same id is recognized as
+    duplicate delivery instead of emitting twice; success and failure share
+    this one identity. Payloads without a generation or invocation id cannot
+    be correlated, so they always emit — losing a separate call is worse than
+    a rare duplicate.
     """
     if not gen_id or not tool_use_id:
         return True
-    return state_claim_once(_generic_completion_claim_key(gen_id, tool_use_id))
+    return _claim_generic_completion_digest(gen_id, stable_digest(tool_use_id))
 
 
 def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
@@ -1319,11 +1394,16 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
             "tool_input_redacted": not tool_content_allowed,
         },
     )
-    # Hosts emitting both channels interleave the generic pre-event between the
-    # dedicated MCP pair, so this is where an MCP result learns which generic
-    # invocation it belongs to.
+    # Observed host ordering is preToolUse → beforeMCPExecution →
+    # afterMCPExecution → postToolUse, i.e. the dedicated pair is nested inside
+    # the generic invocation. Record this invocation as open so a dedicated
+    # result can recognize which call it belongs to. Digest only — the raw
+    # invocation id never reaches durable state.
     if _is_mcp_generic_tool_name(tool_name):
-        state_push(_pending_mcp_invocation_key(gen_id, tool_name[len("MCP:") :]), {"tool_use_id": tool_use_id})
+        state_push(
+            _generic_mcp_open_key(gen_id, tool_name, input_json.get("tool_input")),
+            {"invocation": stable_digest(tool_use_id)},
+        )
     log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
 
 
@@ -1336,6 +1416,8 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
     # Dedicated hooks provide richer fields. Still pop generic state so a host
     # emitting both APIs does not leave dangling files.
+    _close_generic_mcp_invocation(gen_id, tool_name, tool_use_id, input_json.get("tool_input"))
+
     if tool_name.lower() in _DEDICATED_TOOL_NAMES:
         log(f"postToolUse: skipping {tool_name!r} — covered by dedicated handler")
         return
@@ -1423,6 +1505,8 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     failure_type = _jq_str(input_json, "failure_type")
     duration = _to_int(input_json.get("duration"))
     start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+
+    _close_generic_mcp_invocation(gen_id, tool_name, tool_use_id, input_json.get("tool_input"))
 
     # Generic state above is still popped so no dangling files remain, but a
     # completion already reported for this invocation must not duplicate —
