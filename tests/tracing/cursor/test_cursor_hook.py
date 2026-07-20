@@ -2,6 +2,7 @@
 """Tests for tracing.cursor.hooks.handlers and the current Cursor hook inventory."""
 
 import io
+import itertools
 import json
 import os
 import sqlite3
@@ -2015,8 +2016,9 @@ class TestHandlePostToolUse:
             # 5. denied call (observed CLI shape: rejection in the result)
             _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "m5"})
-            _dispatch("afterMCPExecution", {**mcp_common, "result": '{"rejected":true,"reason":"User rejected"}'})
-            _dispatch("postToolUse", {**common, "tool_use_id": "m5", "tool_output": '{"rejected":true}'})
+            rejection = '{"rejected":true,"reason":"User rejected"}'
+            _dispatch("afterMCPExecution", {**mcp_common, "result": rejection})
+            _dispatch("postToolUse", {**common, "tool_use_id": "m5", "tool_output": rejection})
 
         spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
         names = [s["name"] for s in spans]
@@ -2090,12 +2092,14 @@ class TestHandlePostToolUse:
         completion = {**common, "tool_use_id": "generic-1"}
         if completion_event == "postToolUse":
             completion["tool_output"] = "ok"
+            dedicated_outcome = {"result": "ok"}
         else:
             completion["error_message"] = "boom"
+            dedicated_outcome = {"error": "boom"}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
             _dispatch("beforeMCPExecution", {**mcp_common})
             _dispatch("preToolUse", {**common, "tool_use_id": "generic-1"})
-            _dispatch("afterMCPExecution", {**mcp_common, "result": "ok"})
+            _dispatch("afterMCPExecution", {**mcp_common, **dedicated_outcome})
             _dispatch(completion_event, completion)
             _dispatch(completion_event, completion)  # duplicate delivery
 
@@ -2123,11 +2127,12 @@ class TestHandlePostToolUse:
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
         assert names == ["MCP: beta", "Tool: MCP:alpha"]
 
-    def test_ambiguous_concurrent_identical_calls_keep_telemetry(self, captured_spans, monkeypatch):
-        """Two indistinguishable calls open at once must not be de-duplicated.
+    def test_concurrent_identical_calls_get_one_span_each(self, captured_spans, monkeypatch):
+        """Two identical calls in flight at once yield one span per call.
 
-        Nothing in the payloads says which invocation a result belongs to, so
-        no claim is made: an extra span is preferable to dropping a call.
+        Nothing distinguishes the invocations, but each dedicated result is
+        recorded once and each generic completion consumes one record, so the
+        pairing is one-for-one however the events interleave.
         """
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         gen = {"conversation_id": "c1", "generation_id": "g1"}
@@ -2137,12 +2142,75 @@ class TestHandlePostToolUse:
             _dispatch("preToolUse", {**generic, "tool_use_id": "one"})
             _dispatch("preToolUse", {**generic, "tool_use_id": "two"})
             _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("beforeMCPExecution", dedicated)
             _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
-            _dispatch("postToolUse", {**generic, "tool_use_id": "one", "tool_output": "r"})
+            _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
+            # Real hosts have been observed completing these in the opposite
+            # order to their preToolUse events.
             _dispatch("postToolUse", {**generic, "tool_use_id": "two", "tool_output": "r"})
+            _dispatch("postToolUse", {**generic, "tool_use_id": "one", "tool_output": "r"})
 
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
-        assert names == ["MCP: echo", "Tool: MCP:echo", "Tool: MCP:echo"]
+        assert names == ["MCP: echo", "MCP: echo"]
+
+    def test_partial_delivery_of_two_calls_keeps_both_spans(self, captured_spans, monkeypatch):
+        """One call losing its dedicated pair and another losing its generic
+        events must still produce a span each, even when they look identical.
+
+        A single open generic invocation is not evidence that a dedicated
+        result belongs to it — this is exactly the shape two half-delivered
+        calls produce. Matching on the result as well as the call keeps them
+        apart, and an unconsumed completion keeps its own span.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "same"}}
+        dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"same"}'}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            # Call A: generic events only.
+            _dispatch("preToolUse", {**generic, "tool_use_id": "A"})
+            # Call B: dedicated events only, indistinguishable by call shape.
+            _dispatch("beforeMCPExecution", dedicated)
+            _dispatch("afterMCPExecution", {**dedicated, "result": "result-B"})
+            _dispatch("postToolUse", {**generic, "tool_use_id": "A", "tool_output": "result-A"})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        assert [span["name"] for span in spans] == ["MCP: echo", "Tool: MCP:echo"]
+        assert _attrs(spans[0])["output.value"]["stringValue"] == "result-B"
+        assert _attrs(spans[1])["output.value"]["stringValue"] == "result-A"
+
+    def test_concurrent_dedicated_calls_keep_their_own_input_and_start(self, captured_spans, monkeypatch):
+        """Overlapping dedicated calls must not swap arguments or start times.
+
+        Pairing before/after by arrival order let each call adopt the other's
+        record; the after-event claims its own by content instead.
+        """
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        gen = {"conversation_id": "c1", "generation_id": "g1"}
+        alpha = {**gen, "tool_name": "alpha", "tool_input": '{"call":"A"}'}
+        beta = {**gen, "tool_name": "beta", "tool_input": '{"call":"B"}'}
+        generic_alpha = {**gen, "tool_name": "MCP:alpha", "tool_input": {"call": "A"}, "tool_use_id": "A"}
+        generic_beta = {**gen, "tool_name": "MCP:beta", "tool_input": {"call": "B"}, "tool_use_id": "B"}
+        with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", side_effect=itertools.count(1000, 10)):
+            _dispatch("preToolUse", generic_alpha)
+            _dispatch("preToolUse", generic_beta)
+            _dispatch("beforeMCPExecution", alpha)
+            _dispatch("beforeMCPExecution", beta)
+            _dispatch("afterMCPExecution", {**alpha, "result": "result-A"})
+            _dispatch("afterMCPExecution", {**beta, "result": "result-B"})
+            _dispatch("postToolUse", {**generic_alpha, "tool_output": "result-A"})
+            _dispatch("postToolUse", {**generic_beta, "tool_output": "result-B"})
+
+        spans = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for s in captured_spans]
+        by_name = {span["name"]: span for span in spans}
+        assert set(by_name) == {"MCP: alpha", "MCP: beta"}
+        for name, call, result in (("MCP: alpha", "A", "result-A"), ("MCP: beta", "B", "result-B")):
+            attrs = _attrs(by_name[name])
+            assert attrs["input.value"]["stringValue"] == f'{{"call":"{call}"}}'
+            assert attrs["output.value"]["stringValue"] == result
+        # Start times follow their own call: alpha began first, beta second.
+        assert int(by_name["MCP: alpha"]["startTimeUnixNano"]) < int(by_name["MCP: beta"]["startTimeUnixNano"])
 
     def test_sequential_identical_calls_each_correlate(self, captured_spans, monkeypatch):
         """Identical calls that do not overlap stay unambiguous one at a time.
@@ -2164,25 +2232,30 @@ class TestHandlePostToolUse:
         names = [s["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["name"] for s in captured_spans]
         assert names == ["MCP: echo", "MCP: echo"]
 
-    def test_mcp_correlation_state_never_stores_raw_invocation_ids(self, captured_spans, monkeypatch):
-        """Correlation bookkeeping persists digests only, never the raw ids."""
+    def test_mcp_correlation_state_never_stores_raw_content(self, captured_spans, monkeypatch):
+        """Correlation bookkeeping persists digests only, never ids or text."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         gen = {"conversation_id": "c1", "generation_id": "g1"}
-        generic = {"tool_name": "MCP:echo", "tool_input": {"secret": "s3cret-arg"}}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
-            _dispatch("preToolUse", {**gen, **generic, "tool_use_id": "raw-invocation-id"})
+            _dispatch("preToolUse", {**gen, "tool_name": "MCP:echo", "tool_input": {"a": 1}, "tool_use_id": "raw-id"})
+            _dispatch("beforeMCPExecution", {**gen, "tool_name": "echo", "tool_input": '{"secret":"s3cret-arg"}'})
+            _dispatch(
+                "afterMCPExecution",
+                {**gen, "tool_name": "echo", "tool_input": '{"secret":"s3cret-arg"}', "result": "s3cret-result"},
+            )
 
         files = [path for path in adapter.STATE_DIR.rglob("*") if path.is_file()]
-        persisted = "\n".join(path.read_text(errors="replace") + str(path) for path in files)
-        assert "raw-invocation-id" not in persisted
+        assert "raw-id" not in "\n".join(path.read_text(errors="replace") + str(path) for path in files)
 
-        # The correlation bookkeeping itself is digest-only: unlike the tool
-        # state file (whose captured arguments the privacy switches govern), it
-        # carries neither the invocation id nor the argument text.
-        correlation = [path for path in files if path.name.startswith("mcpopen_")]
-        assert correlation, "expected the open-invocation record to be written"
-        for path in correlation:
-            assert "s3cret-arg" not in path.read_text()
+        # Unlike the tool state file, whose captured arguments the privacy
+        # switches govern, the correlation record holds neither the arguments
+        # nor the result — only digests of them.
+        records = [path for path in files if path.name.startswith("mcpdone_")]
+        assert records, "expected the dedicated-report record to be written"
+        for path in records:
+            content = path.read_text() + str(path)
+            assert "s3cret-arg" not in content
+            assert "s3cret-result" not in content
 
     def test_post_tool_use_emits_for_unknown_tool_name(self, captured_spans, monkeypatch):
         """postToolUse emits a span for tools not in the dedup set."""

@@ -832,7 +832,9 @@ So correlation is now by *call content*, with an explicit ambiguity rule:
   invocation of that call shape is open** (`state_take_sole`, atomic under
   the stack lock). With none open — a host emitting no generic events — or
   several open, nothing is claimed and the generic spans still emit. An
-  extra span is preferable to dropping a distinct call.
+  extra span is preferable to dropping a distinct call. (**This open-set
+  mechanism was replaced in the fifth review response; "exactly one open
+  candidate" turned out not to prove correlation.**)
 - `postToolUse` / `postToolUseFailure` remove their own entry, so a finished
   invocation cannot make a later identical call look ambiguous.
 - `_generic_completion_claim_key` validates its argument is 64 hex chars, so
@@ -859,6 +861,80 @@ unit tests for `state_take_sole` and `state_discard`. The MCP fixtures now
 use the captured real payload shapes rather than hand-written ones — the old
 fixtures omitted `tool_input` on generic events, which no real host does.
 Suite: 2,187 passed; pre-commit clean.
+
+## Fifth review response (2026-07-20)
+
+Review of SHA `e9ace54` found two defects, both real and both fixed.
+
+**"Exactly one open candidate" is not proof of correlation.** The open-set
+rule read as evidence something it could not see: with call A delivering
+only its generic events and call B only its dedicated pair — same tool, same
+arguments — there is exactly one open invocation when B's result lands, so B
+claimed A and A's span was dropped. One complete dual-channel call and two
+half-delivered calls produce an identical event stream, so no rule looking
+only at *what was called* can separate them. The claim was too strong and
+the stated conservative policy ("duplicate beats loss") was violated in
+precisely the case it was meant to cover.
+
+The fix is to correlate on the result as well as the call, and to decide at
+the generic completion rather than at the dedicated result:
+
+- `afterMCPExecution` no longer suppresses anything. It records that a span
+  was emitted for `(sha256(tool_name + canonical(tool_input)),
+  sha256(canonical(result-or-error)))`.
+- `postToolUse` / `postToolUseFailure` look up that record with their *own*
+  name, arguments and output, and consume it. A record matches only a
+  completion reporting the same outcome, so a stranger's result cannot
+  silence a call. An unmatched completion keeps its span.
+- Consumption is one-for-one, so two identical concurrent calls now yield
+  one span each (two dedicated, both generics suppressed) instead of the
+  four the previous round produced. Better, and for the same reason: each
+  record is claimed exactly once.
+- `tool_output` and `result_json` being the same value on both channels is
+  the observed real-host behaviour these payload captures established. When
+  a host disagrees, the match fails and the generic span is kept — the
+  failure mode is a duplicate, which is the intended direction.
+
+`preToolUse` no longer keeps MCP bookkeeping at all, and `state_take_sole`
+/ `state_discard` were removed with it rather than left as unused API.
+
+**Dedicated before/after were still paired by arrival order.** The
+generation-wide LIFO stack meant two overlapping calls each adopted the
+other's arguments and start time — `MCP: alpha` reporting B's input while
+`MCP: beta` reported A's, with durations swapped to match. `beforeMCPExecution`
+now stamps each record with its correlation digest and `afterMCPExecution`
+claims its own via `state_pop_matching`. Hosts that omit the arguments on
+the after-event have nothing to match on and fall back to the previous
+arrival-order pairing, which is no worse than before.
+
+Regressions added, each verified to fail against `e9ace54`:
+
+- `test_partial_delivery_of_two_calls_keeps_both_spans` — the reviewer's
+  mixed-delivery probe; two spans, each with its own output.
+- `test_concurrent_dedicated_calls_keep_their_own_input_and_start` — the
+  reviewer's eight-event probe (`pre A, pre B, before A, before B, after A,
+  after B, post A, post B`) asserting name ↔ input ↔ output ↔ start time.
+- `test_concurrent_identical_calls_get_one_span_each` — replaces the
+  previous "keep telemetry" expectation with the sharper one-per-call
+  result, including the reversed completion order seen on the real host.
+- `test_mcp_correlation_state_never_stores_raw_content` — the record holds
+  no invocation id, no arguments and no result text.
+- Adapter unit tests for `state_pop_matching` (claims a buried entry, leaves
+  the stack untouched when nothing matches).
+
+Real-host re-verification (fresh bootstrap, local span sink): two sequential
+calls with different arguments produced exactly two spans, `MCP: echo_marker`
+with `{"text":"alpha"}` and with `{"text":"beta"}`, each generic follow-up
+suppressed. Both calls returned the *same* output, so this also exercises
+attribution staying correct when only the arguments differ.
+
+Suite: 2,190 passed; pre-commit clean; `git diff --check` clean.
+
+Known limitation, stated deliberately: two calls that are identical in tool
+name, arguments *and* result are indistinguishable in the hook payloads.
+They are de-duplicated one-for-one, which is correct when both are real
+calls; if such a pair were also half-delivered on both sides, one span could
+still be lost. No field in the observed payloads can separate that case.
 
 ## Safety and delivery note
 
