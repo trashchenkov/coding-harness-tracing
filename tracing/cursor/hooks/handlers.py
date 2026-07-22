@@ -1480,6 +1480,10 @@ def _dedicated_reported_key(gen_id: str, family: str, correlation: str, outcome_
     return f"dedicateddone_{generation_state_key(gen_id)}_{identity}"
 
 
+def _generic_tool_name(input_json) -> str:
+    return _jq_str(input_json, "tool_name", "toolName", "name", "tool")
+
+
 def _is_shell_generic_tool_name(tool_name: str) -> bool:
     return tool_name.lower() in {"shell", "terminal", "bash", "run_command", "run_shell"}
 
@@ -1617,7 +1621,7 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     tool_use_id = _jq_str(input_json, "tool_use_id")
     if not tool_use_id:
         return
-    tool_name = _jq_str(input_json, "tool_name")
+    tool_name = _generic_tool_name(input_json)
     tool_input_allowed = _generic_tool_input_allowed(tool_name)
     state_key = _tool_state_key(gen_id, tool_use_id)
     while state_pop(f"{state_key}_privacy"):
@@ -1637,7 +1641,7 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
 
 def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     """TOOL span for a successful generic tool call, retrying failed sends."""
-    tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
+    tool_name = _generic_tool_name(input_json)
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
     tool_input_allowed = _generic_tool_input_allowed(tool_name)
@@ -1732,7 +1736,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
 
 def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Emit a retryable TOOL span for failure, timeout, denial, or interruption."""
-    tool_name = _jq_str(input_json, "tool_name") or "unknown"
+    tool_name = _generic_tool_name(input_json) or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
     tool_input_allowed = _generic_tool_input_allowed(tool_name)

@@ -722,3 +722,33 @@ def test_failed_dedicated_shell_fallback_keeps_command_details_redacted(monkeypa
     fallback = next(_span(item) for item in exported if _span(item)["name"] == "Tool: Shell")
     assert secret not in json.dumps(fallback)
     assert _attrs(fallback)["input.value"].startswith("<redacted (")
+
+
+@pytest.mark.parametrize("name_key", ["toolName", "name", "tool"])
+def test_shell_name_aliases_keep_failed_generic_command_private(monkeypatch, _state_dir, name_key):
+    secret = f"{name_key}_FAILURE_SECRET"
+    payload = {
+        "conversation_id": "c",
+        "generation_id": "g",
+        "tool_use_id": f"shell-{name_key}",
+        name_key: "Terminal",
+        "tool_input": {"command": secret},
+    }
+    monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+
+    _dispatch("preToolUse", payload)
+    persisted = b"".join(path.read_bytes() for path in _state_dir.rglob("*") if path.is_file())
+    assert secret.encode() not in persisted
+
+    captured = []
+    with mock.patch(
+        "tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=lambda span: captured.append(span) or True
+    ):
+        _dispatch("postToolUseFailure", {**payload, "error_message": "failed"})
+
+    failure = _span(captured[-1])
+    assert failure["name"] == "Tool: Terminal"
+    assert _attrs(failure)["tool.name"] == "Terminal"
+    assert secret not in json.dumps(failure)
+    assert _attrs(failure)["input.value"].startswith("<redacted (")
