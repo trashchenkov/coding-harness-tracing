@@ -18,6 +18,7 @@ Turn CHAIN root for the pending turn.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from typing import Any, Optional
@@ -118,20 +119,83 @@ def _send_span_async(span_dict: dict) -> None:
 
 
 def _text_of(parts: list) -> str:
-    """Concatenate the text of all TextPart entries in `parts`."""
+    """Concatenate well-formed TextPart strings, skipping malformed leaves."""
     chunks = []
     for p in parts or []:
         if not isinstance(p, dict):
             continue
         if p.get("type") == "text":
-            t = p.get("text") or ""
-            if t:
-                chunks.append(t)
+            text = p.get("text")
+            if isinstance(text, str) and text:
+                chunks.append(text)
     return "".join(chunks)
+
+
+def _string_value(value: Any, default: str = "") -> str:
+    """Return a safe string representation for an untrusted SDK leaf value."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return default
+    try:
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        return default
+
+
+def _timestamp_value(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """Coerce an SDK timestamp without allowing malformed leaves to abort close."""
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _integer_value(value: Any, default: int = 0) -> int:
+    """Coerce an integer counter, rejecting malformed and non-finite leaves."""
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _tool_parts(parts: list) -> list:
     return [p for p in (parts or []) if isinstance(p, dict) and p.get("type") == "tool"]
+
+
+def _validated_messages(messages: Any, session_id: str) -> Optional[list[dict]]:
+    """Return an SDK snapshot only when every record belongs to one session.
+
+    Snapshot ownership is a privacy boundary: never relabel foreign messages or
+    parts with the enclosing session ID. Nested containers used by the
+    reconciler are validated here as well so malformed SDK data fails closed.
+    """
+    if not session_id or not isinstance(messages, list):
+        return None
+    for message in messages:
+        if not isinstance(message, dict):
+            return None
+        info = message.get("info")
+        parts = message.get("parts")
+        if not isinstance(info, dict) or not isinstance(parts, list):
+            return None
+        message_id = info.get("id")
+        if not message_id or info.get("sessionID") != session_id:
+            return None
+        if not isinstance(info.get("time") or {}, dict):
+            return None
+        tokens = info.get("tokens") or {}
+        if not isinstance(tokens, dict) or not isinstance(tokens.get("cache") or {}, dict):
+            return None
+        for part in parts:
+            if not isinstance(part, dict):
+                return None
+            if part.get("sessionID") != session_id:
+                return None
+            state = part.get("state") or {}
+            if not isinstance(state, dict) or not isinstance(state.get("time") or {}, dict):
+                return None
+    return messages
 
 
 def _message_span_id(state: StateManager, message_id: str) -> str:
@@ -247,8 +311,8 @@ def _open_turn_if_new(state: StateManager, user_info: dict, user_parts: list) ->
     state.set("current_trace_id", generate_trace_id())
     state.set("current_trace_span_id", generate_span_id())
 
-    t_created = (user_info.get("time") or {}).get("created")
-    start_ms = str(t_created) if t_created is not None else str(get_timestamp_ms())
+    t_created = _timestamp_value((user_info.get("time") or {}).get("created"), get_timestamp_ms())
+    start_ms = str(t_created)
     state.set("current_trace_start_time", start_ms)
     state.set("current_trace_prompt", _text_of(user_parts))
     state.increment("trace_count")
@@ -302,7 +366,7 @@ def _emit_llm_span(
     session_id_override: str = "",
     prompt_override: Optional[str] = None,
 ) -> None:
-    msg_id = info.get("id") or ""
+    msg_id = info.get("id") if isinstance(info.get("id"), str) else ""
     if not msg_id:
         return
     if state.get(f"emitted_msg_{msg_id}") is not None:
@@ -317,40 +381,27 @@ def _emit_llm_span(
     project_name = state.get("project_name") or ""
     user_id = state.get("user_id") or ""
 
-    model_id = info.get("modelID") or ""
-    provider_id = info.get("providerID") or ""
+    model_id = _string_value(info.get("modelID"))
+    provider_id = _string_value(info.get("providerID"))
     tokens = info.get("tokens") or {}
     cache = tokens.get("cache") or {}
-    try:
-        input_tokens = int(tokens.get("input") or 0)
-    except (TypeError, ValueError):
-        input_tokens = 0
-    try:
-        output_tokens = int(tokens.get("output") or 0)
-    except (TypeError, ValueError):
-        output_tokens = 0
-    try:
-        reasoning_tokens = int(tokens.get("reasoning") or 0)
-    except (TypeError, ValueError):
-        reasoning_tokens = 0
-    try:
-        cache_read = int(cache.get("read") or 0)
-    except (TypeError, ValueError):
-        cache_read = 0
-    try:
-        cache_write = int(cache.get("write") or 0)
-    except (TypeError, ValueError):
-        cache_write = 0
+    input_tokens = _integer_value(tokens.get("input"))
+    output_tokens = _integer_value(tokens.get("output"))
+    reasoning_tokens = _integer_value(tokens.get("reasoning"))
+    cache_read = _integer_value(cache.get("read"))
+    cache_write = _integer_value(cache.get("write"))
     try:
         cost = float(info.get("cost") or 0)
     except (TypeError, ValueError):
         cost = 0.0
+    if not math.isfinite(cost):
+        cost = 0.0
 
     time_block = info.get("time") or {}
-    start_ms = time_block.get("created")
-    end_ms = time_block.get("completed")
+    start_ms = _timestamp_value(time_block.get("created"))
     if start_ms is None:
         start_ms = get_timestamp_ms()
+    end_ms = _timestamp_value(time_block.get("completed"))
     if end_ms is None:
         end_ms = start_ms
 
@@ -421,7 +472,7 @@ def _emit_tool_span(
     turn_span_id_override: str = "",
     session_id_override: str = "",
 ) -> None:
-    call_id = tool_part.get("callID") or ""
+    call_id = tool_part.get("callID") if isinstance(tool_part.get("callID"), str) else ""
     if not call_id:
         return
     if state.get(f"emitted_tool_{call_id}") is not None:
@@ -440,14 +491,15 @@ def _emit_tool_span(
     # ToolPart.messageID is authoritative in the OpenCode SDK. Validate it
     # against the containing assistant message before reserving an LLM parent;
     # malformed or legacy payloads retain an honest Turn-root fallback.
-    tool_message_id = tool_part.get("messageID") or ""
-    tool_session_id = tool_part.get("sessionID") or ""
-    if (
+    tool_message_id = tool_part.get("messageID") if isinstance(tool_part.get("messageID"), str) else ""
+    tool_session_id = tool_part.get("sessionID") if isinstance(tool_part.get("sessionID"), str) else ""
+    message_link_is_authoritative = bool(
         assistant_message_id
         and assistant_session_id
         and tool_message_id == assistant_message_id
         and tool_session_id == assistant_session_id
-    ):
+    )
+    if message_link_is_authoritative and state.get(f"emitted_msg_{tool_message_id}") is not None:
         parent_span_id = _message_span_id(state, assistant_message_id)
         parentage = "assistant_message"
     else:
@@ -458,23 +510,23 @@ def _emit_tool_span(
     project_name = state.get("project_name") or ""
     user_id = state.get("user_id") or ""
 
-    tool_name = tool_part.get("tool") or "unknown"
+    tool_name = _string_value(tool_part.get("tool"), "unknown") or "unknown"
     tool_input = tstate.get("input") or {}
 
     time_block = tstate.get("time") or {}
-    start_ms = time_block.get("start")
-    end_ms = time_block.get("end")
+    start_ms = _timestamp_value(time_block.get("start"))
     if start_ms is None:
         start_ms = get_timestamp_ms()
+    end_ms = _timestamp_value(time_block.get("end"))
     if end_ms is None:
         end_ms = start_ms
 
     is_error = status == "error"
     if is_error:
-        output_raw = tstate.get("error") or ""
+        output_raw = _string_value(tstate.get("error"))
     else:
-        output_raw = tstate.get("output") or ""
-    title_raw = tstate.get("title") or ""
+        output_raw = _string_value(tstate.get("output"))
+    title_raw = _string_value(tstate.get("title"))
 
     input_json_str = json.dumps(tool_input) if isinstance(tool_input, (dict, list)) else str(tool_input)
 
@@ -515,7 +567,7 @@ def _emit_tool_span(
         status_message=status_message,
     )
     _send_span_async(span)
-    if parentage == "assistant_message":
+    if message_link_is_authoritative:
         state.set(f"tool_session_{call_id}", assistant_session_id)
         state.set(f"tool_trace_{call_id}", trace_id)
         state.set(f"tool_turn_span_{call_id}", turn_span_id)
@@ -528,19 +580,63 @@ def _emit_tool_span(
 # ---------------------------------------------------------------------------
 
 
+_PENDING_CHILD_FINALIZERS = "pending_child_finalizers"
+
+
+def _pending_child_finalizers(state: StateManager) -> dict[str, dict]:
+    raw = state.get(_PENDING_CHILD_FINALIZERS) or ""
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _remember_child_finalizer(state: StateManager, child: dict, info: dict) -> None:
+    child_session_id = child.get("sessionID")
+    if not isinstance(child_session_id, str) or not child_session_id:
+        return
+    pending = _pending_child_finalizers(state)
+    pending[child_session_id] = {
+        "sessionID": child_session_id,
+        "parentSessionID": child.get("parentSessionID"),
+        "parentCallID": child.get("parentCallID"),
+        "info": {
+            "id": info.get("id"),
+            "parentID": info.get("parentID"),
+            "time": info.get("time") if isinstance(info.get("time"), dict) else {},
+            "agent": info.get("agent"),
+        },
+        "messages": [],
+    }
+    state.set(_PENDING_CHILD_FINALIZERS, json.dumps(pending, separators=(",", ":"), sort_keys=True))
+
+
+def _forget_child_finalizer(state: StateManager, child_session_id: str) -> None:
+    pending = _pending_child_finalizers(state)
+    if pending.pop(child_session_id, None) is None:
+        return
+    if pending:
+        state.set(_PENDING_CHILD_FINALIZERS, json.dumps(pending, separators=(",", ":"), sort_keys=True))
+    else:
+        state.delete(_PENDING_CHILD_FINALIZERS)
+
+
 def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: bool = False) -> None:
     """Emit one child AGENT subtree linked to its authoritative task call."""
-    child_session_id = child.get("sessionID") or ""
-    parent_call_id = child.get("parentCallID") or ""
+    child_session_id = child.get("sessionID") if isinstance(child.get("sessionID"), str) else ""
+    parent_call_id = child.get("parentCallID") if isinstance(child.get("parentCallID"), str) else ""
+    transport_parent_session = child.get("parentSessionID") if isinstance(child.get("parentSessionID"), str) else ""
     if not child_session_id or not parent_call_id:
         return
     if state.get(f"emitted_tool_{parent_call_id}") is None:
         return
 
     info = child.get("info") or {}
+    if not isinstance(info, dict):
+        return
     expected_parent_session = state.get(f"tool_session_{parent_call_id}") or ""
-    transport_parent_session = child.get("parentSessionID") or ""
-    sdk_parent_session = info.get("parentID") or ""
+    sdk_parent_session = info.get("parentID") if isinstance(info.get("parentID"), str) else ""
     if (
         not expected_parent_session
         or transport_parent_session != expected_parent_session
@@ -554,7 +650,11 @@ def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: boo
     if not trace_id or not task_turn_span_id:
         return
 
-    messages = child.get("messages") or []
+    messages = _validated_messages(child.get("messages"), child_session_id)
+    if messages is None:
+        return
+    if not finalize_agent and state.get(f"emitted_agent_{child_session_id}") is None:
+        _remember_child_finalizer(state, child, info)
     agent_span_id = _agent_span_id(state, child_session_id)
     prompt = ""
     final_output = ""
@@ -576,13 +676,13 @@ def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: boo
 
     if finalize_agent and state.get(f"emitted_agent_{child_session_id}") is None:
         time_block = info.get("time") or {}
-        start_ms = time_block.get("created")
-        end_ms = time_block.get("updated") or final_completed
+        start_ms = _timestamp_value(time_block.get("created"))
+        end_ms = _timestamp_value(time_block.get("updated")) or _timestamp_value(final_completed)
         if start_ms is None:
             start_ms = get_timestamp_ms()
         if end_ms is None:
             end_ms = start_ms
-        agent_name = info.get("agent") or "subagent"
+        agent_name = _string_value(info.get("agent"), "subagent") or "subagent"
         attrs: dict[str, Any] = {
             "session.id": child_session_id,
             "session.parent_id": child.get("parentSessionID") or info.get("parentID") or "",
@@ -609,6 +709,8 @@ def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: boo
         )
         _send_span_async(span)
         state.set(f"emitted_agent_{child_session_id}", "1")
+    if finalize_agent and state.get(f"emitted_agent_{child_session_id}") is not None:
+        _forget_child_finalizer(state, child_session_id)
 
     for message in messages:
         if not isinstance(message, dict):
@@ -640,9 +742,22 @@ def _emit_child_session(state: StateManager, child: dict, *, finalize_agent: boo
 
 
 def _reconcile_child_sessions(state: StateManager, child_sessions: list, *, finalize_agents: bool = False) -> None:
-    for child in child_sessions or []:
+    if not isinstance(child_sessions, list):
+        return
+    for child in child_sessions:
         if isinstance(child, dict):
-            _emit_child_session(state, child, finalize_agent=finalize_agents)
+            try:
+                _emit_child_session(state, child, finalize_agent=finalize_agents)
+            except Exception:
+                # One malformed/vanished child must not prevent root close.
+                continue
+    if finalize_agents:
+        for child in list(_pending_child_finalizers(state).values()):
+            if isinstance(child, dict):
+                try:
+                    _emit_child_session(state, child, finalize_agent=True)
+                except Exception:
+                    continue
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +813,10 @@ def _handle_reconcile(input_json: dict) -> None:
     state = resolve_session(input_json)
     ensure_session_initialized(state, input_json)
 
-    messages = input_json.get("messages") or []
+    snapshot_session_id = input_json.get("sessionID") or ""
+    messages = _validated_messages(input_json.get("messages"), snapshot_session_id)
+    if messages is None:
+        return
     _reconcile_messages(state, messages)
     _reconcile_child_sessions(state, input_json.get("childSessions") or [])
 
@@ -709,7 +827,10 @@ def _handle_close(input_json: dict) -> None:
     state = resolve_session(input_json)
     ensure_session_initialized(state, input_json)
 
-    messages = input_json.get("messages") or []
+    snapshot_session_id = input_json.get("sessionID") or ""
+    messages = _validated_messages(input_json.get("messages"), snapshot_session_id)
+    if messages is None:
+        return
     final = _reconcile_messages(state, messages)
     _reconcile_child_sessions(state, input_json.get("childSessions") or [], finalize_agents=True)
 
@@ -774,11 +895,12 @@ def main() -> None:
         if not isinstance(input_json, dict) or not input_json:
             return
 
-        lock_state = resolve_session(input_json)
+        lock_state = resolve_session(input_json, initialize=False)
         if lock_state.state_file is None:
             return
         handler_lock = lock_state.state_file.with_name(lock_state.state_file.name + ".handler.lock")
         with FileLock(handler_lock, timeout=30.0, break_on_timeout=False):
+            lock_state.init_state()
             kind = input_json.get("type")
             if kind == "reconcile":
                 try:

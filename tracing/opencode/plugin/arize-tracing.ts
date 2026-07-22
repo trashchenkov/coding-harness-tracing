@@ -53,10 +53,22 @@ export const ArizeTracing = async (ctx: any) => {
     return data?.id === expectedID ? data : undefined
   }
 
-  function successfulMessages(response: any): any[] | undefined {
+  function successfulMessages(response: any, expectedID: string): any[] | undefined {
     if (response?.error) return undefined
     const data = response?.data ?? response
-    return Array.isArray(data) ? data : undefined
+    if (!Array.isArray(data)) return undefined
+    for (const message of data) {
+      if (!message || typeof message !== "object" || Array.isArray(message)) return undefined
+      const info = message.info
+      const parts = message.parts
+      if (!info || typeof info !== "object" || Array.isArray(info) || !Array.isArray(parts)) return undefined
+      if (!info.id || info.sessionID !== expectedID) return undefined
+      for (const part of parts) {
+        if (!part || typeof part !== "object" || Array.isArray(part)) return undefined
+        if (part.sessionID !== expectedID) return undefined
+      }
+    }
+    return data
   }
 
   async function fetchChildSessions(messages: any[], seen = new Set<string>()): Promise<any[]> {
@@ -75,7 +87,7 @@ export const ArizeTracing = async (ctx: any) => {
             client.session.messages({ path: { id: childSessionID } }),
           ])
           const info = successfulSession(sessionRes, childSessionID)
-          const childMessages = successfulMessages(messagesRes)
+          const childMessages = successfulMessages(messagesRes, childSessionID)
           if (!info || !childMessages || !info.parentID || info.parentID !== part?.sessionID) continue
           children.push({
             sessionID: childSessionID,
@@ -100,7 +112,7 @@ export const ArizeTracing = async (ctx: any) => {
       const sessionInfo = successfulSession(sessionInfoRes, sessionID)
       if (!sessionInfo || sessionInfo.parentID) return
       const res = await client.session.messages({ path: { id: sessionID } })
-      const messages = successfulMessages(res)
+      const messages = successfulMessages(res, sessionID)
       if (!messages) return
       const childSessions = await fetchChildSessions(messages)
       const type = kind
