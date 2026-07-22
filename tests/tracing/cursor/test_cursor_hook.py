@@ -954,24 +954,25 @@ class TestHandleStop:
         cleanup.assert_called_once_with("g1")
 
     @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
-    def test_terminal_transport_exception_retries_before_cleanup(self, monkeypatch, event):
+    def test_terminal_transport_exception_is_not_replayed_before_cleanup(self, monkeypatch, event):
+        """An exception has an ambiguous remote outcome, so at-most-once wins."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
             mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None),
             mock.patch(
                 "tracing.cursor.hooks.handlers.send_span",
-                side_effect=[RuntimeError("send failed"), True],
+                side_effect=RuntimeError("outcome unknown"),
             ) as send,
             mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation") as cleanup,
         ):
-            with pytest.raises(RuntimeError, match="send failed"):
+            with pytest.raises(RuntimeError, match="outcome unknown"):
                 _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
             cleanup.assert_not_called()
             assert adapter.generation_is_completed("g1") is False
             _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
 
-        assert send.call_count == 2
+        assert send.call_count == 1
         cleanup.assert_called_once_with("g1")
         assert adapter.generation_is_completed("g1") is True
 
@@ -1153,7 +1154,7 @@ class TestHandleStop:
 class TestHandleBeforeShellExecution:
 
     def test_pushes_state(self, monkeypatch):
-        """Pushes command, cwd, start_ms, trace_id, conversation_id to state."""
+        """Pushes only completion-required shell state; omits raw context."""
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
@@ -1173,8 +1174,9 @@ class TestHandleBeforeShellExecution:
         key, value = push_mock.call_args[0]
         assert key == f"shell_{adapter.generation_state_key('gen-1')}"
         assert value["command"] == "ls -la"
-        assert value["cwd"] == "/home"
         assert value["start_ms"] == "1000"
+        assert "cwd" not in value
+        assert "conversation_id" not in value
 
     def test_no_gen_id_returns_early(self, monkeypatch):
         """Without gen_id, returns without pushing state."""
@@ -1254,12 +1256,16 @@ class TestHandleBeforeMcpExecution:
                 },
             )
 
-        push_mock.assert_called_once()
-        key, value = push_mock.call_args[0]
+        assert push_mock.call_count == 2
+        key, value = push_mock.call_args_list[0].args
         assert key == f"mcp_{adapter.generation_state_key('gen-1')}"
         assert value["tool_name"] == "search"
         assert value["tool_input"] == '{"query": "test"}'
         assert value["start_ms"] == "1500"
+        assert "conversation_id" not in value
+        open_key, open_value = push_mock.call_args_list[1].args
+        assert open_key.startswith(f"mcpopen_{adapter.generation_state_key('gen-1')}_")
+        assert open_value == {"pair_token": value["pair_token"]}
 
     def test_no_gen_id_returns_early(self, monkeypatch):
         """Without gen_id, returns without pushing state."""
@@ -2249,19 +2255,19 @@ class TestHandlePostToolUse:
     def test_concurrent_identical_calls_get_one_span_each(self, captured_spans, monkeypatch):
         """Two identical calls in flight at once yield one span per call.
 
-        Nothing distinguishes the invocations, but each dedicated result is
-        recorded once and each generic completion consumes one record, so the
-        pairing is one-for-one however the events interleave.
+        Each dedicated before-hook is paired to the subsequent generic
+        ``tool_use_id`` before either result arrives, so reverse completion
+        order cannot collapse or duplicate an invocation.
         """
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         gen = {"conversation_id": "c1", "generation_id": "g1"}
         generic = {**gen, "tool_name": "MCP:echo", "tool_input": {"text": "same"}}
         dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"same"}'}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
+            _dispatch("beforeMCPExecution", dedicated)
             _dispatch("preToolUse", {**generic, "tool_use_id": "one"})
+            _dispatch("beforeMCPExecution", dedicated)
             _dispatch("preToolUse", {**generic, "tool_use_id": "two"})
-            _dispatch("beforeMCPExecution", dedicated)
-            _dispatch("beforeMCPExecution", dedicated)
             _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
             _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
             # Real hosts have been observed completing these in the opposite
@@ -2312,10 +2318,10 @@ class TestHandlePostToolUse:
         generic_alpha = {**gen, "tool_name": "MCP:alpha", "tool_input": {"call": "A"}, "tool_use_id": "A"}
         generic_beta = {**gen, "tool_name": "MCP:beta", "tool_input": {"call": "B"}, "tool_use_id": "B"}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", side_effect=itertools.count(1000, 10)):
-            _dispatch("preToolUse", generic_alpha)
-            _dispatch("preToolUse", generic_beta)
             _dispatch("beforeMCPExecution", alpha)
+            _dispatch("preToolUse", generic_alpha)
             _dispatch("beforeMCPExecution", beta)
+            _dispatch("preToolUse", generic_beta)
             _dispatch("afterMCPExecution", {**alpha, "result": "result-A"})
             _dispatch("afterMCPExecution", {**beta, "result": "result-B"})
             _dispatch("postToolUse", {**generic_alpha, "tool_output": "result-A"})
@@ -2343,8 +2349,8 @@ class TestHandlePostToolUse:
         dedicated = {**gen, "tool_name": "echo", "tool_input": '{"text":"same"}'}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
             for invocation in ("one", "two"):
-                _dispatch("preToolUse", {**generic, "tool_use_id": invocation})
                 _dispatch("beforeMCPExecution", dedicated)
+                _dispatch("preToolUse", {**generic, "tool_use_id": invocation})
                 _dispatch("afterMCPExecution", {**dedicated, "result": "r"})
                 _dispatch("postToolUse", {**generic, "tool_use_id": invocation, "tool_output": "r"})
 
@@ -2356,8 +2362,16 @@ class TestHandlePostToolUse:
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         gen = {"conversation_id": "c1", "generation_id": "g1"}
         with mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=3000):
-            _dispatch("preToolUse", {**gen, "tool_name": "MCP:echo", "tool_input": {"a": 1}, "tool_use_id": "raw-id"})
             _dispatch("beforeMCPExecution", {**gen, "tool_name": "echo", "tool_input": '{"secret":"s3cret-arg"}'})
+            _dispatch(
+                "preToolUse",
+                {
+                    **gen,
+                    "tool_name": "MCP:echo",
+                    "tool_input": {"secret": "s3cret-arg"},
+                    "tool_use_id": "raw-id",
+                },
+            )
             _dispatch(
                 "afterMCPExecution",
                 {**gen, "tool_name": "echo", "tool_input": '{"secret":"s3cret-arg"}', "result": "s3cret-result"},

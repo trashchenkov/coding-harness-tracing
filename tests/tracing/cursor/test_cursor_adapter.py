@@ -127,6 +127,17 @@ class TestStateStack:
     def test_pop_matching_empty_returns_none(self):
         assert adapter.state_pop_matching("nonexistent", "correlation", "aaa") is None
 
+    def test_pop_singleton_claims_only_an_unambiguous_stack(self):
+        adapter.state_push("single", {"val": "A"})
+        assert adapter.state_pop_singleton("single") == {"val": "A"}
+        assert adapter.state_pop_singleton("single") is None
+
+        adapter.state_push("ambiguous", {"val": "A"})
+        adapter.state_push("ambiguous", {"val": "B"})
+        assert adapter.state_pop_singleton("ambiguous") is None
+        assert adapter.state_pop("ambiguous") == {"val": "B"}
+        assert adapter.state_pop("ambiguous") == {"val": "A"}
+
     def test_pop_empty_returns_none(self):
         assert adapter.state_pop("nonexistent") is None
 

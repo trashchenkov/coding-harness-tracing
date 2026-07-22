@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from tracing.cursor.hooks import adapter
+from tracing.cursor.hooks import adapter, handlers
 from tracing.cursor.hooks.handlers import _dispatch, _subagent_state_key, _tool_state_key
 
 
@@ -752,3 +752,151 @@ def test_shell_name_aliases_keep_failed_generic_command_private(monkeypatch, _st
     assert _attrs(failure)["tool.name"] == "Terminal"
     assert secret not in json.dumps(failure)
     assert _attrs(failure)["input.value"].startswith("<redacted (")
+
+
+def test_reserved_delivery_retries_confirmed_false_but_not_post_success_marker_failure(monkeypatch):
+    calls = []
+    key = "transport_fault_injection"
+
+    attempted, completed = adapter.state_complete_once(
+        key, lambda: calls.append("false") or False, reserve_before_operation=True
+    )
+    assert (attempted, completed) == (True, False)
+
+    real_write = adapter._write_private_text
+    failed_marker_once = False
+
+    def fail_first_delivered_marker(path, text):
+        nonlocal failed_marker_once
+        if path.name.endswith(".delivered") and not failed_marker_once:
+            failed_marker_once = True
+            raise OSError("marker unavailable after transport")
+        return real_write(path, text)
+
+    monkeypatch.setattr(adapter, "_write_private_text", fail_first_delivered_marker)
+    with pytest.raises(OSError, match="marker unavailable"):
+        adapter.state_complete_once(key, lambda: calls.append("sent") or True, reserve_before_operation=True)
+
+    attempted, completed = adapter.state_complete_once(
+        key, lambda: calls.append("duplicate") or True, reserve_before_operation=True
+    )
+    assert (attempted, completed) == (False, True)
+    assert calls == ["false", "sent"]
+
+
+def test_reserved_delivery_does_not_replay_ambiguous_transport_exception():
+    calls = []
+    key = "transport_ambiguous_exception"
+
+    def ambiguous_send():
+        calls.append("sent_or_accepted")
+        raise RuntimeError("connection closed after request")
+
+    with pytest.raises(RuntimeError, match="connection closed"):
+        adapter.state_complete_once(key, ambiguous_send, reserve_before_operation=True)
+
+    attempted, completed = adapter.state_complete_once(
+        key, lambda: calls.append("duplicate") or True, reserve_before_operation=True
+    )
+    assert (attempted, completed) == (False, True)
+    assert calls == ["sent_or_accepted"]
+
+
+def test_mcp_pairing_does_not_consume_identical_earlier_generic_call(captured_spans):
+    generic = {
+        "conversation_id": "c1",
+        "generation_id": "g1",
+        "tool_name": "MCP:foo",
+        "tool_input": {"value": "same"},
+        "tool_use_id": "generic-A",
+    }
+    dedicated = {
+        "conversation_id": "c1",
+        "generation_id": "g1",
+        "tool_name": "foo",
+        "tool_input": '{"value":"same"}',
+    }
+
+    _dispatch("preToolUse", generic)
+    _dispatch("beforeMCPExecution", dedicated)
+    _dispatch("afterMCPExecution", {**dedicated, "result": "same-result"})
+    _dispatch("postToolUse", {**generic, "tool_output": "same-result"})
+
+    names = [_span(payload)["name"] for payload in captured_spans]
+    assert names == ["MCP: foo", "Tool: MCP:foo"]
+
+
+def test_ambiguous_overlapping_mcp_pairs_fail_toward_both_spans(captured_spans):
+    common = {
+        "conversation_id": "c1",
+        "generation_id": "g1",
+        "tool_name": "foo",
+        "tool_input": '{"value":"same"}',
+    }
+    generic_a = {
+        **common,
+        "tool_name": "MCP:foo",
+        "tool_input": {"value": "same"},
+        "tool_use_id": "generic-A",
+    }
+
+    _dispatch("beforeMCPExecution", common)  # dedicated A
+    _dispatch("beforeMCPExecution", common)  # dedicated B
+    _dispatch("preToolUse", generic_a)  # only generic A arrives
+    _dispatch("afterMCPExecution", {**common, "result": "same-result"})  # only dedicated B completes
+    _dispatch("postToolUse", {**generic_a, "tool_output": "same-result"})
+
+    names = [_span(payload)["name"] for payload in captured_spans]
+    assert names == ["MCP: foo", "Tool: MCP:foo"]
+
+
+def test_mcp_transport_is_not_replayed_after_report_marker_failure(captured_spans):
+    dedicated = {
+        "conversation_id": "c1",
+        "generation_id": "g1",
+        "tool_name": "foo",
+        "tool_input": '{"value":"same"}',
+    }
+    generic = {
+        **dedicated,
+        "tool_name": "MCP:foo",
+        "tool_input": {"value": "same"},
+        "tool_use_id": "generic-A",
+    }
+    original_complete_once = handlers.state_complete_once
+    reported_calls = 0
+
+    def fail_first_post_transport_report(key, operation, **kwargs):
+        nonlocal reported_calls
+        if key.startswith("dedicateddone_"):
+            reported_calls += 1
+            if reported_calls == 2:
+                raise OSError("injected report-marker failure")
+        return original_complete_once(key, operation, **kwargs)
+
+    _dispatch("beforeMCPExecution", dedicated)
+    _dispatch("preToolUse", generic)
+    with mock.patch.object(handlers, "state_complete_once", side_effect=fail_first_post_transport_report):
+        with pytest.raises(OSError, match="report-marker"):
+            _dispatch("afterMCPExecution", {**dedicated, "result": "same-result"})
+        _dispatch("afterMCPExecution", {**dedicated, "result": "same-result"})
+        _dispatch("postToolUse", {**generic, "tool_output": "same-result"})
+
+    names = [_span(payload)["name"] for payload in captured_spans]
+    assert names == ["MCP: foo"]
+
+
+def test_deferred_shell_and_mcp_state_omit_raw_conversation_and_cwd(_state_dir):
+    conversation = "CONVERSATION_RAW_SENTINEL"
+    cwd = "/tmp/CWD_RAW_SENTINEL"
+    common = {"conversation_id": conversation, "generation_id": "g1"}
+
+    _dispatch("beforeShellExecution", {**common, "command": "true", "cwd": cwd})
+    _dispatch(
+        "beforeMCPExecution",
+        {**common, "tool_name": "foo", "tool_input": "{}", "cwd": cwd},
+    )
+
+    persisted = "\n".join(path.read_text(errors="replace") for path in _state_dir.rglob("*") if path.is_file())
+    assert conversation not in persisted
+    assert cwd not in persisted

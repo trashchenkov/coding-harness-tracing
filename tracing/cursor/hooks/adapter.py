@@ -780,29 +780,55 @@ def state_claim_once(key: str) -> bool:
     return True
 
 
-def state_complete_once(key: str, operation) -> "tuple[bool, bool]":
-    """Run ``operation`` once, recording completion only after it returns true."""
+def state_complete_once(key: str, operation, *, reserve_before_operation: bool = False) -> "tuple[bool, bool]":
+    """Run ``operation`` once and durably track its completion.
+
+    Transport-only callers may reserve before sending.  A surviving reservation
+    represents an ambiguous prior send and is finalized without replay, which
+    preserves at-most-once delivery.  Confirmed ``False`` results release the
+    reservation and remain retryable.  Orchestration callers keep the default
+    post-success marker semantics so later bookkeeping exceptions can retry.
+    """
     state_parent = _state_parent_for_key(key)
     marker = state_parent / f"{key}.delivered"
+    reservation = state_parent / f"{key}.sending"
     lock_path = state_parent / f".lock_{key}_delivery"
     _ensure_private_file(lock_path)
     with FileLock(lock_path):
         if _read_private_text(marker) is not None:
             return False, True
-        completed = bool(operation())
-        if completed:
+        if reserve_before_operation and _read_private_text(reservation) is not None:
             _write_private_text(marker, "1")
-        return True, completed
+            reservation.unlink(missing_ok=True)
+            return False, True
+        if reserve_before_operation:
+            _write_private_text(reservation, "1")
+        try:
+            completed = bool(operation())
+        except Exception:
+            # The transport outcome is ambiguous. Keep its reservation so a
+            # later hook finalizes the marker without risking a duplicate send.
+            if not reserve_before_operation:
+                reservation.unlink(missing_ok=True)
+            raise
+        if not completed:
+            reservation.unlink(missing_ok=True)
+            return True, False
+        _write_private_text(marker, "1")
+        reservation.unlink(missing_ok=True)
+        return True, True
 
 
 def state_forget_completion(key: str) -> None:
     """Remove a delivered marker after a stronger durable claim is committed."""
     state_parent = _state_parent_for_key(key)
     marker = state_parent / f"{key}.delivered"
+    reservation = state_parent / f"{key}.sending"
     lock_path = state_parent / f".lock_{key}_delivery"
     _ensure_private_file(lock_path)
     with FileLock(lock_path):
         marker.unlink(missing_ok=True)
+        reservation.unlink(missing_ok=True)
 
 
 def state_peek_all(key: str) -> list[dict]:
@@ -822,6 +848,27 @@ def state_peek_all(key: str) -> list[dict]:
         if not isinstance(data, list):
             return []
         return [entry for entry in data if isinstance(entry, dict)]
+
+
+def state_pop_singleton(key: str) -> "dict | None":
+    """Pop only when a stack contains exactly one dict; leave ambiguity intact."""
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
+    _ensure_private_file(lock_path)
+
+    with FileLock(lock_path):
+        serialized = _read_private_text(stack_file)
+        if serialized is None:
+            return None
+        try:
+            data = json.loads(serialized) or []
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            return None
+        stack_file.unlink(missing_ok=True)
+        return data[0]
 
 
 def state_pop(key: str) -> "dict | None":

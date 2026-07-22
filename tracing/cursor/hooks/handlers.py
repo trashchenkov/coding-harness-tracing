@@ -43,6 +43,7 @@ from tracing.cursor.hooks.adapter import (
     state_peek_all,
     state_pop,
     state_pop_matching,
+    state_pop_singleton,
     state_push,
     trace_id_from_generation,
     truncate_attr,
@@ -476,7 +477,7 @@ def _flush_deferred_root_spans(
             SCOPE_NAME,
         )
         delivery_key = f"rootdelivered_{generation_state_key(gen_id)}_{entry.get('span_id', '')}"
-        _, delivered = state_complete_once(delivery_key, lambda: send_span(span))
+        _, delivered = state_complete_once(delivery_key, lambda: send_span(span), reserve_before_operation=True)
         if not delivered:
             return False
         state_pop(root_key)
@@ -636,7 +637,6 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
         return
 
     command = _jq_str(input_json, "command", "shell_command")
-    cwd = _jq_str(input_json, "cwd", "working_directory")
     command_allowed = env.log_tool_details
 
     correlation = stable_digest(command)
@@ -646,10 +646,8 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
             "correlation": correlation,
             "command": redact_content(command_allowed, command),
             "command_redacted": not command_allowed,
-            "cwd": cwd,
             "start_ms": str(now_ms),
             "trace_id": trace_id,
-            "conversation_id": conversation_id,
         },
     )
     log(f"beforeShellExecution: pushed state for gen={gen_id}")
@@ -755,6 +753,8 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
     mcp_cmd = _jq_str(input_json, "command")
     tool_content_allowed = env.log_tool_content
     state_key = _mcp_pair_state_key(gen_id)
+    correlation = _mcp_correlation_digest(tool_name, tool_input)
+    pair_token = os.urandom(16).hex()
 
     state_push(
         state_key,
@@ -762,7 +762,8 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
             # Stamped so the after-event can claim *this* record instead of
             # whatever is on top of the stack. Derived here, where the
             # arguments are still raw, and stored only as a digest.
-            "correlation": _mcp_correlation_digest(tool_name, tool_input),
+            "correlation": correlation,
+            "pair_token": pair_token,
             "tool_name": tool_name,
             "tool_input": redact_content(tool_content_allowed, tool_input),
             "tool_input_redacted": not tool_content_allowed,
@@ -770,9 +771,9 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
             "command": redact_content(env.log_tool_details, mcp_cmd),
             "start_ms": str(now_ms),
             "trace_id": trace_id,
-            "conversation_id": conversation_id,
         },
     )
+    state_push(_mcp_open_pair_key(gen_id, correlation), {"pair_token": pair_token})
     log(f"beforeMCPExecution: pushed state for gen={gen_id}")
 
 
@@ -799,6 +800,18 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
             popped = state_pop_matching(state_key, "correlation", _mcp_correlation_digest(after_tool, after_input))
         else:
             popped = state_pop(state_key)
+
+    pair_token = popped.get("pair_token", "") if popped else ""
+    binding_key = _mcp_pair_binding_key(gen_id, pair_token) if pair_token and gen_id else ""
+    invocation_binding = None
+    if pair_token and gen_id:
+        state_pop_matching(
+            _mcp_open_pair_key(gen_id, popped.get("correlation", "") if popped else ""),
+            "pair_token",
+            pair_token,
+        )
+        bindings = state_peek_all(binding_key)
+        invocation_binding = bindings[0] if len(bindings) == 1 else None
 
     if popped:
         start_ms = popped.get("start_ms", "")
@@ -865,27 +878,69 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
         status_code=2 if raw_error else 1,
         status_message=truncate_attr(error_message, 256) if raw_error else "",
     )
-    sent = send_span(span)
-    if sent and gen_id and after_tool:
-        # Record that this exact call — arguments and result — has a span. The
-        # generic follow-up decides for itself whether it is the same call, by
-        # matching its own result against this record. Nothing is suppressed
-        # here, so a dedicated pair can never silence an unrelated invocation.
-        #
-        # Only a confirmed export records anything: the marker asserts that a
-        # span exists, and a backend that reported failure did not create one.
-        # Leaving it unwritten lets the generic completion act as the fallback
-        # it naturally is, rather than being suppressed by a span that was
-        # never delivered.
-        state_push(
-            _mcp_dedicated_reported_key(
-                gen_id,
-                _mcp_correlation_digest(after_tool, after_input),
-                _mcp_outcome_digest(bool(raw_error), raw_error or raw_result),
-            ),
-            {"reported": True},
-        )
+    invocation_digest = (
+        invocation_binding.get("invocation_digest", "")
+        if invocation_binding
+        else (popped.get("invocation_digest", "") if popped else "")
+    )
+    if popped is not None and invocation_digest:
+        # Keep only the digest in retryable pair state so a bookkeeping failure
+        # after binding cleanup still cannot turn the retry into a replay.
+        popped["invocation_digest"] = invocation_digest
+    reported_key = _mcp_invocation_reported_key(gen_id, invocation_digest) if gen_id and invocation_digest else ""
+    delivery_identity = invocation_digest or (stable_digest(pair_token) if pair_token else "")
+    delivery_key = (
+        f"mcpdelivery_{generation_state_key(gen_id)}_{delivery_identity}" if gen_id and delivery_identity else ""
+    )
+
+    def restore_pair(*, reopen: bool) -> None:
+        if popped is None or not state_key:
+            return
+        state_push(state_key, popped)
+        if reopen and pair_token and gen_id and not invocation_binding:
+            state_push(
+                _mcp_open_pair_key(gen_id, popped.get("correlation", "")),
+                {"pair_token": pair_token},
+            )
+
+    try:
+        already_reported = False
+        if reported_key:
+            _, already_reported = state_complete_once(reported_key, lambda: False)
+
+        if already_reported:
+            sent = True
+        elif delivery_key:
+            _, sent = state_complete_once(
+                delivery_key,
+                lambda: send_span(span),
+                reserve_before_operation=True,
+            )
+        else:
+            sent = send_span(span)
+
+        if not sent:
+            # A confirmed rejection is retryable. Restore the before-record and,
+            # when no generic invocation is already bound, reopen pairing too.
+            restore_pair(reopen=True)
+            return False
+
+        if reported_key and not already_reported:
+            # This durable marker is the stronger claim that lets a retry finish
+            # bookkeeping without replaying an already accepted transport.
+            state_complete_once(reported_key, lambda: True)
+        if binding_key:
+            state_pop(binding_key)
+        if delivery_key:
+            state_forget_completion(delivery_key)
+    except Exception:
+        # Preserve the pair for a retry. A surviving transport reservation (or
+        # reported marker) makes that retry finalize without another send.
+        restore_pair(reopen=False)
+        raise
+
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
+    return True
 
 
 def _file_tool_correlation(payload) -> str:
@@ -1123,7 +1178,7 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs, conversatio
             SCOPE_NAME,
         )
         delivery_key = f"llmdelivered_{generation_state_key(gen_id)}_{entry.get('span_id', '')}"
-        _, delivered = state_complete_once(delivery_key, lambda: send_span(llm_span))
+        _, delivered = state_complete_once(delivery_key, lambda: send_span(llm_span), reserve_before_operation=True)
         if not delivered:
             return sent_entries, False
         sent_entries.append(entry)
@@ -1229,7 +1284,7 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     )
     terminal_delivery_key = f"terminaltransport_{generation_state_key(gen_id)}_stop" if gen_id else ""
     if terminal_delivery_key:
-        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span))
+        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span), reserve_before_operation=True)
     else:
         sent = send_span(span)
     if (
@@ -1373,7 +1428,7 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     )
     terminal_delivery_key = f"terminaltransport_{generation_state_key(gen_id)}_session_end" if gen_id else ""
     if terminal_delivery_key:
-        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span))
+        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span), reserve_before_operation=True)
     else:
         sent = send_span(span)
     if (
@@ -1458,6 +1513,21 @@ def _mcp_pair_state_key(gen_id: str) -> str:
     return f"mcp_{generation_state_key(gen_id)}"
 
 
+def _mcp_open_pair_key(gen_id: str, correlation: str) -> str:
+    """Pending dedicated calls eligible for a later generic pre-hook."""
+    return f"mcpopen_{generation_state_key(gen_id)}_{correlation}"
+
+
+def _mcp_pair_binding_key(gen_id: str, pair_token: str) -> str:
+    """Authoritative generic invocation bound to one dedicated pair."""
+    return f"mcpbind_{generation_state_key(gen_id)}_{pair_token}"
+
+
+def _mcp_invocation_reported_key(gen_id: str, invocation_digest: str) -> str:
+    """Confirmed dedicated delivery keyed by generic ``tool_use_id`` digest."""
+    return _dedicated_reported_key(gen_id, "mcp-invocation", invocation_digest, "")
+
+
 def _mcp_outcome_digest(failed: bool, outcome) -> str:
     """Digest of how a call ended, the field both channels report identically.
 
@@ -1467,11 +1537,6 @@ def _mcp_outcome_digest(failed: bool, outcome) -> str:
     """
     domain = "failure" if failed else "success"
     return stable_digest(f"{domain}\0{_canonical_tool_input(outcome)}")
-
-
-def _mcp_dedicated_reported_key(gen_id: str, correlation: str, outcome_digest: str) -> str:
-    """Key recording that a dedicated MCP span already reported one exact call."""
-    return _dedicated_reported_key(gen_id, "mcp", correlation, outcome_digest)
 
 
 def _dedicated_reported_key(gen_id: str, family: str, correlation: str, outcome_digest: str) -> str:
@@ -1534,7 +1599,13 @@ def _dedicated_file_family(tool_name: str) -> str:
 
 
 def _dedicated_span_already_reported(
-    gen_id: str, tool_name: str, tool_input, failed: bool, outcome, file_correlation: str = ""
+    gen_id: str,
+    tool_name: str,
+    tool_input,
+    failed: bool,
+    outcome,
+    file_correlation: str = "",
+    tool_use_id: str = "",
 ) -> bool:
     """Whether a dedicated span already reported *this exact* generic call.
 
@@ -1548,9 +1619,13 @@ def _dedicated_span_already_reported(
     if not gen_id:
         return False
     if _is_mcp_generic_tool_name(tool_name):
-        correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), tool_input)
-        key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(failed, outcome))
-        return state_pop(key) is not None
+        if not tool_use_id:
+            return False
+        key = _mcp_invocation_reported_key(gen_id, stable_digest(tool_use_id))
+        _, reported = state_complete_once(key, lambda: False)
+        if reported:
+            state_forget_completion(key)
+        return reported
     if _is_shell_generic_tool_name(tool_name):
         command = _shell_command_from_generic(tool_input)
         if not command or failed:
@@ -1636,6 +1711,15 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
             "file_correlation": _file_tool_correlation(input_json),
         },
     )
+    if _is_mcp_generic_tool_name(tool_name):
+        correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), input_json.get("tool_input"))
+        open_pair = state_pop_singleton(_mcp_open_pair_key(gen_id, correlation))
+        pair_token = open_pair.get("pair_token", "") if open_pair else ""
+        if pair_token:
+            state_push(
+                _mcp_pair_binding_key(gen_id, pair_token),
+                {"invocation_digest": stable_digest(tool_use_id)},
+            )
     log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
 
 
@@ -1666,6 +1750,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
             False,
             raw_output,
             popped.get("file_correlation", "") if popped else "",
+            tool_use_id,
         ):
             if state_key:
                 state_pop(state_key)
@@ -1764,7 +1849,14 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
         duration = _to_int(input_json.get("duration"))
         start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
 
-        if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), True, raw_error):
+        if _dedicated_span_already_reported(
+            gen_id,
+            tool_name,
+            input_json.get("tool_input"),
+            True,
+            raw_error,
+            tool_use_id=tool_use_id,
+        ):
             if state_key:
                 state_pop(state_key)
             log(f"postToolUseFailure: skipping {tool_name!r} — exact call already reported by dedicated span")
