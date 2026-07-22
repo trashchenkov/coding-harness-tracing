@@ -32,11 +32,15 @@ from tracing.cursor.hooks.adapter import (
     generation_state_key,
     generation_terminal_attribution_get,
     generation_terminal_attribution_note_usage,
+    generation_terminal_event_is_claimable,
     span_id_16,
     stable_digest,
     state_claim_once,
     state_cleanup_generation,
     state_cleanup_generation_digest,
+    state_complete_once,
+    state_forget_completion,
+    state_peek_all,
     state_pop,
     state_pop_matching,
     state_push,
@@ -186,6 +190,19 @@ def _to_int(v):
         return None
 
 
+def _to_token_int(value):
+    """Accept only non-negative integral token counters (numeric strings included)."""
+    if isinstance(value, bool) or value in (None, "", "--"):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        converted = int(value)
+    except (TypeError, ValueError):
+        return None
+    return converted if converted >= 0 else None
+
+
 def _event_name(input_json: dict) -> str:
     """Extract event name, preferring Cursor's documented snake_case key.
 
@@ -300,9 +317,20 @@ def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> No
                 if completion_status != "active":
                     log(f"Ignoring {event} without generation: {completion_status}")
                     return
-                # Claim before terminal telemetry effects. No generation-scoped
-                # cleanup is possible because this degraded payload has no generation.
+                delivery_key = f"terminalfallback_{fallback_digest}"
+                _, delivered = state_complete_once(
+                    delivery_key,
+                    lambda: handler(input_json, conversation_id, gen_id, trace_id, now_ms),
+                )
+                if not delivered:
+                    log(f"Retaining retryable generationless {event} after transport failure")
+                    return
+                # Bridge transport success to the durable claim without replay:
+                # if the ledger write fails, retry sees this raw-free marker and
+                # commits the claim without resending the terminal span.
                 generation_mark_digest_completed(fallback_digest)
+                state_forget_completion(delivery_key)
+                return
             else:
                 completion_status = generation_completion_status("")
                 if completion_status != "active":
@@ -311,22 +339,29 @@ def _dispatch(event: str, input_json: dict, *, sweep_pending: bool = True) -> No
             handler(input_json, conversation_id, gen_id, trace_id, now_ms)
         return
 
-    # A bounded striped guard makes completion-check → handler atomic with
-    # stop's mark → cleanup sequence. The global ledger guard additionally
-    # orders every handler against saturation transitions across generations.
+    # Serialize terminal delivery attempts, and keep the global ledger guard
+    # across check → send → claim so a successful transport cannot race another
+    # process into a duplicate claim.
     with generation_guard(gen_id):
         with completion_ledger_guard():
             if event in {"stop", "sessionEnd"}:
-                # Claim each distinct terminal event at most once while also
-                # completing the generation and queuing cleanup atomically.
-                if not generation_claim_terminal_event(gen_id, event):
+                if not generation_terminal_event_is_claimable(gen_id, event):
                     log(f"Ignoring duplicate or unclaimable {event} for generation")
                     return
-                try:
-                    handler(input_json, conversation_id, gen_id, trace_id, now_ms)
-                finally:
-                    state_cleanup_generation(gen_id)
-                    generation_mark_cleanup_done(stable_digest(gen_id))
+                delivery_key = f"terminalsend_{generation_state_key(gen_id)}_{event}"
+                _, delivered = state_complete_once(
+                    delivery_key,
+                    lambda: handler(input_json, conversation_id, gen_id, trace_id, now_ms),
+                )
+                if not delivered:
+                    log(f"Retaining retryable {event} state after transport failure")
+                    return
+                if not generation_claim_terminal_event(gen_id, event):
+                    log(f"Unable to record delivered {event} for generation")
+                    return
+                state_forget_completion(delivery_key)
+                state_cleanup_generation(gen_id)
+                generation_mark_cleanup_done(stable_digest(gen_id))
             else:
                 completion_status = generation_completion_status(gen_id)
                 if completion_status != "active":
@@ -573,12 +608,11 @@ def _handle_before_shell_execution(input_json, conversation_id, gen_id, trace_id
     cwd = _jq_str(input_json, "cwd", "working_directory")
     command_allowed = env.log_tool_details
 
-    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}"
-    while state_pop(privacy_key):
-        pass
+    correlation = stable_digest(command)
     state_push(
         f"shell_{generation_state_key(gen_id)}",
         {
+            "correlation": correlation,
             "command": redact_content(command_allowed, command),
             "command_redacted": not command_allowed,
             "cwd": cwd,
@@ -594,8 +628,16 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     """Merge with before state, create TOOL span. Replaces bash lines 184-232."""
     sid = span_id_16()
     parent = gen_root_span_get(gen_id)
-    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}" if gen_id else ""
-    popped = state_pop(f"shell_{generation_state_key(gen_id)}") if gen_id else None
+    shell_key = f"shell_{generation_state_key(gen_id)}" if gen_id else ""
+    after_cmd = _jq_str(input_json, "command", "shell_command")
+    correlation = stable_digest(after_cmd) if after_cmd else ""
+    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}_{correlation}" if gen_id and correlation else ""
+    if shell_key and correlation:
+        popped = state_pop_matching(shell_key, "correlation", correlation)
+    else:
+        # No identity means shell pairing is ambiguous; retain the historical
+        # LIFO fallback, but do not borrow another invocation's tombstone.
+        popped = state_pop(shell_key) if shell_key else None
     privacy_state = state_pop(privacy_key) if privacy_key else None
 
     if popped:
@@ -618,7 +660,6 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
 
     # Use the after-event command only when creation-time state did not redact
     # it. A terminal payload must not reverse an earlier privacy decision.
-    after_cmd = _jq_str(input_json, "command", "shell_command")
     if after_cmd and not command_was_redacted:
         command = after_cmd
 
@@ -660,7 +701,12 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    if sent and gen_id and correlation:
+        state_push(
+            _dedicated_reported_key(gen_id, "shell", correlation, _mcp_outcome_digest(False, raw_output)),
+            {"reported": True},
+        )
     log(f"afterShellExecution: span {sid} (merged)")
 
 
@@ -675,8 +721,6 @@ def _handle_before_mcp_execution(input_json, conversation_id, gen_id, trace_id, 
     mcp_cmd = _jq_str(input_json, "command")
     tool_content_allowed = env.log_tool_content
     state_key = _mcp_pair_state_key(gen_id)
-    while state_pop(f"{state_key}_privacy"):
-        pass
 
     state_push(
         state_key,
@@ -728,8 +772,10 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     else:
         start_ms = ""
         tool_name = ""
+    correlation = _mcp_correlation_digest(after_tool, after_input) if has_after_identity else ""
+    privacy_state_key = f"{state_key}_{correlation}" if state_key and correlation else state_key
     tool_input, tool_input_redacted = (
-        _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+        _tool_input_with_privacy_provenance(privacy_state_key, popped) if privacy_state_key else ("", False)
     )
     # Without a before-record the after payload's own arguments are the only
     # description of the call, and the elapsed time is unknown.
@@ -744,8 +790,8 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
 
     raw_result = _jq_str(input_json, "result", "output", "result_json")
     result = (
-        _redact_terminal_field(f"{state_key}_privacy", "result", raw_result, env.log_tool_content)[0]
-        if state_key
+        _redact_terminal_field(f"{privacy_state_key}_privacy", "result", raw_result, env.log_tool_content)[0]
+        if privacy_state_key
         else redact_content(env.log_tool_content, raw_result)
     )
 
@@ -981,14 +1027,9 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
     stack — otherwise a sessionEnd-first ordering would delete the pending
     entries before stop could emit them. Returns the flushed entries.
     """
-    llm_entries = []
-    if gen_id:
-        llm_key = f"llm_{generation_state_key(gen_id)}"
-        while True:
-            entry = state_pop(llm_key)
-            if entry is None:
-                break
-            llm_entries.append(entry)
+    llm_key = f"llm_{generation_state_key(gen_id)}" if gen_id else ""
+    llm_entries = list(reversed(state_peek_all(llm_key))) if llm_key else []
+    sent_entries = []
 
     for idx, entry in enumerate(llm_entries):
         entry_conv_id = entry.get("conversation_id")
@@ -1027,9 +1068,14 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
             SERVICE_NAME,
             SCOPE_NAME,
         )
-        send_span(llm_span)
+        if not send_span(llm_span):
+            return sent_entries, False
+        state_pop(llm_key)
+        sent_entries.append(entry)
+        if idx == 0 and any(key.startswith("llm.token_count.") for key in token_attrs):
+            generation_terminal_attribution_note_usage(gen_id)
 
-    return llm_entries
+    return sent_entries, True
 
 
 def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
@@ -1045,13 +1091,13 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     # Token counts from stop payload
     # Use explicit None checks — 0 is a valid token count but falsy with ``or``
     _inp_tok = input_json.get("input_tokens")
-    prompt_tokens = _to_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
+    prompt_tokens = _to_token_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
     _out_tok = input_json.get("output_tokens")
-    completion_tokens = _to_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
+    completion_tokens = _to_token_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
     _cr_tok = input_json.get("cache_read_tokens")
-    cache_read = _to_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
+    cache_read = _to_token_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
     _cw_tok = input_json.get("cache_write_tokens")
-    cache_write = _to_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
+    cache_write = _to_token_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
     model = _jq_str(input_json, "model")
     _dur = input_json.get("duration_ms")
     duration_ms = _to_int(_dur if _dur is not None else input_json.get("durationMs"))
@@ -1081,7 +1127,11 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     # parent first. Cumulative usage is attributed at most once per generation:
     # a terminal event that arrives after usage was already attributed carries
     # the same counts again and must not re-attach them anywhere.
-    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs)
+    llm_entries, flush_complete = _flush_deferred_llm_spans(
+        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs
+    )
+    if not flush_complete:
+        return False
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1103,9 +1153,6 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     # Fallback (no afterAgentResponse, e.g. CLI): keep token attrs on Agent Stop.
     if not usage_attributed and not llm_entries:
         attrs.update(token_attrs)
-    if not usage_attributed and any(key.startswith("llm.token_count.") for key in token_attrs):
-        generation_terminal_attribution_note_usage(gen_id)
-
     span = build_span(
         "Agent Stop",
         "CHAIN",
@@ -1118,8 +1165,16 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    if (
+        sent
+        and not usage_attributed
+        and not llm_entries
+        and any(key.startswith("llm.token_count.") for key in token_attrs)
+    ):
+        generation_terminal_attribution_note_usage(gen_id)
     log(f"stop: span {sid}, gen={gen_id}")
+    return sent
 
 
 def _handle_session_start(input_json, conversation_id, gen_id, trace_id, now_ms):
@@ -1184,13 +1239,13 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     # as _handle_stop: ``prompt`` is the total (uncached input + cache buckets),
     # cache split reported via ``prompt_details.*`` subsets.
     _inp_tok = input_json.get("input_tokens")
-    prompt_tokens = _to_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
+    prompt_tokens = _to_token_int(_inp_tok if _inp_tok is not None else input_json.get("inputTokens"))
     _out_tok = input_json.get("output_tokens")
-    completion_tokens = _to_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
+    completion_tokens = _to_token_int(_out_tok if _out_tok is not None else input_json.get("outputTokens"))
     _cr_tok = input_json.get("cache_read_tokens")
-    cache_read = _to_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
+    cache_read = _to_token_int(_cr_tok if _cr_tok is not None else input_json.get("cacheReadTokens"))
     _cw_tok = input_json.get("cache_write_tokens")
-    cache_write = _to_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
+    cache_write = _to_token_int(_cw_tok if _cw_tok is not None else input_json.get("cacheWriteTokens"))
     token_attrs = {}
     prompt_total = None
     if prompt_tokens is not None:
@@ -1209,7 +1264,11 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
 
     # Flush deferred LLM span(s) before Session End so strict OTLP backends see
     # parent first. Same at-most-once usage attribution as _handle_stop.
-    llm_entries = _flush_deferred_llm_spans(gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs)
+    llm_entries, flush_complete = _flush_deferred_llm_spans(
+        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs
+    )
+    if not flush_complete:
+        return False
 
     attrs = {
         "openinference.span.kind": "CHAIN",
@@ -1231,9 +1290,6 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     # Fallback (no deferred afterAgentResponse): keep token attrs on Session End.
     if not usage_attributed and not llm_entries:
         attrs.update(token_attrs)
-    if not usage_attributed and any(key.startswith("llm.token_count.") for key in token_attrs):
-        generation_terminal_attribution_note_usage(gen_id)
-
     span = build_span(
         "Session End",
         "CHAIN",
@@ -1246,8 +1302,16 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    if (
+        sent
+        and not usage_attributed
+        and not llm_entries
+        and any(key.startswith("llm.token_count.") for key in token_attrs)
+    ):
+        generation_terminal_attribution_note_usage(gen_id)
     log(f"sessionEnd: span {sid}, gen={gen_id}")
+    return sent
 
 
 _DEDICATED_TOOL_NAMES = frozenset(
@@ -1331,14 +1395,27 @@ def _mcp_outcome_digest(failed: bool, outcome) -> str:
 
 
 def _mcp_dedicated_reported_key(gen_id: str, correlation: str, outcome_digest: str) -> str:
-    """Key recording that a dedicated span already reported one exact call.
+    """Key recording that a dedicated MCP span already reported one exact call."""
+    return _dedicated_reported_key(gen_id, "mcp", correlation, outcome_digest)
 
-    Correlation is ``(what was called, what came back)``. Two separate calls
-    only collide here when their arguments *and* their results are identical,
-    at which point one span per call is still what gets emitted — the records
-    are consumed one-for-one.
-    """
-    return f"mcpdone_{generation_state_key(gen_id)}_{stable_digest(correlation + outcome_digest)}"
+
+def _dedicated_reported_key(gen_id: str, family: str, correlation: str, outcome_digest: str) -> str:
+    """Raw-free marker for a confirmed dedicated span and exact outcome."""
+    identity = stable_digest(f"{family}\0{correlation}\0{outcome_digest}")
+    return f"dedicateddone_{generation_state_key(gen_id)}_{identity}"
+
+
+def _shell_command_from_generic(tool_input) -> str:
+    if isinstance(tool_input, dict):
+        return _jq_str(tool_input, "command", "shell_command")
+    if isinstance(tool_input, str):
+        try:
+            parsed = json.loads(tool_input)
+        except (TypeError, ValueError):
+            return tool_input
+        if isinstance(parsed, dict):
+            return _jq_str(parsed, "command", "shell_command")
+    return ""
 
 
 def _generic_completion_claim_key(gen_id: str, invocation_digest: str) -> str:
@@ -1365,11 +1442,21 @@ def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, fa
     the record makes the match one-for-one, so an unmatched completion keeps
     its span rather than being suppressed by a stranger's result.
     """
-    if not gen_id or not _is_mcp_generic_tool_name(tool_name):
+    if not gen_id:
         return False
-    correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), tool_input)
-    key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(failed, outcome))
-    return state_pop(key) is not None
+    if _is_mcp_generic_tool_name(tool_name):
+        correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), tool_input)
+        key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(failed, outcome))
+        return state_pop(key) is not None
+    if tool_name.lower() in {"shell", "terminal", "bash", "run_command", "run_shell"}:
+        command = _shell_command_from_generic(tool_input)
+        if not command or failed:
+            # Dedicated shell failures have no dedicated failure event in the
+            # current contract; missing command identity stays fail-closed.
+            return False
+        key = _dedicated_reported_key(gen_id, "shell", stable_digest(command), _mcp_outcome_digest(False, outcome))
+        return state_pop(key) is not None
+    return False
 
 
 def _claim_generic_completion(gen_id: str, tool_use_id: str) -> bool:
@@ -1440,151 +1527,168 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
 
 
 def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """TOOL span for a successful generic tool call."""
+    """TOOL span for a successful generic tool call, retrying failed sends."""
     tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
-    popped = state_pop(state_key) if state_key else None
 
-    # Dedicated hooks provide richer fields. Still pop generic state so a host
-    # emitting both APIs does not leave dangling files.
-    if tool_name.lower() in _DEDICATED_TOOL_NAMES:
-        log(f"postToolUse: skipping {tool_name!r} — covered by dedicated handler")
-        return
-    if not _claim_generic_completion(gen_id, tool_use_id):
-        log(f"postToolUse: skipping {tool_name!r} — completion already claimed for this invocation")
-        return
+    def deliver() -> bool:
+        popped_entries = state_peek_all(state_key) if state_key else []
+        popped = popped_entries[-1] if popped_entries else None
+        # Legacy completion-only dedicated events have no correlatable generic
+        # invocation. Keep suppressing those, while a real preToolUse record is
+        # allowed to provide fallback telemetry when no rich span was delivered.
+        if tool_name.lower() in _DEDICATED_TOOL_NAMES and popped is None:
+            log(f"postToolUse: skipping {tool_name!r} — uncorrelatable dedicated completion")
+            return True
 
-    raw_output = input_json.get("tool_output")
-    if raw_output is None:
-        raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
-    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), False, raw_output):
-        log(f"postToolUse: skipping {tool_name!r} — this exact call already reported by its dedicated span")
-        return
+        raw_output = input_json.get("tool_output")
+        if raw_output is None:
+            raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
+        if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), False, raw_output):
+            if state_key:
+                state_pop(state_key)
+            log(f"postToolUse: skipping {tool_name!r} — exact call already reported by dedicated span")
+            return True
 
-    sid = span_id_16()
-    parent = gen_root_span_get(gen_id) if gen_id else ""
-    tool_input, input_is_redacted = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
-    if not tool_input and not input_is_redacted:
-        raw_input = input_json.get("tool_input")
-        if raw_input is None:
-            raw_input = _jq_str(input_json, "toolInput", "input", "arguments", "args")
-        serialized_input = _json_string(raw_input)
-        tool_input = (
-            _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
-            if state_key
-            else redact_content(env.log_tool_content, serialized_input)
+        sid = span_id_16()
+        parent = gen_root_span_get(gen_id) if gen_id else ""
+        tool_input, input_is_redacted = (
+            _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
         )
-    serialized_output = _json_string(raw_output)
-    output = (
-        _redact_terminal_field(f"{state_key}_privacy", "tool_output", serialized_output, env.log_tool_content)[0]
-        if state_key
-        else redact_content(env.log_tool_content, serialized_output)
-    )
-    duration = _to_int(input_json.get("duration"))
-    start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+        if not tool_input and not input_is_redacted:
+            raw_input = input_json.get("tool_input")
+            if raw_input is None:
+                raw_input = _jq_str(input_json, "toolInput", "input", "arguments", "args")
+            serialized_input = _json_string(raw_input)
+            tool_input = (
+                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+                if state_key
+                else redact_content(env.log_tool_content, serialized_input)
+            )
+        serialized_output = _json_string(raw_output)
+        output = (
+            _redact_terminal_field(f"{state_key}_privacy", "tool_output", serialized_output, env.log_tool_content)[0]
+            if state_key
+            else redact_content(env.log_tool_content, serialized_output)
+        )
+        duration = _to_int(input_json.get("duration"))
+        start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
 
-    attrs = {
-        "openinference.span.kind": "TOOL",
-        "session.id": conversation_id,
-    }
-    if conversation_id:
-        attrs["cursor.conversation.id"] = conversation_id
-    user_id = _resolve_user_id(input_json)
-    if user_id:
-        attrs["user.id"] = user_id
-    if tool_name:
-        attrs["tool.name"] = tool_name
-    if tool_input:
-        attrs["input.value"] = tool_input
-    if output:
-        attrs["output.value"] = output
+        attrs = {"openinference.span.kind": "TOOL", "session.id": conversation_id}
+        if conversation_id:
+            attrs["cursor.conversation.id"] = conversation_id
+        user_id = _resolve_user_id(input_json)
+        if user_id:
+            attrs["user.id"] = user_id
+        if tool_name:
+            attrs["tool.name"] = tool_name
+        if tool_input:
+            attrs["input.value"] = tool_input
+        if output:
+            attrs["output.value"] = output
 
-    span = build_span(
-        f"Tool: {tool_name}" if tool_name else "Tool Use",
-        "TOOL",
-        sid,
-        trace_id,
-        parent,
-        start_ms,
-        now_ms,
-        attrs,
-        SERVICE_NAME,
-        SCOPE_NAME,
-    )
-    send_span(span)
-    log(f"postToolUse: span {sid} (tool={tool_name})")
+        span = build_span(
+            f"Tool: {tool_name}" if tool_name else "Tool Use",
+            "TOOL",
+            sid,
+            trace_id,
+            parent,
+            start_ms,
+            now_ms,
+            attrs,
+            SERVICE_NAME,
+            SCOPE_NAME,
+        )
+        sent = send_span(span)
+        if sent and state_key:
+            state_pop(state_key)
+        if sent:
+            log(f"postToolUse: span {sid} (tool={tool_name})")
+        return sent
+
+    if gen_id and tool_use_id:
+        state_complete_once(_generic_completion_claim_key(gen_id, stable_digest(tool_use_id)), deliver)
+    else:
+        deliver()
 
 
 def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id, now_ms):
-    """Emit a TOOL span for failures, timeouts, denial, or interruption."""
+    """Emit a retryable TOOL span for failure, timeout, denial, or interruption."""
     tool_name = _jq_str(input_json, "tool_name") or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
-    popped = state_pop(state_key) if state_key else None
-    tool_input, input_is_redacted = _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
-    if not tool_input and not input_is_redacted:
-        serialized_input = _json_string(input_json.get("tool_input"))
-        tool_input = (
-            _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
-            if state_key
-            else redact_content(env.log_tool_content, serialized_input)
+
+    def deliver() -> bool:
+        popped_entries = state_peek_all(state_key) if state_key else []
+        popped = popped_entries[-1] if popped_entries else None
+        tool_input, input_is_redacted = (
+            _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
         )
-    raw_error = _jq_str(input_json, "error_message")
-    error_message = (
-        _redact_terminal_field(f"{state_key}_privacy", "error_message", raw_error, env.log_tool_content)[0]
-        if state_key
-        else redact_content(env.log_tool_content, raw_error)
-    )
-    failure_type = _jq_str(input_json, "failure_type")
-    duration = _to_int(input_json.get("duration"))
-    start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
+        if not tool_input and not input_is_redacted:
+            serialized_input = _json_string(input_json.get("tool_input"))
+            tool_input = (
+                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+                if state_key
+                else redact_content(env.log_tool_content, serialized_input)
+            )
+        raw_error = _jq_str(input_json, "error_message")
+        error_message = (
+            _redact_terminal_field(f"{state_key}_privacy", "error_message", raw_error, env.log_tool_content)[0]
+            if state_key
+            else redact_content(env.log_tool_content, raw_error)
+        )
+        failure_type = _jq_str(input_json, "failure_type")
+        duration = _to_int(input_json.get("duration"))
+        start_ms = popped.get("start_ms", now_ms) if popped else now_ms - max(duration or 0, 0)
 
-    # Generic state above is still popped so no dangling files remain, but an
-    # earlier delivery of this invocation must not produce a second span.
-    if not _claim_generic_completion(gen_id, tool_use_id):
-        log(f"postToolUseFailure: skipping {tool_name!r} — completion already claimed for this invocation")
-        return
+        if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), True, raw_error):
+            if state_key:
+                state_pop(state_key)
+            log(f"postToolUseFailure: skipping {tool_name!r} — exact call already reported by dedicated span")
+            return True
 
-    # A dedicated span that already reported this exact failure covers it.
-    if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), True, raw_error):
-        log(f"postToolUseFailure: skipping {tool_name!r} — this exact call already reported by its dedicated span")
-        return
+        attrs = {
+            "openinference.span.kind": "TOOL",
+            "tool.name": tool_name,
+            "input.value": tool_input,
+            "output.value": error_message,
+            "session.id": conversation_id,
+            "cursor.tool.status": "error",
+            "cursor.tool.failure_type": failure_type,
+            "cursor.tool.is_interrupt": bool(input_json.get("is_interrupt", False)),
+        }
+        if conversation_id:
+            attrs["cursor.conversation.id"] = conversation_id
+        user_id = _resolve_user_id(input_json)
+        if user_id:
+            attrs["user.id"] = user_id
 
-    attrs = {
-        "openinference.span.kind": "TOOL",
-        "tool.name": tool_name,
-        "input.value": tool_input,
-        "output.value": error_message,
-        "session.id": conversation_id,
-        "cursor.tool.status": "error",
-        "cursor.tool.failure_type": failure_type,
-        "cursor.tool.is_interrupt": bool(input_json.get("is_interrupt", False)),
-    }
-    if conversation_id:
-        attrs["cursor.conversation.id"] = conversation_id
-    user_id = _resolve_user_id(input_json)
-    if user_id:
-        attrs["user.id"] = user_id
+        span = build_span(
+            f"Tool: {tool_name}",
+            "TOOL",
+            span_id_16(),
+            trace_id,
+            gen_root_span_get(gen_id) if gen_id else "",
+            start_ms,
+            now_ms,
+            attrs,
+            SERVICE_NAME,
+            SCOPE_NAME,
+            status_code=2,
+            status_message=truncate_attr(error_message, 256),
+        )
+        sent = send_span(span)
+        if sent and state_key:
+            state_pop(state_key)
+        if sent:
+            log(f"postToolUseFailure: span for tool={tool_name}")
+        return sent
 
-    span = build_span(
-        f"Tool: {tool_name}",
-        "TOOL",
-        span_id_16(),
-        trace_id,
-        gen_root_span_get(gen_id) if gen_id else "",
-        start_ms,
-        now_ms,
-        attrs,
-        SERVICE_NAME,
-        SCOPE_NAME,
-        # OTLP ERROR status so backends count these in error metrics instead
-        # of rendering failures as OK; the message is already privacy-redacted.
-        status_code=2,
-        status_message=truncate_attr(error_message, 256),
-    )
-    send_span(span)
-    log(f"postToolUseFailure: span for tool={tool_name}")
+    if gen_id and tool_use_id:
+        state_complete_once(_generic_completion_claim_key(gen_id, stable_digest(tool_use_id)), deliver)
+    else:
+        deliver()
 
 
 def _subagent_state_key(gen_id: str, subagent_type: str, task: str) -> str:

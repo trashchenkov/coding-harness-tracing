@@ -338,8 +338,10 @@ class TestDispatch:
                     "generation_id": "g1",
                 },
             )
-            # stop flushes the deferred LLM span (Agent Response) and emits Agent Stop.
-            assert send_mock.call_count == 3
+            # The deferred LLM transport failed, so terminal delivery is not
+            # attempted and retryable generation state is retained.
+            assert send_mock.call_count == 2
+            assert adapter.generation_is_completed("g1") is False
 
 
 # ---------------------------------------------------------------------------
@@ -929,38 +931,47 @@ class TestHandleStop:
         assert "cursor.stop.loop_count" not in attr_keys
 
     @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
-    def test_terminal_mark_failure_precedes_state_mutation_and_send(self, monkeypatch, event):
+    def test_terminal_claim_failure_retries_without_resending(self, monkeypatch, event):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
             mock.patch(
                 "tracing.cursor.hooks.handlers.generation_claim_terminal_event",
-                side_effect=sqlite3.OperationalError("database is locked"),
+                side_effect=[sqlite3.OperationalError("database is locked"), True],
             ) as mark,
             mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None) as pop,
-            mock.patch("tracing.cursor.hooks.handlers.send_span") as send,
+            mock.patch("tracing.cursor.hooks.handlers.send_span", return_value=True) as send,
             mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation") as cleanup,
         ):
             with pytest.raises(sqlite3.OperationalError, match="database is locked"):
                 _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
+            _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
 
-        mark.assert_called_once_with("g1", event)
+        assert mark.call_count == 2
+        mark.assert_called_with("g1", event)
         pop.assert_not_called()
-        send.assert_not_called()
-        cleanup.assert_not_called()
+        send.assert_called_once()
+        cleanup.assert_called_once_with("g1")
 
     @pytest.mark.parametrize("event", ["stop", "sessionEnd"])
-    def test_terminal_post_claim_exception_still_cleans_state(self, monkeypatch, event):
+    def test_terminal_transport_exception_retries_before_cleanup(self, monkeypatch, event):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         with (
             mock.patch("tracing.cursor.hooks.handlers.get_timestamp_ms", return_value=1000),
             mock.patch("tracing.cursor.hooks.handlers.state_pop", return_value=None),
-            mock.patch("tracing.cursor.hooks.handlers.send_span", side_effect=RuntimeError("send failed")),
+            mock.patch(
+                "tracing.cursor.hooks.handlers.send_span",
+                side_effect=[RuntimeError("send failed"), True],
+            ) as send,
             mock.patch("tracing.cursor.hooks.handlers.state_cleanup_generation") as cleanup,
         ):
             with pytest.raises(RuntimeError, match="send failed"):
                 _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
+            cleanup.assert_not_called()
+            assert adapter.generation_is_completed("g1") is False
+            _dispatch(event, {"conversation_id": "c1", "generation_id": "g1"})
 
+        assert send.call_count == 2
         cleanup.assert_called_once_with("g1")
         assert adapter.generation_is_completed("g1") is True
 
@@ -2358,8 +2369,8 @@ class TestHandlePostToolUse:
         # Unlike the tool state file, whose captured arguments the privacy
         # switches govern, the correlation record holds neither the arguments
         # nor the result — only digests of them.
-        records = [path for path in files if path.name.startswith("mcpdone_")]
-        assert records, "expected the dedicated-report record to be written"
+        records = [path for path in files if path.name.startswith("dedicateddone_")]
+        assert records, "expected the digest-only dedicated-report record to be written"
         for path in records:
             content = path.read_text() + str(path)
             assert "s3cret-arg" not in content

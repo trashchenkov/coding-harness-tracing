@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest import mock
 
 import pytest
@@ -261,3 +263,244 @@ def test_all_string_attributes_are_bounded(captured_spans, monkeypatch):
         value = attribute["value"].get("stringValue")
         if value is not None:
             assert len(value) <= 8
+
+
+def test_sequential_shell_start_cannot_expose_delayed_redacted_duplicate(captured_spans, monkeypatch):
+    common = {"conversation_id": "c", "generation_id": "g"}
+    monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+    first = {**common, "command": "A_COMMAND_SECRET", "output": "A_OUTPUT_SECRET"}
+    _dispatch("beforeShellExecution", first)
+    _dispatch("afterShellExecution", first)
+
+    monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+    _dispatch("beforeShellExecution", {**common, "command": "B_COMMAND"})
+    _dispatch("afterShellExecution", first)
+
+    exported = json.dumps(captured_spans)
+    assert "A_COMMAND_SECRET" not in exported
+    assert "A_OUTPUT_SECRET" not in exported
+
+
+def test_sequential_mcp_start_cannot_expose_delayed_redacted_duplicate(captured_spans, monkeypatch):
+    common = {"conversation_id": "c", "generation_id": "g"}
+    first = {**common, "tool_name": "alpha", "tool_input": "A_INPUT_SECRET"}
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+    _dispatch("beforeMCPExecution", first)
+    _dispatch("afterMCPExecution", {**first, "result": "A_OUTPUT_SECRET"})
+
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+    _dispatch("beforeMCPExecution", {**common, "tool_name": "beta", "tool_input": "B_INPUT"})
+    _dispatch("afterMCPExecution", {**first, "result": "A_OUTPUT_SECRET"})
+
+    exported = json.dumps(captured_spans)
+    assert "A_INPUT_SECRET" not in exported
+    assert "A_OUTPUT_SECRET" not in exported
+
+
+@pytest.mark.parametrize("completion_event", ["postToolUse", "postToolUseFailure"])
+def test_failed_generic_send_retries_without_losing_private_state(monkeypatch, completion_event):
+    common = {
+        "conversation_id": "c",
+        "generation_id": "g",
+        "tool_name": "Custom",
+        "tool_use_id": "call",
+        "tool_input": "INPUT_SECRET",
+    }
+    completion = {**common}
+    if completion_event == "postToolUse":
+        completion["tool_output"] = "OUTPUT_SECRET"
+    else:
+        completion.update(error_message="OUTPUT_SECRET", failure_type="error")
+    attempts = []
+
+    def fail_once(payload):
+        attempts.append(payload)
+        return len(attempts) > 1
+
+    _dispatch("preToolUse", common)
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_once):
+        _dispatch(completion_event, completion)
+        _dispatch(completion_event, completion)
+
+    assert len(attempts) == 2
+    attrs = _attrs(_span(attempts[1]))
+    assert attrs["input.value"] == "INPUT_SECRET"
+    assert attrs["output.value"] == "OUTPUT_SECRET"
+
+
+def test_concurrent_generic_completions_export_once(monkeypatch):
+    common = {
+        "conversation_id": "c",
+        "generation_id": "g",
+        "tool_name": "Custom",
+        "tool_use_id": "call",
+        "tool_input": "input",
+        "tool_output": "output",
+    }
+    attempts = []
+    entered = threading.Event()
+
+    def slow_send(payload):
+        attempts.append(payload)
+        entered.set()
+        time.sleep(0.05)
+        return True
+
+    _dispatch("preToolUse", common)
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=slow_send):
+        threads = [threading.Thread(target=lambda: _dispatch("postToolUse", common)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(5)
+        for thread in threads:
+            thread.join(5)
+
+    assert len(attempts) == 1
+
+
+def test_generic_only_shell_delivery_is_not_discarded(captured_spans):
+    common = {
+        "conversation_id": "c",
+        "generation_id": "g",
+        "tool_name": "Shell",
+        "tool_use_id": "shell-call",
+        "tool_input": {"command": "pwd"},
+    }
+    _dispatch("preToolUse", common)
+    _dispatch("postToolUse", {**common, "tool_output": "/tmp"})
+    assert [_span(payload)["name"] for payload in captured_spans] == ["Tool: Shell"]
+
+
+def test_dedicated_shell_success_suppresses_matching_generic_completion(captured_spans):
+    common = {"conversation_id": "c", "generation_id": "g"}
+    _dispatch("beforeShellExecution", {**common, "command": "pwd"})
+    _dispatch("afterShellExecution", {**common, "command": "pwd", "output": "/tmp"})
+    generic = {
+        **common,
+        "tool_name": "Shell",
+        "tool_use_id": "shell-call",
+        "tool_input": {"command": "pwd"},
+        "tool_output": "/tmp",
+    }
+    _dispatch("preToolUse", generic)
+    _dispatch("postToolUse", generic)
+    assert [_span(payload)["name"] for payload in captured_spans] == ["Shell"]
+
+
+def test_failed_dedicated_shell_send_preserves_generic_fallback(monkeypatch):
+    common = {"conversation_id": "c", "generation_id": "g"}
+    attempts = []
+
+    def reject_rich(payload):
+        attempts.append(payload)
+        return _span(payload)["name"] != "Shell"
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=reject_rich):
+        _dispatch("beforeShellExecution", {**common, "command": "pwd"})
+        _dispatch("afterShellExecution", {**common, "command": "pwd", "output": "/tmp"})
+        generic = {
+            **common,
+            "tool_name": "Shell",
+            "tool_use_id": "shell-call",
+            "tool_input": {"command": "pwd"},
+            "tool_output": "/tmp",
+        }
+        _dispatch("preToolUse", generic)
+        _dispatch("postToolUse", generic)
+
+    assert [_span(payload)["name"] for payload in attempts] == ["Shell", "Tool: Shell"]
+
+
+@pytest.mark.parametrize("event,terminal_name", [("stop", "Agent Stop"), ("sessionEnd", "Session End")])
+def test_failed_terminal_send_retries_only_unconfirmed_spans(monkeypatch, event, terminal_name):
+    common = {"conversation_id": "c", "generation_id": "g"}
+    _dispatch("beforeSubmitPrompt", {**common, "prompt": "PRIVATE_PROMPT"})
+    _dispatch("afterAgentResponse", {**common, "text": "PRIVATE_RESPONSE"})
+    attempts = []
+    terminal_attempts = 0
+
+    def fail_terminal_once(payload):
+        nonlocal terminal_attempts
+        name = _span(payload)["name"]
+        attempts.append(payload)
+        if name == terminal_name:
+            terminal_attempts += 1
+            return terminal_attempts > 1
+        return True
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_terminal_once):
+        _dispatch(event, {**common, "input_tokens": 7, "output_tokens": 3})
+        _dispatch(event, {**common, "input_tokens": 7, "output_tokens": 3})
+
+    names = [_span(payload)["name"] for payload in attempts]
+    assert names == ["Agent Response", terminal_name, terminal_name]
+    llm_attrs = _attrs(_span(attempts[0]))
+    assert llm_attrs["input.value"] == "PRIVATE_PROMPT"
+    assert llm_attrs["output.value"] == "PRIVATE_RESPONSE"
+    assert llm_attrs["llm.token_count.total"] == 10
+    assert adapter.generation_is_completed("g") is True
+
+
+@pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+def test_token_counters_reject_bool_negative_and_fraction_independently(captured_spans, event):
+    _dispatch(
+        event,
+        {
+            "conversation_id": "c",
+            "input_tokens": True,
+            "output_tokens": -5,
+            "cache_read_tokens": 1.9,
+            "cache_write_tokens": "4",
+            "duration_ms": 1.9,
+        },
+    )
+    attrs = _attrs(_span(captured_spans[0]))
+    assert "llm.token_count.prompt" not in attrs
+    assert "llm.token_count.completion" not in attrs
+    assert "llm.token_count.prompt_details.cache_read" not in attrs
+    assert attrs["llm.token_count.prompt_details.cache_write"] == 4
+    duration_key = "cursor.stop.duration_ms" if event == "stop" else "cursor.session.duration_ms"
+    assert attrs[duration_key] == 1
+
+
+@pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+def test_generationless_terminal_transport_failure_retries(monkeypatch, event):
+    payload = {"conversation_id": "legacy-conversation"}
+    attempts = []
+
+    def fail_once(span):
+        attempts.append(span)
+        return len(attempts) > 1
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_once):
+        _dispatch(event, payload)
+        _dispatch(event, payload)
+
+    assert len(attempts) == 2
+    digest = adapter.stable_digest(f"cursor-terminal-fallback\0{event}\0legacy-conversation")
+    assert adapter.generation_digest_completion_status(digest) == "completed"
+
+
+@pytest.mark.parametrize("event", ["stop", "sessionEnd"])
+def test_generationless_terminal_ledger_failure_does_not_resend(monkeypatch, event):
+    payload = {"conversation_id": "legacy-conversation"}
+    attempts = []
+
+    with (
+        mock.patch(
+            "tracing.cursor.hooks.handlers._send_span_to_backend",
+            side_effect=lambda span: attempts.append(span) or True,
+        ),
+        mock.patch(
+            "tracing.cursor.hooks.handlers.generation_mark_digest_completed",
+            side_effect=[RuntimeError("ledger unavailable"), None],
+        ) as mark,
+    ):
+        with pytest.raises(RuntimeError, match="ledger unavailable"):
+            _dispatch(event, payload)
+        _dispatch(event, payload)
+
+    assert len(attempts) == 1
+    assert mark.call_count == 2

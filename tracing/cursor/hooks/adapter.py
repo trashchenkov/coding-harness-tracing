@@ -548,6 +548,39 @@ def generation_claim_terminal_event(gen_id: str, event: str) -> bool:
             return True
 
 
+def generation_terminal_event_is_claimable(gen_id: str, event: str) -> bool:
+    """Check a terminal delivery without claiming it before transport succeeds."""
+    if not gen_id or event not in {"stop", "sessionEnd"}:
+        raise ValueError("invalid terminal event claim")
+    generation_digest = _generation_digest(gen_id)
+    event_digest = stable_digest(f"cursor-terminal-event\0{event}\0{gen_id}")
+    terminal_digests = tuple(
+        stable_digest(f"cursor-terminal-event\0{terminal_event}\0{gen_id}") for terminal_event in ("stop", "sessionEnd")
+    )
+    with completion_ledger_guard():
+        if not _completed_db_path().exists():
+            return True
+        with _completed_db_connect() as connection:
+            metadata = _read_completion_metadata(connection)
+            if metadata is None or metadata[1]:
+                return False
+            if connection.execute(
+                "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1", (event_digest,)
+            ).fetchone():
+                return False
+            generation_exists = connection.execute(
+                "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1", (generation_digest,)
+            ).fetchone()
+            if (
+                generation_exists
+                and not connection.execute(
+                    "SELECT 1 FROM completed_generations WHERE digest IN (?, ?) LIMIT 1", terminal_digests
+                ).fetchone()
+            ):
+                return False
+            return True
+
+
 def generation_terminal_attribution_get(gen_id: str) -> "dict | None":
     """Return persisted terminal metadata for a generation, or None."""
     if not gen_id:
@@ -576,8 +609,9 @@ def generation_terminal_attribution_note_usage(gen_id: str) -> None:
         with _completed_db_connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                "UPDATE terminal_attribution SET usage_attributed = 1 WHERE digest = ?",
-                (_generation_digest(gen_id),),
+                "INSERT INTO terminal_attribution(digest, root_span_id, usage_attributed) VALUES (?, ?, 1) "
+                "ON CONFLICT(digest) DO UPDATE SET usage_attributed = 1",
+                (_generation_digest(gen_id), gen_root_span_get(gen_id)),
             )
 
 
@@ -740,6 +774,50 @@ def state_claim_once(key: str) -> bool:
         return False
     os.close(fd)
     return True
+
+
+def state_complete_once(key: str, operation) -> "tuple[bool, bool]":
+    """Run ``operation`` once, recording completion only after it returns true."""
+    state_parent = _state_parent_for_key(key)
+    marker = state_parent / f"{key}.delivered"
+    lock_path = state_parent / f".lock_{key}_delivery"
+    _ensure_private_file(lock_path)
+    with FileLock(lock_path):
+        if _read_private_text(marker) is not None:
+            return False, True
+        completed = bool(operation())
+        if completed:
+            _write_private_text(marker, "1")
+        return True, completed
+
+
+def state_forget_completion(key: str) -> None:
+    """Remove a delivered marker after a stronger durable claim is committed."""
+    state_parent = _state_parent_for_key(key)
+    marker = state_parent / f"{key}.delivered"
+    lock_path = state_parent / f".lock_{key}_delivery"
+    _ensure_private_file(lock_path)
+    with FileLock(lock_path):
+        marker.unlink(missing_ok=True)
+
+
+def state_peek_all(key: str) -> list[dict]:
+    """Return a copy of a stack without consuming retryable state."""
+    state_parent = _state_parent_for_key(key)
+    stack_file = state_parent / f"{key}.stack.json"
+    lock_path = state_parent / f".lock_{key}"
+    _ensure_private_file(lock_path)
+    with FileLock(lock_path):
+        serialized = _read_private_text(stack_file)
+        if serialized is None:
+            return []
+        try:
+            data = json.loads(serialized) or []
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [entry for entry in data if isinstance(entry, dict)]
 
 
 def state_pop(key: str) -> "dict | None":
