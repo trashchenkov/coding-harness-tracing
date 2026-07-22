@@ -1480,6 +1480,15 @@ def _dedicated_reported_key(gen_id: str, family: str, correlation: str, outcome_
     return f"dedicateddone_{generation_state_key(gen_id)}_{identity}"
 
 
+def _is_shell_generic_tool_name(tool_name: str) -> bool:
+    return tool_name.lower() in {"shell", "terminal", "bash", "run_command", "run_shell"}
+
+
+def _generic_tool_input_allowed(tool_name: str) -> bool:
+    """Shell commands are details; all other generic inputs are tool content."""
+    return env.log_tool_details if _is_shell_generic_tool_name(tool_name) else env.log_tool_content
+
+
 def _shell_command_from_generic(tool_input) -> str:
     if isinstance(tool_input, dict):
         return _jq_str(tool_input, "command", "shell_command")
@@ -1538,7 +1547,7 @@ def _dedicated_span_already_reported(
         correlation = _mcp_correlation_digest(_mcp_tool_name_from_generic(tool_name), tool_input)
         key = _mcp_dedicated_reported_key(gen_id, correlation, _mcp_outcome_digest(failed, outcome))
         return state_pop(key) is not None
-    if tool_name.lower() in {"shell", "terminal", "bash", "run_command", "run_shell"}:
+    if _is_shell_generic_tool_name(tool_name):
         command = _shell_command_from_generic(tool_input)
         if not command or failed:
             # Dedicated shell failures have no dedicated failure event in the
@@ -1575,8 +1584,12 @@ def _tool_state_key(gen_id: str, tool_use_id: str) -> str:
     return f"tool_{generation_state_key(gen_id)}_{tool_digest}"
 
 
-def _tool_input_with_privacy_provenance(state_key: str, popped: Optional[dict]) -> Tuple[str, bool]:
+def _tool_input_with_privacy_provenance(
+    state_key: str, popped: Optional[dict], content_allowed: Optional[bool] = None
+) -> Tuple[str, bool]:
     """Resolve tool input while retaining content-free duplicate-delivery provenance."""
+    if content_allowed is None:
+        content_allowed = env.log_tool_content
     privacy_key = f"{state_key}_privacy"
     privacy_state = state_pop(privacy_key)
     privacy_record = dict(privacy_state or {})
@@ -1589,8 +1602,8 @@ def _tool_input_with_privacy_provenance(state_key: str, popped: Optional[dict]) 
     else:
         return "", False
 
-    tool_input = _redact_deferred(env.log_tool_content, source, was_redacted)
-    is_redacted = was_redacted or not env.log_tool_content
+    tool_input = _redact_deferred(content_allowed, source, was_redacted)
+    is_redacted = was_redacted or not content_allowed
     privacy_record["tool_input"] = tool_input if is_redacted else ""
     privacy_record["tool_input_redacted"] = is_redacted
     state_push(privacy_key, privacy_record)
@@ -1604,8 +1617,8 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
     tool_use_id = _jq_str(input_json, "tool_use_id")
     if not tool_use_id:
         return
-    tool_content_allowed = env.log_tool_content
     tool_name = _jq_str(input_json, "tool_name")
+    tool_input_allowed = _generic_tool_input_allowed(tool_name)
     state_key = _tool_state_key(gen_id, tool_use_id)
     while state_pop(f"{state_key}_privacy"):
         pass
@@ -1614,8 +1627,8 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
         {
             "start_ms": now_ms,
             "tool_name": tool_name,
-            "tool_input": redact_content(tool_content_allowed, _json_string(input_json.get("tool_input"))),
-            "tool_input_redacted": not tool_content_allowed,
+            "tool_input": redact_content(tool_input_allowed, _json_string(input_json.get("tool_input"))),
+            "tool_input_redacted": not tool_input_allowed,
             "file_correlation": _file_tool_correlation(input_json),
         },
     )
@@ -1627,6 +1640,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
     tool_name = _jq_str(input_json, "tool_name", "toolName", "name", "tool")
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
+    tool_input_allowed = _generic_tool_input_allowed(tool_name)
 
     def deliver() -> bool:
         popped_entries = state_peek_all(state_key) if state_key else []
@@ -1657,7 +1671,7 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
         sid = span_id_16()
         parent = gen_root_span_get(gen_id) if gen_id else ""
         tool_input, input_is_redacted = (
-            _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+            _tool_input_with_privacy_provenance(state_key, popped, tool_input_allowed) if state_key else ("", False)
         )
         if not tool_input and not input_is_redacted:
             raw_input = input_json.get("tool_input")
@@ -1665,9 +1679,9 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
                 raw_input = _jq_str(input_json, "toolInput", "input", "arguments", "args")
             serialized_input = _json_string(raw_input)
             tool_input = (
-                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, tool_input_allowed)[0]
                 if state_key
-                else redact_content(env.log_tool_content, serialized_input)
+                else redact_content(tool_input_allowed, serialized_input)
             )
         serialized_output = _json_string(raw_output)
         output = (
@@ -1721,19 +1735,20 @@ def _handle_post_tool_use_failure(input_json, conversation_id, gen_id, trace_id,
     tool_name = _jq_str(input_json, "tool_name") or "unknown"
     tool_use_id = _jq_str(input_json, "tool_use_id")
     state_key = _tool_state_key(gen_id, tool_use_id) if gen_id and tool_use_id else ""
+    tool_input_allowed = _generic_tool_input_allowed(tool_name)
 
     def deliver() -> bool:
         popped_entries = state_peek_all(state_key) if state_key else []
         popped = popped_entries[-1] if popped_entries else None
         tool_input, input_is_redacted = (
-            _tool_input_with_privacy_provenance(state_key, popped) if state_key else ("", False)
+            _tool_input_with_privacy_provenance(state_key, popped, tool_input_allowed) if state_key else ("", False)
         )
         if not tool_input and not input_is_redacted:
             serialized_input = _json_string(input_json.get("tool_input"))
             tool_input = (
-                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, env.log_tool_content)[0]
+                _redact_terminal_field(f"{state_key}_privacy", "tool_input", serialized_input, tool_input_allowed)[0]
                 if state_key
-                else redact_content(env.log_tool_content, serialized_input)
+                else redact_content(tool_input_allowed, serialized_input)
             )
         raw_error = _jq_str(input_json, "error_message")
         error_message = (

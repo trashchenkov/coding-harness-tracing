@@ -696,3 +696,29 @@ def test_terminal_only_usage_ledger_failure_does_not_resend(monkeypatch, event, 
     spans = [_span(item) for item in sent]
     assert [span["name"] for span in spans] == [span_name]
     assert _attrs(spans[0])["llm.token_count.total"] == 10
+
+
+def test_failed_dedicated_shell_fallback_keeps_command_details_redacted(monkeypatch):
+    secret = "COMMAND_DETAILS_SECRET"
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    exported = []
+    monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+
+    def fail_dedicated(span):
+        name = _span(span)["name"]
+        if name == "Shell":
+            return False
+        exported.append(span)
+        return True
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_dedicated):
+        _dispatch("beforeShellExecution", {**payload, "command": secret})
+        _dispatch("afterShellExecution", {**payload, "command": secret, "output": "ok"})
+        generic = {**payload, "tool_use_id": "shell-1", "tool_name": "Shell"}
+        _dispatch("preToolUse", {**generic, "tool_input": {"command": secret}})
+        _dispatch("postToolUse", {**generic, "tool_input": {"command": secret}, "tool_output": "ok"})
+
+    fallback = next(_span(item) for item in exported if _span(item)["name"] == "Tool: Shell")
+    assert secret not in json.dumps(fallback)
+    assert _attrs(fallback)["input.value"].startswith("<redacted (")
