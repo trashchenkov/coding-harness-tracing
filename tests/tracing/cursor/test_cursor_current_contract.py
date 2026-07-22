@@ -579,7 +579,7 @@ def test_all_dedicated_file_families_suppress_matching_generic(
 ):
     payload = {"conversation_id": "c", "generation_id": "g", "tool_use_id": "id", "tool_name": tool_name}
     _dispatch("preToolUse", {**payload, "tool_input": tool_input})
-    _dispatch(dedicated_event, {"conversation_id": "c", "generation_id": "g", **rich_payload})
+    _dispatch(dedicated_event, {"conversation_id": "c", "generation_id": "g", "tool_use_id": "id", **rich_payload})
     _dispatch("postToolUse", {**payload, "tool_output": "ok"})
     assert [_span(item)["name"] for item in captured_spans] == [rich_span_name]
 
@@ -617,3 +617,82 @@ def test_failed_deferred_root_is_retried_before_terminal_completion(monkeypatch)
 
     assert attempts == ["User Prompt", "User Prompt", "Agent Response", "Agent Stop"]
     assert adapter.generation_is_completed("g") is True
+
+
+def test_root_retry_reapplies_current_privacy_policy(monkeypatch):
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    roots = []
+    monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+    monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "true")
+
+    def fail_first_root(span):
+        if _span(span)["name"] == "User Prompt":
+            roots.append(span)
+            return len(roots) > 1
+        return True
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_first_root):
+        _dispatch("beforeSubmitPrompt", {**payload, "prompt": "PROMPT_SECRET"})
+        _dispatch("afterAgentResponse", {**payload, "response": "RESPONSE_SECRET"})
+        monkeypatch.setenv("ARIZE_LOG_PROMPTS", "false")
+        monkeypatch.setenv("ARIZE_LOG_MODEL_OUTPUTS", "false")
+        _dispatch("stop", payload)
+
+    retried = json.dumps(roots[-1])
+    assert "PROMPT_SECRET" not in retried
+    assert "RESPONSE_SECRET" not in retried
+
+
+def test_pending_generation_state_does_not_persist_raw_identities(monkeypatch, _state_dir):
+    conversation = "CONVERSATION_SENTINEL"
+    user = "USER_SENTINEL@example.com"
+    payload = {"conversation_id": conversation, "generation_id": "g", "user_email": user}
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", return_value=False):
+        _dispatch("beforeSubmitPrompt", {**payload, "prompt": "p"})
+        _dispatch("afterAgentResponse", {**payload, "response": "r"})
+
+    persisted = b"".join(path.read_bytes() for path in _state_dir.rglob("*") if path.is_file())
+    assert conversation.encode() not in persisted
+    assert user.encode() not in persisted
+
+
+@pytest.mark.parametrize(
+    ("dedicated_event", "tool_name", "tool_input", "rich_payload"),
+    [
+        ("beforeReadFile", "read_file", {"path": "/tmp/a"}, {"file_path": "/tmp/a"}),
+        ("afterFileEdit", "edit_file", {"path": "/tmp/a", "edits": "x"}, {"file_path": "/tmp/a", "edits": "x"}),
+        ("beforeTabFileRead", "tab_file_read", {"path": "/tmp/a"}, {"file_path": "/tmp/a"}),
+        ("afterTabFileEdit", "tab_file_edit", {"path": "/tmp/a", "edits": "x"}, {"file_path": "/tmp/a", "edits": "x"}),
+    ],
+)
+def test_uncorrelatable_dedicated_file_event_does_not_suppress_distinct_generic(
+    captured_spans, dedicated_event, tool_name, tool_input, rich_payload
+):
+    generic = {"conversation_id": "c", "generation_id": "g", "tool_use_id": "generic-a", "tool_name": tool_name}
+    _dispatch("preToolUse", {**generic, "tool_input": tool_input})
+    _dispatch(dedicated_event, {"conversation_id": "c", "generation_id": "g", **rich_payload})
+    _dispatch("postToolUse", {**generic, "tool_output": "ok"})
+    assert len(captured_spans) == 2
+
+
+@pytest.mark.parametrize("event,span_name", [("stop", "Agent Stop"), ("sessionEnd", "Session End")])
+def test_terminal_only_usage_ledger_failure_does_not_resend(monkeypatch, event, span_name):
+    payload = {"conversation_id": "c", "generation_id": "g", "input_tokens": 7, "output_tokens": 3}
+    sent = []
+    with (
+        mock.patch(
+            "tracing.cursor.hooks.handlers._send_span_to_backend",
+            side_effect=lambda span: sent.append(span) or True,
+        ),
+        mock.patch(
+            "tracing.cursor.hooks.handlers.generation_terminal_attribution_note_usage",
+            side_effect=[RuntimeError("usage ledger unavailable"), None],
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="usage ledger unavailable"):
+            _dispatch(event, payload)
+        _dispatch(event, payload)
+
+    spans = [_span(item) for item in sent]
+    assert [span["name"] for span in spans] == [span_name]
+    assert _attrs(spans[0])["llm.token_count.total"] == 10

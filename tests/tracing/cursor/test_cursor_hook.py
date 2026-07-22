@@ -3594,6 +3594,7 @@ class TestDeferredLlmSpan:
                 {
                     "conversation_id": "conv-abc",
                     "generation_id": "gen-1",
+                    "user_email": "alice@example.com",
                 },
             )
 

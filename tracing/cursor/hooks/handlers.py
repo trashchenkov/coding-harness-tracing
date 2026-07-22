@@ -397,7 +397,6 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
             {
                 "span_id": sid,
                 "trace_id": trace_id,
-                "conversation_id": conversation_id,
                 "start_ms": now_ms,
                 "prompt": prompt,
                 "prompt_redacted": not prompt_allowed,
@@ -440,16 +439,43 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
     log(f"beforeSubmitPrompt: root span {sid} (trace={trace_id})")
 
 
-def _flush_deferred_root_spans(gen_id: str) -> bool:
-    """Deliver pending User Prompt roots before any terminal child spans."""
+def _flush_deferred_root_spans(
+    gen_id: str, conversation_id: str = "", user_id: str = "", now_ms: Optional[int] = None
+) -> bool:
+    """Deliver pending roots, reapplying current privacy and event identity."""
     root_key = f"rootpending_{generation_state_key(gen_id)}" if gen_id else ""
     entries = list(reversed(state_peek_all(root_key))) if root_key else []
     for entry in entries:
-        span = entry.get("span")
-        if not isinstance(span, dict):
-            return False
-        span_id = span.get("resourceSpans", [{}])[0].get("scopeSpans", [{}])[0].get("spans", [{}])[0].get("spanId", "")
-        delivery_key = f"rootdelivered_{generation_state_key(gen_id)}_{span_id}"
+        attrs = {
+            "openinference.span.kind": "CHAIN",
+            "input.value": _redact_deferred(
+                env.log_prompts, entry.get("input", ""), bool(entry.get("input_redacted", False))
+            ),
+            "output.value": _redact_deferred(
+                env.log_model_outputs, entry.get("output", ""), bool(entry.get("output_redacted", False))
+            ),
+            "session.id": conversation_id,
+        }
+        if conversation_id:
+            attrs["cursor.conversation.id"] = conversation_id
+        if user_id:
+            attrs["user.id"] = user_id
+        if entry.get("model"):
+            attrs["llm.model_name"] = entry["model"]
+        end_ms = int(now_ms if now_ms is not None else entry.get("end_ms") or entry.get("start_ms") or 0)
+        span = build_span(
+            "User Prompt",
+            "CHAIN",
+            entry.get("span_id", ""),
+            entry.get("trace_id", ""),
+            "",
+            int(entry.get("start_ms") or end_ms),
+            end_ms,
+            attrs,
+            SERVICE_NAME,
+            SCOPE_NAME,
+        )
+        delivery_key = f"rootdelivered_{generation_state_key(gen_id)}_{entry.get('span_id', '')}"
         _, delivered = state_complete_once(delivery_key, lambda: send_span(span))
         if not delivered:
             return False
@@ -499,43 +525,26 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
 
     user_id = _resolve_user_id(input_json)
 
-    # Send User Prompt CHAIN first (parent before LLM for strict backends), full I/O + duration.
+    # Persist only privacy-tracked semantic content. Conversation/user identities
+    # are supplied by the current event at delivery time and never written to disk.
     if root_state and deferred_root:
-        root_conv_id = root_state.get("conversation_id", conversation_id)
-        root_attrs = {
-            "openinference.span.kind": "CHAIN",
-            "input.value": prompt,
-            "output.value": response,
-            "session.id": root_conv_id,
-        }
-        if root_conv_id:
-            root_attrs["cursor.conversation.id"] = root_conv_id
-        if user_id:
-            root_attrs["user.id"] = user_id
         root_model = model or root_state.get("model", "")
-        if root_model:
-            root_attrs["llm.model_name"] = root_model
-
-        root_span = build_span(
-            "User Prompt",
-            "CHAIN",
-            root_state["span_id"],
-            root_state.get("trace_id", trace_id),
-            "",
-            root_state.get("start_ms", now_ms),
-            now_ms,
-            root_attrs,
-            SERVICE_NAME,
-            SCOPE_NAME,
-        )
         if safe_gen:
-            # Persist the complete, privacy-filtered payload before transport.
-            # A failed afterAgentResponse export is retried by the terminal
-            # event before any child LLM or terminal span can complete.
-            state_push(f"rootpending_{safe_gen}", {"span": root_span})
-            _flush_deferred_root_spans(gen_id)
-        else:
-            send_span(root_span)
+            state_push(
+                f"rootpending_{safe_gen}",
+                {
+                    "span_id": root_state["span_id"],
+                    "trace_id": root_state.get("trace_id", trace_id),
+                    "start_ms": root_state.get("start_ms", now_ms),
+                    "end_ms": now_ms,
+                    "input": prompt,
+                    "output": response,
+                    "input_redacted": prompt_is_redacted,
+                    "output_redacted": response_is_redacted,
+                    "model": root_model,
+                },
+            )
+            _flush_deferred_root_spans(gen_id, conversation_id, user_id, now_ms)
         log(f"afterAgentResponse: attempted deferred root span {root_state['span_id']}")
 
     llm_entry = {
@@ -547,8 +556,6 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
         "input_redacted": prompt_is_redacted,
         "output_redacted": response_is_redacted,
         "model": model,
-        "conversation_id": conversation_id,
-        "user_id": user_id,
         "start_ms": now_ms,
     }
 
@@ -881,18 +888,12 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
 
 
-def _file_tool_correlation(tool_input) -> str:
-    """Raw-free identity shared by dedicated and generic file-tool payloads."""
-    if isinstance(tool_input, str):
-        try:
-            tool_input = json.loads(tool_input)
-        except (TypeError, ValueError):
-            tool_input = {"path": tool_input}
-    if not isinstance(tool_input, dict):
-        tool_input = {}
-    path = _jq_str(tool_input, "file_path", "filePath", "path")
-    edits = tool_input.get("edits", tool_input.get("changes", tool_input.get("diff", "")))
-    return stable_digest(f"{path}\0{_canonical_tool_input(edits)}")
+def _file_tool_correlation(payload) -> str:
+    """Raw-free exact invocation identity shared by both file event channels."""
+    if not isinstance(payload, dict):
+        return ""
+    invocation_id = _jq_str(payload, "tool_use_id", "toolUseId", "call_id", "callId")
+    return stable_digest(invocation_id) if invocation_id else ""
 
 
 def _record_dedicated_file_delivery(gen_id: str, family: str, payload, sent: bool) -> None:
@@ -900,6 +901,8 @@ def _record_dedicated_file_delivery(gen_id: str, family: str, payload, sent: boo
     if not sent or not gen_id:
         return
     correlation = _file_tool_correlation(payload)
+    if not correlation:
+        return
     state_push(_dedicated_reported_key(gen_id, family, correlation, ""), {"reported": True})
 
 
@@ -1072,7 +1075,7 @@ def _terminal_attribution_context(gen_id):
     return parent, bool(attribution and attribution["usage_attributed"])
 
 
-def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
+def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs, conversation_id: str = "", user_id: str = ""):
     """Drain and emit every deferred Agent Response span for a generation.
 
     Dispatch removes all generation state after either terminal event, so
@@ -1082,10 +1085,9 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
     """
     llm_key = f"llm_{generation_state_key(gen_id)}" if gen_id else ""
     llm_entries = list(reversed(state_peek_all(llm_key))) if llm_key else []
-    sent_entries = []
+    sent_entries: list[dict] = []
 
     for idx, entry in enumerate(llm_entries):
-        entry_conv_id = entry.get("conversation_id")
         llm_attrs = {
             "openinference.span.kind": "LLM",
             "input.value": _redact_deferred(
@@ -1095,12 +1097,11 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
                 env.log_model_outputs, entry.get("output", ""), bool(entry.get("output_redacted", False))
             ),
         }
-        if entry_conv_id:
-            llm_attrs["session.id"] = entry_conv_id
-            llm_attrs["cursor.conversation.id"] = entry_conv_id
-        entry_user = entry.get("user_id")
-        if entry_user:
-            llm_attrs["user.id"] = entry_user
+        if conversation_id:
+            llm_attrs["session.id"] = conversation_id
+            llm_attrs["cursor.conversation.id"] = conversation_id
+        if user_id:
+            llm_attrs["user.id"] = user_id
         entry_model = entry.get("model", "")
         if entry_model:
             llm_attrs["llm.model_name"] = entry_model
@@ -1181,7 +1182,7 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     if model:
         token_attrs["llm.model_name"] = model
 
-    if not _flush_deferred_root_spans(gen_id):
+    if not _flush_deferred_root_spans(gen_id, conversation_id, user_id, now_ms):
         return False
 
     # Flush deferred LLM span(s) before Agent Stop so strict OTLP backends see
@@ -1189,7 +1190,7 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
     # a terminal event that arrives after usage was already attributed carries
     # the same counts again and must not re-attach them anywhere.
     llm_entries, flush_complete = _flush_deferred_llm_spans(
-        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs
+        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs, conversation_id, user_id
     )
     if not flush_complete:
         return False
@@ -1226,7 +1227,11 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    sent = send_span(span)
+    terminal_delivery_key = f"terminaltransport_{generation_state_key(gen_id)}_stop" if gen_id else ""
+    if terminal_delivery_key:
+        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span))
+    else:
+        sent = send_span(span)
     if (
         sent
         and not usage_attributed
@@ -1323,13 +1328,13 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     if model:
         token_attrs["llm.model_name"] = model
 
-    if not _flush_deferred_root_spans(gen_id):
+    if not _flush_deferred_root_spans(gen_id, conversation_id, user_id, now_ms):
         return False
 
     # Flush deferred LLM span(s) before Session End so strict OTLP backends see
     # parent first. Same at-most-once usage attribution as _handle_stop.
     llm_entries, flush_complete = _flush_deferred_llm_spans(
-        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs
+        gen_id, trace_id, now_ms, {} if usage_attributed else token_attrs, conversation_id, user_id
     )
     if not flush_complete:
         return False
@@ -1366,7 +1371,11 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    sent = send_span(span)
+    terminal_delivery_key = f"terminaltransport_{generation_state_key(gen_id)}_session_end" if gen_id else ""
+    if terminal_delivery_key:
+        _, sent = state_complete_once(terminal_delivery_key, lambda: send_span(span))
+    else:
+        sent = send_span(span)
     if (
         sent
         and not usage_attributed
@@ -1607,7 +1616,7 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
             "tool_name": tool_name,
             "tool_input": redact_content(tool_content_allowed, _json_string(input_json.get("tool_input"))),
             "tool_input_redacted": not tool_content_allowed,
-            "file_correlation": _file_tool_correlation(input_json.get("tool_input")),
+            "file_correlation": _file_tool_correlation(input_json),
         },
     )
     log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
