@@ -435,8 +435,8 @@ def test_failed_terminal_send_retries_only_unconfirmed_spans(monkeypatch, event,
         _dispatch(event, {**common, "input_tokens": 7, "output_tokens": 3})
 
     names = [_span(payload)["name"] for payload in attempts]
-    assert names == ["Agent Response", terminal_name, terminal_name]
-    llm_attrs = _attrs(_span(attempts[0]))
+    assert names == ["User Prompt", "Agent Response", terminal_name, terminal_name]
+    llm_attrs = _attrs(_span(attempts[1]))
     assert llm_attrs["input.value"] == "PRIVATE_PROMPT"
     assert llm_attrs["output.value"] == "PRIVATE_RESPONSE"
     assert llm_attrs["llm.token_count.total"] == 10
@@ -504,3 +504,116 @@ def test_generationless_terminal_ledger_failure_does_not_resend(monkeypatch, eve
 
     assert len(attempts) == 1
     assert mark.call_count == 2
+
+
+def test_shell_without_command_keeps_redaction_for_delayed_duplicate(monkeypatch):
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    sent = []
+    monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "false")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+    with mock.patch(
+        "tracing.cursor.hooks.handlers._send_span_to_backend",
+        side_effect=lambda span: sent.append(span) or True,
+    ):
+        _dispatch("beforeShellExecution", {**payload, "command": "SECRET_COMMAND"})
+        after = {**payload, "output": "SECRET_OUTPUT", "exit_code": 0}
+        _dispatch("afterShellExecution", after)
+        monkeypatch.setenv("ARIZE_LOG_TOOL_DETAILS", "true")
+        monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "true")
+        _dispatch("afterShellExecution", after)
+
+    exported = json.dumps(sent)
+    assert "SECRET_COMMAND" not in exported
+    assert "SECRET_OUTPUT" not in exported
+
+
+def test_llm_usage_ledger_failure_retries_without_duplicate_tokens(monkeypatch):
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    sent = []
+    with (
+        mock.patch(
+            "tracing.cursor.hooks.handlers._send_span_to_backend",
+            side_effect=lambda span: sent.append(span) or True,
+        ),
+        mock.patch(
+            "tracing.cursor.hooks.handlers.generation_terminal_attribution_note_usage",
+            side_effect=[RuntimeError("usage ledger unavailable"), None],
+        ),
+    ):
+        _dispatch("beforeSubmitPrompt", {**payload, "prompt": "p"})
+        _dispatch("afterAgentResponse", {**payload, "response": "r"})
+        terminal = {**payload, "input_tokens": 7, "output_tokens": 3}
+        with pytest.raises(RuntimeError, match="usage ledger unavailable"):
+            _dispatch("stop", terminal)
+        _dispatch("stop", terminal)
+
+    spans = [_span(item) for item in sent]
+    token_bearing = [span for span in spans if any(key.startswith("llm.token_count.") for key in _attrs(span))]
+    assert [span["name"] for span in token_bearing] == ["Agent Response"]
+    assert [span["name"] for span in spans].count("Agent Response") == 1
+
+
+@pytest.mark.parametrize(
+    ("dedicated_event", "tool_name", "tool_input", "rich_payload", "rich_span_name"),
+    [
+        ("beforeReadFile", "read_file", {"path": "/tmp/a"}, {"file_path": "/tmp/a"}, "Read File"),
+        (
+            "afterFileEdit",
+            "edit_file",
+            {"path": "/tmp/a", "edits": "change"},
+            {"file_path": "/tmp/a", "edits": "change"},
+            "File Edit",
+        ),
+        ("beforeTabFileRead", "tab_file_read", {"path": "/tmp/a"}, {"file_path": "/tmp/a"}, "Tab Read File"),
+        (
+            "afterTabFileEdit",
+            "tab_file_edit",
+            {"path": "/tmp/a", "edits": "change"},
+            {"file_path": "/tmp/a", "edits": "change"},
+            "Tab File Edit",
+        ),
+    ],
+)
+def test_all_dedicated_file_families_suppress_matching_generic(
+    captured_spans, dedicated_event, tool_name, tool_input, rich_payload, rich_span_name
+):
+    payload = {"conversation_id": "c", "generation_id": "g", "tool_use_id": "id", "tool_name": tool_name}
+    _dispatch("preToolUse", {**payload, "tool_input": tool_input})
+    _dispatch(dedicated_event, {"conversation_id": "c", "generation_id": "g", **rich_payload})
+    _dispatch("postToolUse", {**payload, "tool_output": "ok"})
+    assert [_span(item)["name"] for item in captured_spans] == [rich_span_name]
+
+
+def test_terminal_preflights_exact_ledger_capacity(monkeypatch, captured_spans):
+    monkeypatch.setattr(adapter, "COMPLETION_LEDGER_MAX_ROWS", 2)
+    adapter.generation_mark_completed("already-complete")
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    _dispatch("beforeSubmitPrompt", {**payload, "prompt": "p"})
+    _dispatch("afterAgentResponse", {**payload, "response": "r"})
+    before = len(captured_spans)
+    _dispatch("stop", {**payload, "input_tokens": 1, "output_tokens": 1})
+    assert len(captured_spans) == before
+    assert adapter.generation_completion_status("g") == "active"
+
+
+def test_failed_deferred_root_is_retried_before_terminal_completion(monkeypatch):
+    payload = {"conversation_id": "c", "generation_id": "g"}
+    attempts = []
+    root_attempts = 0
+
+    def fail_first_root(span):
+        nonlocal root_attempts
+        name = _span(span)["name"]
+        attempts.append(name)
+        if name == "User Prompt":
+            root_attempts += 1
+            return root_attempts > 1
+        return True
+
+    with mock.patch("tracing.cursor.hooks.handlers._send_span_to_backend", side_effect=fail_first_root):
+        _dispatch("beforeSubmitPrompt", {**payload, "prompt": "p"})
+        _dispatch("afterAgentResponse", {**payload, "response": "r"})
+        _dispatch("stop", payload)
+
+    assert attempts == ["User Prompt", "User Prompt", "Agent Response", "Agent Stop"]
+    assert adapter.generation_is_completed("g") is True

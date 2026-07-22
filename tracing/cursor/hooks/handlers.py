@@ -440,6 +440,23 @@ def _handle_before_submit_prompt(input_json, conversation_id, gen_id, trace_id, 
     log(f"beforeSubmitPrompt: root span {sid} (trace={trace_id})")
 
 
+def _flush_deferred_root_spans(gen_id: str) -> bool:
+    """Deliver pending User Prompt roots before any terminal child spans."""
+    root_key = f"rootpending_{generation_state_key(gen_id)}" if gen_id else ""
+    entries = list(reversed(state_peek_all(root_key))) if root_key else []
+    for entry in entries:
+        span = entry.get("span")
+        if not isinstance(span, dict):
+            return False
+        span_id = span.get("resourceSpans", [{}])[0].get("scopeSpans", [{}])[0].get("spans", [{}])[0].get("spanId", "")
+        delivery_key = f"rootdelivered_{generation_state_key(gen_id)}_{span_id}"
+        _, delivered = state_complete_once(delivery_key, lambda: send_span(span))
+        if not delivered:
+            return False
+        state_pop(root_key)
+    return True
+
+
 def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, now_ms):
     """Defer the LLM span until stop so per-turn tokens land on it."""
     sid = span_id_16()
@@ -511,8 +528,15 @@ def _handle_after_agent_response(input_json, conversation_id, gen_id, trace_id, 
             SERVICE_NAME,
             SCOPE_NAME,
         )
-        send_span(root_span)
-        log(f"afterAgentResponse: sent deferred root span {root_state['span_id']}")
+        if safe_gen:
+            # Persist the complete, privacy-filtered payload before transport.
+            # A failed afterAgentResponse export is retried by the terminal
+            # event before any child LLM or terminal span can complete.
+            state_push(f"rootpending_{safe_gen}", {"span": root_span})
+            _flush_deferred_root_spans(gen_id)
+        else:
+            send_span(root_span)
+        log(f"afterAgentResponse: attempted deferred root span {root_state['span_id']}")
 
     llm_entry = {
         "span_id": sid,
@@ -631,7 +655,10 @@ def _handle_after_shell_execution(input_json, conversation_id, gen_id, trace_id,
     shell_key = f"shell_{generation_state_key(gen_id)}" if gen_id else ""
     after_cmd = _jq_str(input_json, "command", "shell_command")
     correlation = stable_digest(after_cmd) if after_cmd else ""
-    privacy_key = f"shell_privacy_{generation_state_key(gen_id)}_{correlation}" if gen_id and correlation else ""
+    privacy_key = ""
+    if gen_id:
+        privacy_suffix = correlation or "anonymous"
+        privacy_key = f"shell_privacy_{generation_state_key(gen_id)}_{privacy_suffix}"
     if shell_key and correlation:
         popped = state_pop_matching(shell_key, "correlation", correlation)
     else:
@@ -854,6 +881,28 @@ def _handle_after_mcp_execution(input_json, conversation_id, gen_id, trace_id, n
     log(f"afterMCPExecution: span {sid} (merged, tool={tool_name})")
 
 
+def _file_tool_correlation(tool_input) -> str:
+    """Raw-free identity shared by dedicated and generic file-tool payloads."""
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except (TypeError, ValueError):
+            tool_input = {"path": tool_input}
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    path = _jq_str(tool_input, "file_path", "filePath", "path")
+    edits = tool_input.get("edits", tool_input.get("changes", tool_input.get("diff", "")))
+    return stable_digest(f"{path}\0{_canonical_tool_input(edits)}")
+
+
+def _record_dedicated_file_delivery(gen_id: str, family: str, payload, sent: bool) -> None:
+    """Record one confirmed rich file span for one-for-one generic dedup."""
+    if not sent or not gen_id:
+        return
+    correlation = _file_tool_correlation(payload)
+    state_push(_dedicated_reported_key(gen_id, family, correlation, ""), {"reported": True})
+
+
 def _handle_before_read_file(input_json, conversation_id, gen_id, trace_id, now_ms):
     """TOOL span for file read. Replaces bash lines 317-339."""
     sid = span_id_16()
@@ -886,7 +935,8 @@ def _handle_before_read_file(input_json, conversation_id, gen_id, trace_id, now_
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    _record_dedicated_file_delivery(gen_id, "read", input_json, sent)
     log(f"beforeReadFile: span {sid}")
 
 
@@ -924,7 +974,8 @@ def _handle_after_file_edit(input_json, conversation_id, gen_id, trace_id, now_m
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    _record_dedicated_file_delivery(gen_id, "edit", input_json, sent)
     log(f"afterFileEdit: span {sid}")
 
 
@@ -960,7 +1011,8 @@ def _handle_before_tab_file_read(input_json, conversation_id, gen_id, trace_id, 
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    _record_dedicated_file_delivery(gen_id, "tab_read", input_json, sent)
     log(f"beforeTabFileRead: span {sid}")
 
 
@@ -998,7 +1050,8 @@ def _handle_after_tab_file_edit(input_json, conversation_id, gen_id, trace_id, n
         SERVICE_NAME,
         SCOPE_NAME,
     )
-    send_span(span)
+    sent = send_span(span)
+    _record_dedicated_file_delivery(gen_id, "tab_edit", input_json, sent)
     log(f"afterTabFileEdit: span {sid}")
 
 
@@ -1068,12 +1121,17 @@ def _flush_deferred_llm_spans(gen_id, trace_id, now_ms, token_attrs):
             SERVICE_NAME,
             SCOPE_NAME,
         )
-        if not send_span(llm_span):
+        delivery_key = f"llmdelivered_{generation_state_key(gen_id)}_{entry.get('span_id', '')}"
+        _, delivered = state_complete_once(delivery_key, lambda: send_span(llm_span))
+        if not delivered:
             return sent_entries, False
-        state_pop(llm_key)
         sent_entries.append(entry)
         if idx == 0 and any(key.startswith("llm.token_count.") for key in token_attrs):
+            # Commit attribution before consuming the retryable entry. The
+            # per-span delivery marker suppresses a resend if this ledger write
+            # fails; retry can then finish bookkeeping and pop the state.
             generation_terminal_attribution_note_usage(gen_id)
+        state_pop(llm_key)
 
     return sent_entries, True
 
@@ -1122,6 +1180,9 @@ def _handle_stop(input_json, conversation_id, gen_id, trace_id, now_ms):
         token_attrs["llm.token_count.total"] = prompt_total + completion_tokens
     if model:
         token_attrs["llm.model_name"] = model
+
+    if not _flush_deferred_root_spans(gen_id):
+        return False
 
     # Flush deferred LLM span(s) before Agent Stop so strict OTLP backends see
     # parent first. Cumulative usage is attributed at most once per generation:
@@ -1262,6 +1323,9 @@ def _handle_session_end(input_json, conversation_id, gen_id, trace_id, now_ms):
     if model:
         token_attrs["llm.model_name"] = model
 
+    if not _flush_deferred_root_spans(gen_id):
+        return False
+
     # Flush deferred LLM span(s) before Session End so strict OTLP backends see
     # parent first. Same at-most-once usage attribution as _handle_stop.
     llm_entries, flush_complete = _flush_deferred_llm_spans(
@@ -1332,7 +1396,9 @@ _DEDICATED_TOOL_NAMES = frozenset(
         "create_file",
         "delete_file",
         "tab_file_read",
+        "read_file_tab",
         "tab_file_edit",
+        "edit_file_tab",
         "mcp",
         "mcp_execution",
     }
@@ -1432,7 +1498,22 @@ def _claim_generic_completion_digest(gen_id: str, invocation_digest: str) -> boo
     return state_claim_once(_generic_completion_claim_key(gen_id, invocation_digest))
 
 
-def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, failed: bool, outcome) -> bool:
+def _dedicated_file_family(tool_name: str) -> str:
+    normalized = tool_name.lower()
+    if normalized in {"read_file", "read", "view_file", "view"}:
+        return "read"
+    if normalized in {"edit_file", "edit", "write_file", "write", "create_file", "delete_file"}:
+        return "edit"
+    if normalized in {"tab_file_read", "read_file_tab"}:
+        return "tab_read"
+    if normalized in {"tab_file_edit", "edit_file_tab"}:
+        return "tab_edit"
+    return ""
+
+
+def _dedicated_span_already_reported(
+    gen_id: str, tool_name: str, tool_input, failed: bool, outcome, file_correlation: str = ""
+) -> bool:
     """Whether a dedicated span already reported *this exact* generic call.
 
     The decision is deferred to the generic completion so it can be matched on
@@ -1455,6 +1536,11 @@ def _dedicated_span_already_reported(gen_id: str, tool_name: str, tool_input, fa
             # current contract; missing command identity stays fail-closed.
             return False
         key = _dedicated_reported_key(gen_id, "shell", stable_digest(command), _mcp_outcome_digest(False, outcome))
+        return state_pop(key) is not None
+    file_family = _dedicated_file_family(tool_name)
+    if file_family and not failed:
+        correlation = file_correlation or _file_tool_correlation(tool_input)
+        key = _dedicated_reported_key(gen_id, file_family, correlation, "")
         return state_pop(key) is not None
     return False
 
@@ -1521,6 +1607,7 @@ def _handle_pre_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms):
             "tool_name": tool_name,
             "tool_input": redact_content(tool_content_allowed, _json_string(input_json.get("tool_input"))),
             "tool_input_redacted": not tool_content_allowed,
+            "file_correlation": _file_tool_correlation(input_json.get("tool_input")),
         },
     )
     log(f"preToolUse: pushed state for tool_use_id={tool_use_id}")
@@ -1545,7 +1632,14 @@ def _handle_post_tool_use(input_json, conversation_id, gen_id, trace_id, now_ms)
         raw_output = input_json.get("tool_output")
         if raw_output is None:
             raw_output = _jq_str(input_json, "result", "output", "response", "stdout")
-        if _dedicated_span_already_reported(gen_id, tool_name, input_json.get("tool_input"), False, raw_output):
+        if _dedicated_span_already_reported(
+            gen_id,
+            tool_name,
+            input_json.get("tool_input"),
+            False,
+            raw_output,
+            popped.get("file_correlation", "") if popped else "",
+        ):
             if state_key:
                 state_pop(state_key)
             log(f"postToolUse: skipping {tool_name!r} — exact call already reported by dedicated span")

@@ -559,11 +559,14 @@ def generation_terminal_event_is_claimable(gen_id: str, event: str) -> bool:
     )
     with completion_ledger_guard():
         if not _completed_db_path().exists():
-            return True
+            # The first terminal claim needs one generation row plus one
+            # event row. Refuse transport when that durable claim cannot fit.
+            return COMPLETION_LEDGER_MAX_ROWS >= 2
         with _completed_db_connect() as connection:
             metadata = _read_completion_metadata(connection)
             if metadata is None or metadata[1]:
                 return False
+            row_count = metadata[0]
             if connection.execute(
                 "SELECT 1 FROM completed_generations WHERE digest = ? LIMIT 1", (event_digest,)
             ).fetchone():
@@ -578,7 +581,8 @@ def generation_terminal_event_is_claimable(gen_id: str, event: str) -> bool:
                 ).fetchone()
             ):
                 return False
-            return True
+            rows_needed = 1 + int(not generation_exists)
+            return row_count + rows_needed <= COMPLETION_LEDGER_MAX_ROWS
 
 
 def generation_terminal_attribution_get(gen_id: str) -> "dict | None":
