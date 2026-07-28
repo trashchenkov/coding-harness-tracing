@@ -126,9 +126,15 @@ def ensure_session_initialized(state: StateManager, input_json: dict) -> None:
 
 
 def dispatch_lock_path_for_key(key: str, state_dir: Path | None = None) -> Path:
-    """Return the stable bounded dispatcher lock protecting a state key."""
+    """Return the stable bounded lifecycle-shard lock for a state key."""
     shard = hashlib.sha256(key.encode("utf-8", errors="surrogatepass")).hexdigest()[:2]
     return (STATE_DIR if state_dir is None else state_dir) / f".dispatch_h_{shard}"
+
+
+def session_dispatch_lock_path_for_key(key: str, state_dir: Path | None = None) -> Path:
+    """Return the per-session lock whose lifecycle is guarded by its shard."""
+    digest = hashlib.sha256(key.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return (STATE_DIR if state_dir is None else state_dir) / f".dispatch_s_{digest}"
 
 
 def gc_stale_state_files() -> None:
@@ -145,26 +151,42 @@ def gc_stale_state_files() -> None:
         try:
             key = f.stem.replace("state_", "", 1)
             try:
-                with FileLock(dispatch_lock_path_for_key(key), timeout=0, break_on_timeout=False):
-                    if f.stat().st_mtime >= cutoff:
-                        continue
+                shard_lock = dispatch_lock_path_for_key(key)
+                session_lock_path = session_dispatch_lock_path_for_key(key)
+                with FileLock(shard_lock, timeout=0, break_on_timeout=False):
+                    with FileLock(session_lock_path, timeout=0, break_on_timeout=False):
+                        if f.stat().st_mtime >= cutoff:
+                            continue
 
-                    try:
-                        f.unlink(missing_ok=True)
-                    except OSError as e:
-                        log(f"GC: failed to remove stale state file {f}: {e}")
+                        try:
+                            f.unlink(missing_ok=True)
+                        except OSError as e:
+                            log(f"GC: failed to remove stale state file {f}: {e}")
 
-                    lock_path = STATE_DIR / f".lock_{key}"
-                    if lock_path.is_dir():
+                        lock_path = STATE_DIR / f".lock_{key}"
+                        if lock_path.is_dir():
+                            try:
+                                lock_path.rmdir()
+                            except OSError as e:
+                                log(f"GC: failed to remove stale lock directory {lock_path}: {e}")
+                        elif lock_path.is_file():
+                            try:
+                                lock_path.unlink(missing_ok=True)
+                            except OSError as e:
+                                log(f"GC: failed to remove stale lock file {lock_path}: {e}")
+
+                    # No waiter can open this path while the lifecycle shard is
+                    # held, so deletion after releasing the per-session lock is safe.
+                    if session_lock_path.is_dir():
                         try:
-                            lock_path.rmdir()
+                            session_lock_path.rmdir()
                         except OSError as e:
-                            log(f"GC: failed to remove stale lock directory {lock_path}: {e}")
-                    elif lock_path.is_file():
+                            log(f"GC: failed to remove stale session lock directory {session_lock_path}: {e}")
+                    elif session_lock_path.is_file():
                         try:
-                            lock_path.unlink(missing_ok=True)
+                            session_lock_path.unlink(missing_ok=True)
                         except OSError as e:
-                            log(f"GC: failed to remove stale lock file {lock_path}: {e}")
+                            log(f"GC: failed to remove stale session lock file {session_lock_path}: {e}")
             except TimeoutError:
                 # An active hook owns this shard. Leave the candidate for a later pass.
                 continue

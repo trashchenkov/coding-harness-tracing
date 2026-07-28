@@ -17,8 +17,6 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-const FORWARD_TIMEOUT_MS = 1500;
-
 function binaryPath(): string {
   const base = join(homedir(), ".arize", "harness", "venv");
   return platform() === "win32"
@@ -36,7 +34,6 @@ function forward(payload: unknown): Promise<void> {
       const finish = (): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
         resolve();
       };
       const stop = (): void => {
@@ -47,8 +44,6 @@ function forward(payload: unknown): Promise<void> {
         }
         finish();
       };
-      const timer = setTimeout(stop, FORWARD_TIMEOUT_MS);
-
       child.once("error", finish);
       child.once("close", finish);
       child.stdin?.on("error", stop);

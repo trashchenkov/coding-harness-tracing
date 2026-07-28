@@ -3,9 +3,14 @@
 
 import io
 import json
+import os
+import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -249,6 +254,54 @@ class TestFileLock:
         released_event.set()
         t.join(timeout=5)
         assert not t.is_alive()
+
+    def test_sqlite_fallback_recovers_after_owner_process_crashes(self, tmp_path):
+        """SQLite releases its transaction when a fallback lock owner dies."""
+        lock_path = tmp_path / "test.lock"
+        script = f"""
+from pathlib import Path
+import os
+from core.common import FileLock
+lock = FileLock(Path({str(lock_path)!r}), timeout=1, break_on_timeout=False)
+lock._method = 'sqlite'
+lock.__enter__()
+os._exit(0)
+"""
+        subprocess.run([sys.executable, "-c", script], check=True, cwd=Path(__file__).parents[2])
+
+        lock = FileLock(lock_path, timeout=0.2, break_on_timeout=False)
+        lock._method = "sqlite"
+        with lock:
+            assert lock_path.is_file()
+
+    def test_sqlite_fallback_migrates_stale_legacy_lock_directory(self, tmp_path):
+        lock_path = tmp_path / "test.lock"
+        lock_path.mkdir()
+        old = time.time() - 31
+        os.utime(lock_path, (old, old))
+
+        lock = FileLock(lock_path, timeout=0.1, break_on_timeout=False)
+        lock._method = "sqlite"
+        with lock:
+            assert lock_path.is_file()
+
+    def test_sqlite_fallback_waits_for_recent_legacy_lock_directory(self, tmp_path):
+        lock_path = tmp_path / "test.lock"
+        lock_path.mkdir()
+
+        lock = FileLock(lock_path, timeout=0.1, break_on_timeout=False)
+        lock._method = "sqlite"
+        with pytest.raises(TimeoutError, match="timed out acquiring lock"):
+            lock.__enter__()
+
+    def test_sqlite_fallback_maps_legacy_python_busy_error_to_timeout(self, tmp_path):
+        lock = FileLock(tmp_path / "test.lock", timeout=0.1, break_on_timeout=False)
+        lock._method = "sqlite"
+
+        busy = sqlite3.OperationalError("database is locked")
+        with mock.patch("core.common.sqlite3.connect", side_effect=busy):
+            with pytest.raises(TimeoutError, match="timed out acquiring lock"):
+                lock.__enter__()
 
     def test_creates_parent_directories(self, tmp_path):
         """FileLock creates parent directories if missing."""

@@ -386,6 +386,23 @@ class TestGcStaleStateFiles:
         assert not state_file.exists()
         assert not state_lock.exists()
 
+    def test_active_session_lock_prevents_gc_after_shard_is_released(self, omp_state_dir, disable_env_vars):
+        """An active handler holds only the per-session lock during its work."""
+        key = "active-session"
+        state_file = omp_state_dir / f"state_{key}.json"
+        state_file.write_text("{}")
+        old_time = time.time() - 90000
+        os.utime(state_file, (old_time, old_time))
+        session_lock = adapter.session_dispatch_lock_path_for_key(key)
+
+        with FileLock(session_lock, timeout=1, break_on_timeout=False):
+            adapter.gc_stale_state_files()
+            assert state_file.exists()
+
+        adapter.gc_stale_state_files()
+        assert not state_file.exists()
+        assert not session_lock.exists()
+
     def test_dispatch_lock_file_is_not_removed_with_stale_session(self, omp_state_dir, disable_env_vars):
         """GC never unlinks dispatcher locks, which may still be held by another process."""
         state_file = omp_state_dir / "state_old-dispatch.json"

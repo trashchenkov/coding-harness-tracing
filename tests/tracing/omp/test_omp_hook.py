@@ -1218,6 +1218,98 @@ class TestMainEntryPoint:
 
         assert max_active == 1
 
+    def test_colliding_sessions_do_not_share_the_long_running_lock(self, monkeypatch, tmp_path):
+        """Shard collisions protect lifecycle only; unrelated handlers may overlap."""
+        monkeypatch.setattr("tracing.omp.hooks.handlers.STATE_DIR", tmp_path)
+        first = {"type": "turn_end", "sessionId": "session-0", "message": {}, "toolResults": []}
+        first_path = handlers_module._dispatch_lock_path(first)
+        second = next(
+            {"type": "turn_end", "sessionId": f"session-{index}", "message": {}, "toolResults": []}
+            for index in range(1, 10_000)
+            if handlers_module._dispatch_lock_path({"sessionId": f"session-{index}"}) == first_path
+        )
+        local_payload = threading.local()
+        active = 0
+        max_active = 0
+        guard = threading.Lock()
+        entered = threading.Barrier(2, timeout=5)
+
+        def read_payload():
+            return local_payload.value
+
+        def slow_handler(_payload):
+            nonlocal active, max_active
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            entered.wait()
+            with guard:
+                active -= 1
+
+        def run_one(payload):
+            local_payload.value = payload
+            main()
+
+        with (
+            mock.patch("tracing.omp.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.omp.hooks.handlers._read_stdin", side_effect=read_payload),
+            mock.patch("tracing.omp.hooks.handlers._handle_turn_end", side_effect=slow_handler),
+        ):
+            threads = [threading.Thread(target=run_one, args=(payload,)) for payload in (first, second)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+        assert max_active == 2
+
+    def test_handler_timeout_is_not_retried(self, monkeypatch, tmp_path):
+        """Only acquisition timeouts may retry; handler side effects run at most once."""
+        payload = {"type": "turn_end", "sessionId": "same", "message": {}, "toolResults": []}
+        monkeypatch.setattr("tracing.omp.hooks.handlers.STATE_DIR", tmp_path)
+        with (
+            mock.patch("tracing.omp.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.omp.hooks.handlers._read_stdin", return_value=payload),
+            mock.patch(
+                "tracing.omp.hooks.handlers._handle_turn_end", side_effect=[TimeoutError("handler"), None]
+            ) as handler,
+        ):
+            main()
+
+        handler.assert_called_once_with(payload)
+
+    def test_dispatch_timeout_retries_instead_of_dropping_event(self, monkeypatch, tmp_path):
+        """A shard collision may delay an event but must not discard it."""
+        payload = {"type": "turn_end", "sessionId": "same", "message": {}, "toolResults": []}
+        attempts = 0
+
+        class RetryOnceLock:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise TimeoutError("busy shard")
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        monkeypatch.setattr("tracing.omp.hooks.handlers.STATE_DIR", tmp_path)
+        with (
+            mock.patch("tracing.omp.hooks.handlers.check_requirements", return_value=True),
+            mock.patch("tracing.omp.hooks.handlers._read_stdin", return_value=payload),
+            mock.patch("tracing.omp.hooks.handlers.FileLock", RetryOnceLock),
+            mock.patch("tracing.omp.hooks.handlers._handle_turn_end") as handler,
+        ):
+            main()
+
+        assert attempts == 3  # failed shard, successful shard, per-session lock
+        handler.assert_called_once_with(payload)
+
     def test_no_system_exit_on_unknown(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         payload = {"type": "???"}

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from tracing.omp.hooks.adapter import (
     ensure_session_initialized,
     gc_stale_state_files,
     resolve_session,
+    session_dispatch_lock_path_for_key,
     session_file_key,
 )
 
@@ -212,9 +214,29 @@ def _tool_identity(turn_identity: str, call_id: Any, result_index: int) -> str:
 
 def _dispatch_lock_path(input_json: dict) -> Path:
     key = session_file_key(input_json)
-    # Keep a bounded pool of stable lock inodes: unlinking a per-session lock can
-    # silently break mutual exclusion while another hook process still holds it.
+    # Keep a bounded pool of stable lifecycle guards. Long-running handlers use
+    # a per-session lock so unrelated keys that hash to one shard can overlap.
     return dispatch_lock_path_for_key(key, STATE_DIR)
+
+
+def _session_dispatch_lock_path(input_json: dict) -> Path:
+    return session_dispatch_lock_path_for_key(session_file_key(input_json), STATE_DIR)
+
+
+def _acquire_session_dispatch_lock(input_json: dict) -> FileLock:
+    """Acquire a per-session lock while briefly holding its lifecycle shard."""
+    shard_path = _dispatch_lock_path(input_json)
+    session_path = _session_dispatch_lock_path(input_json)
+    while True:
+        try:
+            with FileLock(shard_path, timeout=0.1, break_on_timeout=False):
+                session_lock = FileLock(session_path, timeout=0, break_on_timeout=False)
+                session_lock.__enter__()
+                return session_lock
+        except TimeoutError:
+            # A collision or the same session is active. The shard is never held
+            # while running a handler, so unrelated sessions quickly make progress.
+            time.sleep(0.01)
 
 
 def _int_or_zero(value: Any) -> int:
@@ -556,29 +578,27 @@ def main() -> None:
             return
 
         kind = input_json.get("type")
-        session_id = _bounded_text(input_json.get("sessionId"), MAX_METADATA_CHARS)
         if kind == "before_agent_start":
             try:
                 gc_stale_state_files()
             except Exception as exc:
                 log(f"omp: stale-state GC failed (non-fatal): {exc!r}")
-        dispatch_lock = _dispatch_lock_path(input_json)
+        session_lock = _acquire_session_dispatch_lock(input_json)
         try:
-            with FileLock(dispatch_lock, timeout=5.0, break_on_timeout=False):
-                if kind == "before_agent_start":
-                    _handle_before_agent_start(input_json)
-                elif kind == "turn_end":
-                    _handle_turn_end(input_json)
-                elif kind == "agent_end":
-                    _handle_agent_end(input_json)
-                elif kind == "session_shutdown":
-                    _handle_session_shutdown(input_json)
-                else:
-                    log(f"omp: unknown type {kind!r}")
-        except TimeoutError:
-            error(f"omp: timed out serializing session {session_id!r}")
+            if kind == "before_agent_start":
+                _handle_before_agent_start(input_json)
+            elif kind == "turn_end":
+                _handle_turn_end(input_json)
+            elif kind == "agent_end":
+                _handle_agent_end(input_json)
+            elif kind == "session_shutdown":
+                _handle_session_shutdown(input_json)
+            else:
+                log(f"omp: unknown type {kind!r}")
         except Exception as exc:
             error(f"omp {kind!r} failed: {exc!r}")
+        finally:
+            session_lock.__exit__(None, None, None)
     except Exception as exc:
         error(f"omp main() crashed: {exc!r}")
 

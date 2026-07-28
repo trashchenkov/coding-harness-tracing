@@ -12,6 +12,7 @@ import functools
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -802,22 +803,22 @@ except ImportError:
 
         _LOCK_IMPL = "msvcrt"
     except ImportError:
-        _LOCK_IMPL = "mkdir"
+        _LOCK_IMPL = "sqlite"
 
 
 class FileLock:
     """Cross-platform file lock.
 
     Uses fcntl.flock on Unix, msvcrt.locking on Windows.
-    Falls back to mkdir-based locking if neither is available.
+    Falls back to a SQLite transaction if neither is available; SQLite releases
+    the transaction automatically when a lock-owning process crashes.
 
     Usage:
         with FileLock(Path("/path/to/.lock"), timeout=3.0):
             # exclusive access
 
-    The lock_path can be a file or directory path:
-    - fcntl/msvcrt mode: creates/opens lock_path as a file
-    - mkdir fallback: creates lock_path as a directory (matches bash behavior)
+    The lock_path is a file path in all selected implementations. The legacy
+    mkdir methods remain for compatibility with tests that exercise them directly.
     """
 
     def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True) -> None:
@@ -825,6 +826,7 @@ class FileLock:
         self.timeout = timeout
         self.break_on_timeout = break_on_timeout
         self._fd: Optional[IO[str]] = None
+        self._sqlite_connection: Optional[sqlite3.Connection] = None
         self._method = _LOCK_IMPL
 
     def __enter__(self) -> "FileLock":
@@ -834,6 +836,8 @@ class FileLock:
             self._acquire_fcntl()
         elif self._method == "msvcrt":
             self._acquire_msvcrt()
+        elif self._method == "sqlite":
+            self._acquire_sqlite()
         else:
             self._acquire_mkdir()
         return self
@@ -843,8 +847,53 @@ class FileLock:
             self._release_fcntl()
         elif self._method == "msvcrt":
             self._release_msvcrt()
+        elif self._method == "sqlite":
+            self._release_sqlite()
         else:
             self._release_mkdir()
+
+    def _acquire_sqlite(self) -> None:
+        """Use SQLite's crash-released transaction lock as the last fallback."""
+        # Migrate directories left by the former mkdir fallback. A live
+        # old-version owner gets a grace period longer than the OMP shim timeout;
+        # rmdir is atomic and cannot remove a replacement SQLite file.
+        if self.lock_path.is_dir():
+            try:
+                if time.time() - self.lock_path.stat().st_mtime < 30.0:
+                    raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
+                self.lock_path.rmdir()
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            except OSError as exc:
+                raise TimeoutError(f"timed out acquiring lock: {self.lock_path}") from exc
+
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(
+                self.lock_path,
+                timeout=max(0.0, self.timeout),
+                isolation_level=None,
+            )
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if connection is not None:
+                connection.close()
+            error_code = getattr(exc, "sqlite_errorcode", None)
+            primary_code = error_code & 0xFF if isinstance(error_code, int) else None
+            message = str(exc).lower()
+            if primary_code in {5, 6} or message in {"database is locked", "database table is locked"}:
+                raise TimeoutError(f"timed out acquiring lock: {self.lock_path}") from exc
+            raise
+        self._sqlite_connection = connection
+
+    def _release_sqlite(self) -> None:
+        if self._sqlite_connection is None:
+            return
+        try:
+            self._sqlite_connection.rollback()
+        finally:
+            self._sqlite_connection.close()
+            self._sqlite_connection = None
 
     def _acquire_fcntl(self) -> None:
         self._fd = open(self.lock_path, "w")

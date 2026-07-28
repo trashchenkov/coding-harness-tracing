@@ -137,6 +137,12 @@ def _read_settings(settings_file):
     return json.loads(settings_file.read_text(encoding="utf-8"))
 
 
+def test_plugin_does_not_kill_a_dispatcher_waiting_for_session_lock(plugin_source_text):
+    """A contended event must wait rather than be killed and silently dropped."""
+    assert "FORWARD_TIMEOUT_MS" not in plugin_source_text
+    assert "setTimeout(" not in plugin_source_text
+
+
 # ---------------------------------------------------------------------------
 # Install tests — fresh install (config.json harness entry)
 # ---------------------------------------------------------------------------
