@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from core.common import StateManager
+from core.common import FileLock, StateManager
 
 # ---------------------------------------------------------------------------
 # We import the adapter module itself so we can monkeypatch its module-level
@@ -367,8 +367,27 @@ class TestGcStaleStateFiles:
         assert not state_file.exists()
         assert not lock_file.exists()
 
-    def test_dispatch_lock_file_removed_with_stale_session(self, omp_state_dir, disable_env_vars):
-        """GC removes the dispatcher lock paired with stale session state."""
+    def test_active_dispatch_shard_prevents_gc_unlink(self, omp_state_dir, disable_env_vars):
+        """GC must not unlink state or its lock while an active hook owns the shard."""
+        key = "active-session"
+        state_file = omp_state_dir / f"state_{key}.json"
+        state_file.write_text("{}")
+        state_lock = omp_state_dir / f".lock_{key}"
+        state_lock.write_text("")
+        old_time = time.time() - 90000
+        os.utime(state_file, (old_time, old_time))
+
+        with FileLock(adapter.dispatch_lock_path_for_key(key), timeout=1, break_on_timeout=False):
+            adapter.gc_stale_state_files()
+            assert state_file.exists()
+            assert state_lock.exists()
+
+        adapter.gc_stale_state_files()
+        assert not state_file.exists()
+        assert not state_lock.exists()
+
+    def test_dispatch_lock_file_is_not_removed_with_stale_session(self, omp_state_dir, disable_env_vars):
+        """GC never unlinks dispatcher locks, which may still be held by another process."""
         state_file = omp_state_dir / "state_old-dispatch.json"
         state_file.write_text("{}")
         dispatch_lock = omp_state_dir / ".dispatch_old-dispatch"
@@ -379,7 +398,7 @@ class TestGcStaleStateFiles:
         adapter.gc_stale_state_files()
 
         assert not state_file.exists()
-        assert not dispatch_lock.exists()
+        assert dispatch_lock.exists()
 
     def test_empty_dir_no_error(self, omp_state_dir, disable_env_vars):
         """Empty STATE_DIR causes no errors."""

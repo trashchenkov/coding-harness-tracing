@@ -35,6 +35,7 @@ from tracing.omp.hooks.adapter import (
     SERVICE_NAME,
     STATE_DIR,
     check_requirements,
+    dispatch_lock_path_for_key,
     ensure_session_initialized,
     gc_stale_state_files,
     resolve_session,
@@ -210,7 +211,10 @@ def _tool_identity(turn_identity: str, call_id: Any, result_index: int) -> str:
 
 
 def _dispatch_lock_path(input_json: dict) -> Path:
-    return STATE_DIR / f".dispatch_{session_file_key(input_json)}"
+    key = session_file_key(input_json)
+    # Keep a bounded pool of stable lock inodes: unlinking a per-session lock can
+    # silently break mutual exclusion while another hook process still holds it.
+    return dispatch_lock_path_for_key(key, STATE_DIR)
 
 
 def _int_or_zero(value: Any) -> int:
@@ -553,11 +557,15 @@ def main() -> None:
 
         kind = input_json.get("type")
         session_id = _bounded_text(input_json.get("sessionId"), MAX_METADATA_CHARS)
+        if kind == "before_agent_start":
+            try:
+                gc_stale_state_files()
+            except Exception as exc:
+                log(f"omp: stale-state GC failed (non-fatal): {exc!r}")
         dispatch_lock = _dispatch_lock_path(input_json)
         try:
             with FileLock(dispatch_lock, timeout=5.0, break_on_timeout=False):
                 if kind == "before_agent_start":
-                    gc_stale_state_files()
                     _handle_before_agent_start(input_json)
                 elif kind == "turn_end":
                     _handle_turn_end(input_json)

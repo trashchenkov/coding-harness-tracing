@@ -20,8 +20,9 @@ import hashlib
 import os
 import re
 import time
+from pathlib import Path
 
-from core.common import StateManager, env, get_timestamp_ms, log, redirect_stderr_to_log_file
+from core.common import FileLock, StateManager, env, get_timestamp_ms, log, redirect_stderr_to_log_file
 from core.constants import HARNESSES, STATE_BASE_DIR
 from tracing.omp.constants import HARNESS_NAME
 
@@ -124,11 +125,18 @@ def ensure_session_initialized(state: StateManager, input_json: dict) -> None:
     log(f"Session initialized: {session_id}")
 
 
+def dispatch_lock_path_for_key(key: str, state_dir: Path | None = None) -> Path:
+    """Return the stable bounded dispatcher lock protecting a state key."""
+    shard = hashlib.sha256(key.encode("utf-8", errors="surrogatepass")).hexdigest()[:2]
+    return (STATE_DIR if state_dir is None else state_dir) / f".dispatch_h_{shard}"
+
+
 def gc_stale_state_files() -> None:
     """Remove state files (and their lock files) older than 24h by mtime.
 
     omp keys are session IDs (not PIDs), so this is the mtime-only branch — no
-    PID-liveness check.
+    PID-liveness check. Each candidate is rechecked under its dispatcher shard
+    so GC cannot unlink state or a lock inode used by an active hook.
     """
     if not STATE_DIR.is_dir():
         return
@@ -136,36 +144,32 @@ def gc_stale_state_files() -> None:
     for f in STATE_DIR.glob("state_*.json"):
         try:
             key = f.stem.replace("state_", "", 1)
-            if f.stat().st_mtime >= cutoff:
-                continue
-
             try:
-                f.unlink(missing_ok=True)
-            except OSError as e:
-                log(f"GC: failed to remove stale state file {f}: {e}")
+                with FileLock(dispatch_lock_path_for_key(key), timeout=0, break_on_timeout=False):
+                    if f.stat().st_mtime >= cutoff:
+                        continue
 
-            lock_path = STATE_DIR / f".lock_{key}"
-            if lock_path.is_dir():
-                try:
-                    lock_path.rmdir()
-                except OSError as e:
-                    log(f"GC: failed to remove stale lock directory {lock_path}: {e}")
-            elif lock_path.is_file():
-                try:
-                    lock_path.unlink(missing_ok=True)
-                except OSError as e:
-                    log(f"GC: failed to remove stale lock file {lock_path}: {e}")
+                    try:
+                        f.unlink(missing_ok=True)
+                    except OSError as e:
+                        log(f"GC: failed to remove stale state file {f}: {e}")
 
-            dispatch_path = STATE_DIR / f".dispatch_{key}"
-            if dispatch_path.is_dir():
-                try:
-                    dispatch_path.rmdir()
-                except OSError as e:
-                    log(f"GC: failed to remove stale dispatch lock directory {dispatch_path}: {e}")
-            elif dispatch_path.is_file():
-                try:
-                    dispatch_path.unlink(missing_ok=True)
-                except OSError as e:
-                    log(f"GC: failed to remove stale dispatch lock file {dispatch_path}: {e}")
+                    lock_path = STATE_DIR / f".lock_{key}"
+                    if lock_path.is_dir():
+                        try:
+                            lock_path.rmdir()
+                        except OSError as e:
+                            log(f"GC: failed to remove stale lock directory {lock_path}: {e}")
+                    elif lock_path.is_file():
+                        try:
+                            lock_path.unlink(missing_ok=True)
+                        except OSError as e:
+                            log(f"GC: failed to remove stale lock file {lock_path}: {e}")
+            except TimeoutError:
+                # An active hook owns this shard. Leave the candidate for a later pass.
+                continue
+            except FileNotFoundError:
+                # Another GC pass may already have removed this candidate.
+                continue
         except OSError as e:
             log(f"GC: failed to inspect stale state candidate {f}: {e}")

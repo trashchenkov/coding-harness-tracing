@@ -676,6 +676,12 @@ class TestHighFidelityTurnTopology:
         assert path.name.startswith(".dispatch_h_")
         assert len(path.name) < 100
 
+    def test_dispatch_lock_paths_are_bounded(self, tmp_path, monkeypatch):
+        """Per-session serialization uses a bounded lock pool rather than leaking files."""
+        monkeypatch.setattr(handlers_module, "STATE_DIR", tmp_path)
+        paths = {handlers_module._dispatch_lock_path({"sessionId": f"session-{index}"}) for index in range(1000)}
+        assert len(paths) <= 256
+
     def test_malformed_containers_and_counters_degrade_safely(self, mock_resolve, mock_ensure, state, captured_spans):
         _handle_before_agent_start(_load_fixture("before_agent_start.json"))
         payload = _load_fixture("turn_end_basic.json")
@@ -1104,6 +1110,16 @@ class TestMainEntryPoint:
         ae.assert_not_called()
         ss.assert_not_called()
         gc.assert_called_once_with()
+
+    def test_gc_failure_does_not_drop_before_agent_start(self, monkeypatch):
+        monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
+        payload = {"type": "before_agent_start", "sessionId": "x", "prompt": "hi"}
+        with mock.patch("tracing.omp.hooks.handlers.gc_stale_state_files", side_effect=OSError("gc failed")):
+            bas, te, ae, ss = self._run_main(payload)
+        bas.assert_called_once_with(payload)
+        te.assert_not_called()
+        ae.assert_not_called()
+        ss.assert_not_called()
 
     def test_dispatches_turn_end(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
