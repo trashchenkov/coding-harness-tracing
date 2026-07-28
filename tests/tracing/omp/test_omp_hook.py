@@ -1097,11 +1097,13 @@ class TestMainEntryPoint:
     def test_dispatches_before_agent_start(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")
         payload = {"type": "before_agent_start", "sessionId": "x", "prompt": "hi"}
-        bas, te, ae, ss = self._run_main(payload)
+        with mock.patch("tracing.omp.hooks.handlers.gc_stale_state_files") as gc:
+            bas, te, ae, ss = self._run_main(payload)
         bas.assert_called_once_with(payload)
         te.assert_not_called()
         ae.assert_not_called()
         ss.assert_not_called()
+        gc.assert_called_once_with()
 
     def test_dispatches_turn_end(self, monkeypatch):
         monkeypatch.setenv("ARIZE_TRACE_ENABLED", "true")

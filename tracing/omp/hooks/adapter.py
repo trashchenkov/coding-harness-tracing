@@ -155,5 +155,17 @@ def gc_stale_state_files() -> None:
                     lock_path.unlink(missing_ok=True)
                 except OSError as e:
                     log(f"GC: failed to remove stale lock file {lock_path}: {e}")
+
+            dispatch_path = STATE_DIR / f".dispatch_{key}"
+            if dispatch_path.is_dir():
+                try:
+                    dispatch_path.rmdir()
+                except OSError as e:
+                    log(f"GC: failed to remove stale dispatch lock directory {dispatch_path}: {e}")
+            elif dispatch_path.is_file():
+                try:
+                    dispatch_path.unlink(missing_ok=True)
+                except OSError as e:
+                    log(f"GC: failed to remove stale dispatch lock file {dispatch_path}: {e}")
         except OSError as e:
             log(f"GC: failed to inspect stale state candidate {f}: {e}")

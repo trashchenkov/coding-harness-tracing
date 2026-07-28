@@ -36,6 +36,7 @@ from tracing.omp.hooks.adapter import (
     STATE_DIR,
     check_requirements,
     ensure_session_initialized,
+    gc_stale_state_files,
     resolve_session,
     session_file_key,
 )
@@ -556,6 +557,7 @@ def main() -> None:
         try:
             with FileLock(dispatch_lock, timeout=5.0, break_on_timeout=False):
                 if kind == "before_agent_start":
+                    gc_stale_state_files()
                     _handle_before_agent_start(input_json)
                 elif kind == "turn_end":
                     _handle_turn_end(input_json)

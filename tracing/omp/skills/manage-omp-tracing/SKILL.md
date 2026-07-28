@@ -202,7 +202,7 @@ Each trace covers one **agent run** (one user prompt → the agent's internal tu
 |------|------|-------------|
 | `Turn` | CHAIN | Root span. `input.value` is the user prompt (from `before_agent_start`); `output.value` is the final assistant message's text. One per agent run. |
 | `LLM: <model>` | LLM | Child of `Turn`. One per `turn_end` (one per model call in the loop). Carries `llm.model_name`, `llm.provider`, prompt/completion/reasoning token counts, cache read/write tokens, and `llm.cost`. omp surfaces token usage inline on the assistant message, so it **is** captured. |
-| `<tool>` | TOOL | Child of `Turn`. One per `ToolResultMessage` in a `turn_end`, paired with its originating `ToolCall` by id. Records `tool.name`, redacted input args + output, and tool-specific attributes; errors are recorded with span status. |
+| `<tool>` | TOOL | Child of the `LLM` span that requested it. One per `ToolResultMessage` in a `turn_end`, paired with its originating `ToolCall` by id. Records `tool.name`, redacted input args + output, and tool-specific attributes; errors are recorded with span status. |
 
 ## Troubleshoot
 

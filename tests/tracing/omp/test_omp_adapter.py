@@ -367,6 +367,20 @@ class TestGcStaleStateFiles:
         assert not state_file.exists()
         assert not lock_file.exists()
 
+    def test_dispatch_lock_file_removed_with_stale_session(self, omp_state_dir, disable_env_vars):
+        """GC removes the dispatcher lock paired with stale session state."""
+        state_file = omp_state_dir / "state_old-dispatch.json"
+        state_file.write_text("{}")
+        dispatch_lock = omp_state_dir / ".dispatch_old-dispatch"
+        dispatch_lock.write_text("")
+        old_time = time.time() - 90000
+        os.utime(state_file, (old_time, old_time))
+
+        adapter.gc_stale_state_files()
+
+        assert not state_file.exists()
+        assert not dispatch_lock.exists()
+
     def test_empty_dir_no_error(self, omp_state_dir, disable_env_vars):
         """Empty STATE_DIR causes no errors."""
         for f in omp_state_dir.glob("state_*.json"):
