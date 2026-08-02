@@ -41,10 +41,23 @@ from .transcript import parse_qwen_transcript
 
 
 def _read_stdin() -> dict:
-    """Read hook input JSON from stdin, tolerating empty or malformed payloads."""
+    """Read hook input JSON from stdin, tolerating empty or malformed payloads.
+
+    The payload is decoded from bytes as UTF-8 rather than read as text. Hook
+    payloads carry user prompts and tool output, and ``sys.stdin.read()``
+    decodes with the interpreter's locale encoding — on a Windows console set to
+    a non-UTF-8 codepage that raises ``UnicodeDecodeError`` on any non-ASCII
+    prompt, the entry point swallows it, and the turn silently produces no span.
+    Reading bytes removes the locale from the path entirely. See #88, which
+    reports the same failure mode for transcript reads.
+    """
     try:
-        raw = sys.stdin.read()
-    except (OSError, UnicodeError):
+        buffer = getattr(sys.stdin, "buffer", None)
+        if buffer is not None:
+            raw = buffer.read().decode("utf-8", errors="replace")
+        else:  # pragma: no cover - stdin replaced by a text-only stub
+            raw = sys.stdin.read()
+    except (OSError, UnicodeError, ValueError):
         return {}
     if not raw.strip():
         return {}

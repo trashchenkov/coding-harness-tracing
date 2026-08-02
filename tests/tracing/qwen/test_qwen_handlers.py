@@ -203,3 +203,28 @@ def test_read_stdin_tolerates_garbage(monkeypatch):
     monkeypatch.setattr("sys.stdin", type("S", (), {"read": staticmethod(lambda: "not json")})())
 
     assert handlers._read_stdin() == {}
+
+
+def test_read_stdin_decodes_utf8_regardless_of_locale(monkeypatch):
+    """Hook payloads carry non-ASCII prompts; the locale codec must not apply.
+
+    Reading text from stdin decodes with the interpreter locale, which on a
+    Windows console set to a non-UTF-8 codepage raises UnicodeDecodeError and
+    silently costs the turn its span (see upstream #88 for the same failure on
+    transcript reads). Reading bytes keeps the payload intact everywhere.
+    """
+    import io
+
+    payload = {"prompt": "привет 안녕 مرحبا", "session_id": "s1"}
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    class _Stdin:
+        buffer = io.BytesIO(encoded)
+
+        @staticmethod
+        def read():  # pragma: no cover - must not be reached
+            raise AssertionError("stdin must be read as bytes, not text")
+
+    monkeypatch.setattr("sys.stdin", _Stdin())
+
+    assert handlers._read_stdin() == payload
