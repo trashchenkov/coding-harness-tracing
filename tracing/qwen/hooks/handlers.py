@@ -101,7 +101,17 @@ def _handle_session_end(input_json: dict) -> None:
 
 
 def _handle_user_prompt_submit(input_json: dict) -> None:
-    """Open a new turn, closing an orphaned one first."""
+    """Open a new turn, closing an orphaned one first.
+
+    Qwen Code fires this event again after tool results, to continue the same
+    turn, and that continuation carries an empty ``prompt``. Treating it as a
+    new turn splits one user request across two traces, so only a non-empty
+    prompt opens a turn.
+    """
+    prompt = input_json.get("prompt", "") or ""
+    if not prompt.strip():
+        return
+
     state = resolve_session(input_json)
     ensure_session_initialized(state, input_json)
 
@@ -126,7 +136,7 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
     state.set("current_trace_start_time", str(get_timestamp_ms()))
     # Store the raw prompt; redaction happens at emit time so the toggle is read
     # once per export rather than baked into the state file.
-    state.set("current_trace_prompt", input_json.get("prompt", "") or "")
+    state.set("current_trace_prompt", prompt)
     state.set("pending_subagents", "{}")
 
     # Record where this turn starts in the transcript so Stop only reads the
