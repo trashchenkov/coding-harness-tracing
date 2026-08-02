@@ -13,7 +13,6 @@ session-scoped root span would never close there.
 
 import json
 import sys
-from pathlib import Path
 
 from core.common import (
     env,
@@ -108,16 +107,16 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
 
     # A retained turn means a previous export failed; retry it before opening a
     # new one so stable span IDs and the transcript offset are not lost.
-    prev_trace_id = state.get("current_trace_id")
+    prev_trace_id = state.get("current_trace_id") or ""
     if prev_trace_id:
         retry_input = dict(input_json)
         retry_input.setdefault("last_assistant_message", "(Turn closed by fail-safe: Stop hook did not fire)")
         _handle_stop(retry_input)
-        current = state.get("current_trace_id")
+        current = state.get("current_trace_id") or ""
         if current == prev_trace_id:
             log("Fail-safe: retained orphaned turn after failed export")
             return
-        if current is not None:
+        if current:
             log("Fail-safe: a concurrent newer turn owns the session state")
             return
 
@@ -149,7 +148,9 @@ def _handle_stop(input_json: dict) -> None:
     state = resolve_session(input_json)
     session_id = state.get("session_id")
     trace_id = state.get("current_trace_id")
-    if session_id is None or trace_id is None:
+    # Empty strings can survive in state files written by older versions; treat
+    # them as absent so a cleared turn is never re-exported with a blank trace.
+    if not session_id or not trace_id:
         return
 
     trace_span_id = state.get("current_trace_span_id") or generate_span_id()
@@ -248,7 +249,7 @@ def _clear_turn(state) -> None:
         "pending_subagents",
         "turn_failed",
     ):
-        state.set(key, "")
+        state.delete(key)
 
 
 def _periodic_gc(trace_count: str) -> None:
@@ -355,19 +356,11 @@ def _merge_subagents(state, graph) -> None:
         graph.events.append(agent_event)
         sequence += 1
 
-        child_path = descriptor.get("transcript_path") or ""
-        if not child_path:
-            continue
-        child_file = Path(child_path)
-        if not child_file.is_file():
-            log(f"subagent transcript missing, exporting agent span only: {child_path}")
-            continue
-        child_graph = parse_qwen_transcript(child_file, agent_event)
-        # Skip the root: it is already in the parent graph.
-        for event in child_graph.events[1:]:
-            event.sequence = sequence
-            sequence += 1
-            graph.events.append(event)
+        # Qwen Code does not expose the subagent's internal steps: as of 0.21.3
+        # `agent_transcript_path` on SubagentStop is the *parent* transcript,
+        # not a child file. Parsing it again would duplicate the parent's model
+        # calls and tools beneath the AGENT span. What the harness can report is
+        # the invocation itself, its timings and its final answer.
 
 
 # ---------------------------------------------------------------------------
