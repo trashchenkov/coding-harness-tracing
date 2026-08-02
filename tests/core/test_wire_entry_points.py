@@ -53,6 +53,23 @@ EXPECTED_HARNESS_ENTRY_POINTS = {
     "arize-hook-copilot-stop": "tracing.copilot.hooks.handlers:stop",
     "arize-hook-copilot-subagent-stop": "tracing.copilot.hooks.handlers:subagent_stop",
     # Gemini hooks
+    "arize-hook-qwen-session-start": "tracing.qwen.hooks.handlers:session_start",
+    "arize-hook-qwen-session-end": "tracing.qwen.hooks.handlers:session_end",
+    "arize-hook-qwen-user-prompt-submit": "tracing.qwen.hooks.handlers:user_prompt_submit",
+    "arize-hook-qwen-pre-tool-use": "tracing.qwen.hooks.handlers:pre_tool_use",
+    "arize-hook-qwen-post-tool-use": "tracing.qwen.hooks.handlers:post_tool_use",
+    "arize-hook-qwen-post-tool-use-failure": "tracing.qwen.hooks.handlers:post_tool_use_failure",
+    "arize-hook-qwen-stop": "tracing.qwen.hooks.handlers:stop",
+    "arize-hook-qwen-stop-failure": "tracing.qwen.hooks.handlers:stop_failure",
+    "arize-hook-qwen-subagent-start": "tracing.qwen.hooks.handlers:subagent_start",
+    "arize-hook-qwen-subagent-stop": "tracing.qwen.hooks.handlers:subagent_stop",
+    "arize-hook-qwen-pre-compact": "tracing.qwen.hooks.handlers:pre_compact",
+    "arize-hook-qwen-post-compact": "tracing.qwen.hooks.handlers:post_compact",
+    "arize-hook-qwen-notification": "tracing.qwen.hooks.handlers:notification",
+    "arize-hook-qwen-permission-request": "tracing.qwen.hooks.handlers:permission_request",
+    "arize-hook-qwen-permission-denied": "tracing.qwen.hooks.handlers:permission_denied",
+    "arize-hook-qwen-todo-created": "tracing.qwen.hooks.handlers:todo_created",
+    "arize-hook-qwen-todo-completed": "tracing.qwen.hooks.handlers:todo_completed",
     "arize-hook-gemini-session-start": "tracing.gemini.hooks.handlers:session_start",
     "arize-hook-gemini-session-end": "tracing.gemini.hooks.handlers:session_end",
     "arize-hook-gemini-before-agent": "tracing.gemini.hooks.handlers:before_agent",
@@ -77,6 +94,7 @@ EXPECTED_SETUP_ENTRY_POINTS = {
     "arize-setup-codex": "core.setup.codex:main",
     "arize-setup-copilot": "core.setup.copilot:main",
     "arize-setup-cursor": "core.setup.cursor:main",
+    "arize-setup-qwen": "core.setup.qwen:main",
     "arize-setup-gemini": "core.setup.gemini:main",
     "arize-setup-kiro": "core.setup.kiro:main",
     "arize-setup-opencode": "core.setup.opencode:main",
@@ -135,9 +153,9 @@ class TestPyprojectEntryPointsUpdated:
         expected_count = (
             len(EXPECTED_HARNESS_ENTRY_POINTS) + len(EXPECTED_SETUP_ENTRY_POINTS) + 1
         )  # +1 for arize-config
-        assert (
-            len(self.scripts) == expected_count
-        ), f"Expected {expected_count} entry points, got {len(self.scripts)}: {sorted(self.scripts.keys())}"
+        assert len(self.scripts) == expected_count, (
+            f"Expected {expected_count} entry points, got {len(self.scripts)}: {sorted(self.scripts.keys())}"
+        )
 
 
 # ---------------------------------------------------------------------------
