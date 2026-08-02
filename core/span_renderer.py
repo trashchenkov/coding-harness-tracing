@@ -255,7 +255,9 @@ def _safe_parent_event_ids(events: list[BaseEvent]) -> list[str | None]:
         (
             None
             if event.event_id in break_ids and first_by_id[event.event_id] is event
-            else event.parent_event_id if event.parent_event_id in first_by_id else None
+            else event.parent_event_id
+            if event.parent_event_id in first_by_id
+            else None
         )
         for event in events
     ]

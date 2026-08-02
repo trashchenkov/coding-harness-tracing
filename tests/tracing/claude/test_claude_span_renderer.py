@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from core.event_model import AgentEvent, EventGraph, EventStatus, ModelCallEvent, ToolEvent, TurnEvent, Usage
-from tracing.claude_code.hooks.span_renderer import render_event_graph
+from core.span_renderer import render_event_graph
 from tracing.claude_code.hooks.transcript import parse_claude_transcript
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"

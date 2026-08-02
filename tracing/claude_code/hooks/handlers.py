@@ -33,7 +33,7 @@ from .adapter import (
     resolve_session,
     resolve_transcript_path,
 )
-from .span_renderer import render_event_graph
+from core.span_renderer import render_event_graph
 from .tool_buffer import ToolBuffer, ToolObservation
 from .transcript import parse_claude_transcript
 

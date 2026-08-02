@@ -62,6 +62,13 @@ HARNESSES: dict[str, HarnessMetadata] = {
         "state_subdir": "copilot",
         "default_log_file": LOG_DIR / "copilot.log",
     },
+    "qwen": {
+        "service_name": "qwen",
+        "scope_name": "arize-qwen-plugin",
+        "default_project_name": "qwen",
+        "state_subdir": "qwen",
+        "default_log_file": LOG_DIR / "qwen.log",
+    },
     "gemini": {
         "service_name": "gemini",
         "scope_name": "arize-gemini-plugin",
