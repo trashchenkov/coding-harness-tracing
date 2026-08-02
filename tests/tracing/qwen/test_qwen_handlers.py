@@ -184,6 +184,93 @@ def test_subagent_merge_does_not_reparse_the_parent_transcript(state_dir, tmp_pa
     assert "ModelCallEvent" not in kinds
 
 
+def test_two_subagents_bind_to_their_own_tool_calls(state_dir, tmp_path):
+    """Regression: pairing by event order filed a subagent under the wrong call.
+
+    Qwen embeds the invoking tool call id in `agent_id`, so binding uses that.
+    Here the stop events arrive in the opposite order to the transcript calls —
+    ordinal pairing would swap the two AGENT spans.
+    """
+    from core.event_model import EventGraph, EventStatus, ToolEvent, TurnEvent
+
+    payload = _payload(prompt="delegate twice")
+    handlers._handle_user_prompt_submit(payload)
+
+    for agent_id in ("general-purpose-call_aaa", "general-purpose-call_bbb"):
+        handlers._handle_subagent_start(
+            _payload(hook_event_name="SubagentStart", agent_id=agent_id, agent_type="general-purpose")
+        )
+    # Stop events out of order relative to the transcript.
+    for agent_id, answer in (("general-purpose-call_bbb", "second"), ("general-purpose-call_aaa", "first")):
+        handlers._handle_subagent_stop(
+            _payload(
+                hook_event_name="SubagentStop",
+                agent_id=agent_id,
+                agent_type="general-purpose",
+                last_assistant_message=answer,
+            )
+        )
+
+    root = TurnEvent(
+        event_id="turn-1",
+        session_id="sess-1",
+        turn_id="trace-1",
+        sequence=0,
+        started_at_ms=1,
+        ended_at_ms=2,
+        status=EventStatus.COMPLETED,
+    )
+
+    def _agent_tool(call_id, seq):
+        return ToolEvent(
+            event_id=f"tool-{call_id}",
+            session_id="sess-1",
+            turn_id="trace-1",
+            parent_event_id="turn-1",
+            sequence=seq,
+            started_at_ms=1,
+            ended_at_ms=2,
+            status=EventStatus.COMPLETED,
+            tool_call_id=call_id,
+            tool_name="agent",
+            source_id="general-purpose",
+        )
+
+    graph = EventGraph([root, _agent_tool("call_aaa", 1), _agent_tool("call_bbb", 2)])
+    handlers._merge_subagents(_state(payload), graph)
+
+    parents = {e.agent_id: e.parent_event_id for e in graph.events if type(e).__name__ == "AgentEvent"}
+    assert parents["general-purpose-call_aaa"] == "tool-call_aaa"
+    assert parents["general-purpose-call_bbb"] == "tool-call_bbb"
+
+
+def test_unmatched_subagent_falls_back_to_the_turn(state_dir):
+    """Evidence is kept rather than dropped when no tool call matches."""
+    from core.event_model import EventGraph, EventStatus, TurnEvent
+
+    payload = _payload(prompt="delegate")
+    handlers._handle_user_prompt_submit(payload)
+    handlers._handle_subagent_stop(
+        _payload(hook_event_name="SubagentStop", agent_id="general-purpose-call_zzz", agent_type="general-purpose")
+    )
+
+    root = TurnEvent(
+        event_id="turn-1",
+        session_id="sess-1",
+        turn_id="trace-1",
+        sequence=0,
+        started_at_ms=1,
+        ended_at_ms=2,
+        status=EventStatus.COMPLETED,
+    )
+    graph = EventGraph([root])
+    handlers._merge_subagents(_state(payload), graph)
+
+    agents = [e for e in graph.events if type(e).__name__ == "AgentEvent"]
+    assert len(agents) == 1
+    assert agents[0].parent_event_id == "turn-1"
+
+
 # ---------------------------------------------------------------------------
 # Robustness
 # ---------------------------------------------------------------------------

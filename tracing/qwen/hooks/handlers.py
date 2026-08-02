@@ -341,35 +341,62 @@ def _pending_subagents(state) -> dict:
     return decoded if isinstance(decoded, dict) else {}
 
 
-def _merge_subagents(state, graph) -> None:
-    """Attach each finished subagent as an AGENT subtree under its tool call.
+def _tool_call_id_from_agent_id(agent_id: str, agent_type: str) -> str:
+    """Recover the invoking tool call id from a Qwen subagent id.
 
-    The parent transcript already carries the invoking tool call; the child's
-    own transcript supplies the model calls and tools that ran inside it.
+    Qwen Code composes it as ``<agent_type>-<tool_call_id>``, e.g.
+    ``general-purpose-call_jhze7894``. The agent type is not a safe delimiter on
+    its own — it contains hyphens — so strip the known prefix and fall back to
+    the ``call_`` marker when the type is missing or does not match.
+    """
+    if agent_type and agent_id.startswith(f"{agent_type}-"):
+        return agent_id[len(agent_type) + 1 :]
+    marker = agent_id.find("call_")
+    return agent_id[marker:] if marker != -1 else ""
+
+
+def _merge_subagents(state, graph) -> None:
+    """Attach each finished subagent as an AGENT span under its own tool call.
+
+    Subagents are bound to the invoking `agent` tool through the call id that
+    Qwen embeds in `agent_id`, not through event order: with two subagents, or
+    with `run_in_background: true`, SubagentStart/Stop need not arrive in the
+    same order as the calls appear in the transcript, and ordinal pairing would
+    file the span under the wrong invocation.
     """
     pending = _pending_subagents(state)
     if not pending:
         return
 
-    # Tool calls that invoked a subagent are recoverable from the parent
-    # transcript: the parser records the subagent name on `source_id`.
-    agent_tools = [e for e in graph.events if isinstance(e, ToolEvent) and e.source_id]
+    root = graph.events[0]
+    # Tool calls that invoked a subagent: the parser tags them with the
+    # subagent name taken from the task_execution result display.
+    tools_by_call_id = {
+        e.tool_call_id: e for e in graph.events if isinstance(e, ToolEvent) and e.tool_call_id and e.source_id
+    }
     sequence = max((e.sequence for e in graph.events), default=0) + 1
 
-    for index, descriptor in enumerate(sorted(pending.values(), key=lambda d: d.get("started_at_ms") or 0)):
+    for descriptor in sorted(pending.values(), key=lambda d: d.get("started_at_ms") or 0):
         agent_id = descriptor.get("agent_id") or ""
         if not agent_id:
             continue
-        parent_tool = agent_tools[index] if index < len(agent_tools) else None
-        parent_event_id = parent_tool.event_id if parent_tool is not None else graph.events[0].event_id
+        agent_type = descriptor.get("agent_type") or ""
+
+        call_id = _tool_call_id_from_agent_id(agent_id, agent_type)
+        parent_tool = tools_by_call_id.get(call_id)
+        if parent_tool is None:
+            # An unmatched subagent still deserves a span; hanging it off the
+            # turn keeps the evidence rather than dropping it.
+            log(f"subagent {agent_id} has no matching tool call; attaching to the turn")
+        parent_event_id = parent_tool.event_id if parent_tool is not None else root.event_id
 
         agent_event = AgentEvent(
             event_id=f"agent-{agent_id}",
-            session_id=graph.events[0].session_id,
-            turn_id=graph.events[0].turn_id,
+            session_id=root.session_id,
+            turn_id=root.turn_id,
             parent_event_id=parent_event_id,
             agent_id=agent_id,
-            source_id=descriptor.get("agent_type") or "",
+            source_id=agent_type,
             sequence=sequence,
             started_at_ms=descriptor.get("started_at_ms"),
             ended_at_ms=descriptor.get("ended_at_ms"),
