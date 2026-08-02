@@ -75,6 +75,24 @@ without children. This is a limitation of the CLI, not of the harness.
 entries for events it does not know, so an older CLI simply never fires them
 and produces a thinner but valid trace.
 
+## Verification status
+
+Exercised against a live qwen 0.21.3 session, exporting to both Arize AX and a
+local Phoenix, with matching span trees on each:
+
+| Path | Status |
+| --- | --- |
+| turn, model calls, tools, tokens | verified live |
+| subagent invocation and `AGENT` span | verified live |
+| tool failure (`status`, `errorType`) | verified live |
+| todo phases | verified live |
+| permission request / denied | **not exercised** — non-interactive runs self-approve |
+| context compaction | **not exercised** — needs a long interactive session |
+
+The two unexercised paths only log; they build no spans, so the blast radius is
+small. They are implemented from the documented payloads and covered by unit
+tests, not by a live run.
+
 ## Environment
 
 | Variable | Effect |
