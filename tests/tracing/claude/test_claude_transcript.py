@@ -97,11 +97,11 @@ def test_model_usage_and_text_are_kept_per_call():
     models = _typed(graph.events, ModelCallEvent)
 
     assert models[0].model == "qwen3-coder-next"
-    assert models[0].usage.input_tokens == 100
+    assert models[0].usage.input_tokens == 115
     assert models[0].usage.output_tokens == 20
     assert models[0].usage.cache_read_tokens == 10
     assert models[0].usage.cache_write_tokens == 5
-    assert models[0].usage.total_tokens == 120
+    assert models[0].usage.total_tokens == 135
     assert models[0].output == ""
     assert models[2].output == "SYNTHETIC_TOOL_OK"
     assert models[2].status is EventStatus.COMPLETED
@@ -194,7 +194,7 @@ def test_split_message_id_records_coalesce_into_one_model_call(tmp_path: Path):
     assert [tool.tool_call_id for tool in tools] == ["call-1", "call-2"]
     assert [tool.parent_event_id for tool in tools] == ["rec-1", "rec-1"]
     # Usage is the message's usage, not summed across the split records.
-    assert models[0].usage.input_tokens == 100
+    assert models[0].usage.input_tokens == 110
     assert models[0].usage.output_tokens == 20
     assert models[0].usage.cache_read_tokens == 10
     # Span covers the full response window.

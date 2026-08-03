@@ -142,6 +142,18 @@ class TestHarnessMapping:
     def test_omp_maps_to_tracing_omp(self):
         assert "omp)" in self.text and '"tracing/omp"' in self.text
 
+    def test_qwen_maps_to_tracing_qwen(self):
+        assert 'qwen)    echo "tracing/qwen"' in self.text
+
+    def test_qwen_dispatches_to_install_harness_without_network(self):
+        script = self.text.rsplit('main "$@"', 1)[0]
+        script += '\ninstall_harness() { printf "%s:%s\\n" "$1" "$2"; }\nmain qwen\n'
+
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "qwen:false"
+
 
 # ---------------------------------------------------------------------------
 # Usage output tests
@@ -160,7 +172,7 @@ class TestUsageOutput:
 
     @pytest.mark.parametrize(
         "cmd",
-        ["claude", "codex", "copilot", "cursor", "opencode", "omp", "update", "uninstall"],
+        ["claude", "codex", "copilot", "cursor", "qwen", "opencode", "omp", "update", "uninstall"],
     )
     def test_command_listed(self, cmd):
         assert cmd in self.text
@@ -221,10 +233,10 @@ class TestSmokeTests:
         result = self._run("uninstall", "invalid-harness")
         assert result.returncode != 0
 
-    def test_update_without_install_fails(self):
-        """update should fail if no venv exists at ~/.arize/harness/venv."""
-        # Use a fake HOME so we don't touch real install
-        result = self._run("update", env_extra={"HOME": "/tmp/arize-test-nonexistent"})
+    def test_update_without_install_fails(self, tmp_path):
+        """update should fail if no venv exists beneath an isolated HOME."""
+        fake_home = tmp_path / "empty-home"
+        result = self._run("update", env_extra={"HOME": str(fake_home)})
         assert result.returncode != 0
 
 
@@ -241,8 +253,8 @@ class TestDispatchLogic:
         self.text = _read_install_sh()
 
     def test_dispatches_harness_commands(self):
-        """claude|codex|copilot|cursor|gemini|kiro|opencode|omp should be dispatched."""
-        assert "claude|codex|copilot|cursor|gemini|kiro|opencode|omp)" in self.text
+        """Every supported harness command, including Qwen, should be dispatched."""
+        assert "claude|codex|copilot|cursor|gemini|kiro|qwen|opencode|omp)" in self.text
 
     def test_install_harness_called(self):
         """install_harness function should be called for harness commands."""

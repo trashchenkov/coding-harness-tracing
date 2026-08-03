@@ -11,8 +11,9 @@ import atexit
 import functools
 import json
 import os
-import shutil
+import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -557,7 +558,7 @@ def resolve_backend(span_dict: dict) -> dict:
             "project_name": project_name,
         }
 
-    error(f"Unknown target '{target}' for harness '{service_name}'. " f"Expected 'arize' or 'phoenix'.")
+    error(f"Unknown target '{target}' for harness '{service_name}'. Expected 'arize' or 'phoenix'.")
     return {"target": "none", "project_name": project_name}
 
 
@@ -805,6 +806,46 @@ except ImportError:
         _LOCK_IMPL = "mkdir"
 
 
+def _open_directory_no_symlinks(path: Path, *, create: bool, mode: int = 0o700) -> int:
+    """Open a directory after a descriptor-relative no-symlink component walk."""
+    absolute = Path(os.path.abspath(Path(path).expanduser()))
+    if os.name == "nt":
+        if create:
+            absolute.mkdir(parents=True, exist_ok=True, mode=mode)
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            current /= component
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise OSError(f"unsafe directory component: {current}")
+        # Callers only need a closeable validation token on Windows; directory
+        # descriptors and dir_fd-relative operations are POSIX-only.
+        return os.open(os.devnull, os.O_RDONLY)
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute.anchor or os.sep, flags)
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=mode, dir_fd=descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            metadata = os.fstat(child)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(child)
+                raise OSError(f"unsafe directory component below {absolute}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 class FileLock:
     """Cross-platform file lock.
 
@@ -820,7 +861,7 @@ class FileLock:
     - mkdir fallback: creates lock_path as a directory (matches bash behavior)
     """
 
-    def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = True) -> None:
+    def __init__(self, lock_path: Path, timeout: float = 3.0, *, break_on_timeout: bool = False) -> None:
         self.lock_path = Path(lock_path)
         self.timeout = timeout
         self.break_on_timeout = break_on_timeout
@@ -828,13 +869,15 @@ class FileLock:
         self._method = _LOCK_IMPL
 
     def __enter__(self) -> "FileLock":
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-
         if self._method == "fcntl":
             self._acquire_fcntl()
         elif self._method == "msvcrt":
+            parent_fd = _open_directory_no_symlinks(self.lock_path.parent, create=True)
+            os.close(parent_fd)
             self._acquire_msvcrt()
         else:
+            parent_fd = _open_directory_no_symlinks(self.lock_path.parent, create=True)
+            os.close(parent_fd)
             self._acquire_mkdir()
         return self
 
@@ -846,8 +889,28 @@ class FileLock:
         else:
             self._release_mkdir()
 
+    def _open_posix_lock_file(self) -> IO[str]:
+        """Open an owner-only regular lock file without following symlinks."""
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = _open_directory_no_symlinks(self.lock_path.parent, create=True)
+        try:
+            fd = os.open(self.lock_path.name, flags, 0o600, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(f"lock path is not a regular file: {self.lock_path}")
+            os.fchmod(fd, 0o600)
+            return os.fdopen(fd, "a+", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+
     def _acquire_fcntl(self) -> None:
-        self._fd = open(self.lock_path, "w")
+        self._fd = self._open_posix_lock_file()
         deadline = time.monotonic() + self.timeout
         while True:
             try:
@@ -857,16 +920,7 @@ class FileLock:
                 if time.monotonic() >= deadline:
                     self._fd.close()
                     self._fd = None
-                    if not self.break_on_timeout:
-                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
-                    # Force-acquire: remove and reopen the lock inode.
-                    try:
-                        self.lock_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    self._fd = open(self.lock_path, "w")
-                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return
+                    raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                 time.sleep(0.1)
 
     def _release_fcntl(self) -> None:
@@ -892,15 +946,7 @@ class FileLock:
                 if time.monotonic() >= deadline:
                     self._fd.close()
                     self._fd = None
-                    if not self.break_on_timeout:
-                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
-                    try:
-                        self.lock_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    self._fd = open(self.lock_path, "w")
-                    msvcrt.locking(self._fd.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-                    return
+                    raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                 time.sleep(0.1)
 
     def _release_msvcrt(self) -> None:
@@ -923,18 +969,7 @@ class FileLock:
                 return
             except FileExistsError:
                 if time.monotonic() >= deadline:
-                    if not self.break_on_timeout:
-                        raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
-                    # Force-acquire: remove and recreate (matches bash lines 67-70)
-                    try:
-                        shutil.rmtree(self.lock_path)
-                    except OSError:
-                        pass
-                    try:
-                        self.lock_path.mkdir()
-                    except FileExistsError:
-                        pass
-                    return
+                    raise TimeoutError(f"timed out acquiring lock: {self.lock_path}")
                 time.sleep(0.1)
 
     def _release_mkdir(self) -> None:
@@ -971,18 +1006,33 @@ class StateManager:
         If file exists but is corrupted, overwrite with empty dict.
         Matches bash init_state() at common.sh:49-59.
         """
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        directory_fd = _open_directory_no_symlinks(self.state_dir, create=True)
+        os.close(directory_fd)
+        directory_metadata = self.state_dir.lstat()
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            raise OSError(f"state directory is not a real directory: {self.state_dir}")
+        if os.name != "nt":
+            self.state_dir.chmod(0o700)
         if self.state_file is None:
             return
-        if not self.state_file.exists():
+        try:
+            state_metadata = self.state_file.lstat()
+        except FileNotFoundError:
             self._write({})
         else:
-            # Validate existing file; overwrite if corrupted
+            if not stat.S_ISREG(state_metadata.st_mode):
+                if stat.S_ISLNK(state_metadata.st_mode):
+                    self.state_file.unlink()
+                    self._write({})
+                    return
+                raise OSError(f"state path is not a regular file: {self.state_file}")
+            # Validate existing file through a no-follow descriptor; overwrite
+            # a corrupt regular file atomically.
             try:
                 data = self._read()
                 if not isinstance(data, dict):
                     self._write({})
-            except Exception:
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 self._write({})
 
     def get(self, key: str) -> "str | None":
@@ -997,46 +1047,60 @@ class StateManager:
             return None
         return str(val)
 
-    def set(self, key: str, value: str) -> None:
-        """Set a key-value pair. Acquires lock.
-
-        Value is always stored as string (matches bash: jq --arg v "$2").
-        Uses atomic write: write to .tmp.{pid} then rename.
-        """
+    def set(self, key: str, value: str) -> bool:
+        """Set a key-value pair. Acquires lock and reports durable success."""
         if self.state_file is None:
-            return
+            return False
         try:
             with self._lock():
-                data = self._read_safe()
+                data = self._read_for_update()
                 data[key] = str(value)
                 self._write(data)
+            return True
         except Exception as e:
             error(f"set_state failed for key={key}: {e}")
+            return False
 
-    def delete(self, key: str) -> None:
-        """Remove a key. No-op if missing. Acquires lock."""
+    def set_many(self, values: dict[str, str]) -> bool:
+        """Persist a group of values in one atomic state replacement."""
         if self.state_file is None:
-            return
+            return False
         try:
             with self._lock():
-                data = self._read_safe()
+                data = self._read_for_update()
+                data.update({str(key): str(value) for key, value in values.items()})
+                self._write(data)
+            return True
+        except Exception as e:
+            error(f"set_many_state failed: {e}")
+            return False
+
+    def delete(self, key: str) -> bool:
+        """Remove a key and report durable success."""
+        if self.state_file is None:
+            return False
+        try:
+            with self._lock():
+                data = self._read_for_update()
                 data.pop(key, None)
                 self._write(data)
+            return True
         except Exception as e:
             error(f"del_state failed for key={key}: {e}")
+            return False
 
-    def increment(self, key: str) -> None:
-        """Increment a numeric string value. Acquires lock.
+    def increment(self, key: str) -> bool:
+        """Increment a numeric string value and report durable success.
 
         Missing key treated as "0" -> becomes "1".
         Non-numeric value treated as 0 -> becomes "1".
         Matches bash inc_state() at common.sh:101-108.
         """
         if self.state_file is None:
-            return
+            return False
         try:
             with self._lock():
-                data = self._read_safe()
+                data = self._read_for_update()
                 current = data.get(key, "0")
                 try:
                     num = int(current)
@@ -1044,8 +1108,10 @@ class StateManager:
                     num = 0
                 data[key] = str(num + 1)
                 self._write(data)
+            return True
         except Exception as e:
             error(f"inc_state failed for key={key}: {e}")
+            return False
 
     def _lock(self) -> FileLock:
         """Return a FileLock for this state file."""
@@ -1062,11 +1128,38 @@ class StateManager:
         except Exception:
             return {}
 
+    def _read_for_update(self) -> dict:
+        """Read authoritative state; only a genuinely absent file is empty."""
+        try:
+            return self._read()
+        except FileNotFoundError:
+            return {}
+
     def _read(self) -> dict:
-        """Read state file, raise on error."""
+        """Read a real state file descriptor without following symlinks."""
         if self.state_file is None:
             return {}
-        text = self.state_file.read_text(encoding="utf-8")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = _open_directory_no_symlinks(self.state_file.parent, create=False)
+        try:
+            if os.name == "nt":
+                fd = os.open(self.state_file, flags)
+            else:
+                fd = os.open(self.state_file.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(f"state path is not a regular file: {self.state_file}")
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                text = handle.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
         data = json.loads(text)
         if data is None:
             return {}
@@ -1075,20 +1168,52 @@ class StateManager:
         return data
 
     def _write(self, data: dict) -> None:
-        """Write dict to state file atomically via tmp+rename."""
+        """Durably replace state via an unpredictable owner-only temp file."""
         if self.state_file is None:
             return
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_file.with_suffix(f".tmp.{os.getpid()}")
+        parent_fd = _open_directory_no_symlinks(self.state_file.parent, create=True)
+        if os.name == "nt":
+            os.close(parent_fd)
+            tmp = None
+            try:
+                fd, raw_tmp = tempfile.mkstemp(prefix=f".{self.state_file.name}.tmp.", dir=str(self.state_file.parent))
+                tmp = Path(raw_tmp)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(data, indent=2))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                tmp.replace(self.state_file)
+            except Exception:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
+                raise
+            return
+
+        tmp_name = f".{self.state_file.name}.tmp.{os.getpid()}.{os.urandom(8).hex()}"
         try:
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            tmp.replace(self.state_file)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(tmp_name, flags, 0o600, dir_fd=parent_fd)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(data, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(
+                tmp_name,
+                self.state_file.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
         except Exception:
             try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
                 pass
             raise
+        finally:
+            os.close(parent_fd)
 
 
 # ── OTLP Span Building ────────────────────────────────────────────────────

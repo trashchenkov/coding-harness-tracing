@@ -13,13 +13,21 @@ Verified against **qwen 0.21.3**.
 
 - The traced unit is the **turn**, not the session: Qwen Code does not emit
   `SessionEnd` in one-shot mode, so a session-scoped root span would never close.
-- `UserPromptSubmit` fires again with an empty `prompt` to continue a turn after
-  tool results. That continuation does not start a new trace.
+- `UserPromptSubmit` can fire for machine continuations. An explicit
+  `submitted_prompt` identifies a genuine user turn; older/headless payloads
+  fall back to non-empty `prompt` only when no turn is active.
+- Failed transcript reads or exports retain the turn state, including during
+  `SessionEnd`, so retries preserve trace and span identities. Lifecycle hooks
+  share one per-session lock; running subagents keep the turn non-terminal, and
+  reusable advisory lock files remain after state cleanup to avoid inode races.
+- Installer updates preserve foreign hooks, serialize cooperating writers, and
+  abort instead of overwriting if `settings.json` changes after it is read.
 - Todo hooks fire twice per item, once per phase; only `postWrite` is recorded.
-- Subagents produce an `AGENT` span with no children: Qwen Code does not publish
-  the subagent's internal steps.
-- Older CLIs expose fewer events (0.15.11 has 14 of the 22). All are registered
-  regardless; unknown ones are ignored by Qwen Code and simply never fire.
+- Subagents always produce an `AGENT` span. A distinct background child
+  transcript is parsed beneath it; a foreground path equal to the parent is not
+  reparsed.
+- Qwen Code 0.21.3 exposes 22 events. The harness registers the 17 events in
+  `tracing/qwen/constants.py`; older CLIs ignore event names they do not know.
 
 
 ## How to Use This Skill
@@ -27,7 +35,9 @@ Verified against **qwen 0.21.3**.
 **This skill follows a decision tree workflow.** Start by asking the user where they are in the setup process:
 
 1. **Is the harness already installed?**
-   - Check `~/.qwen/settings.json` for 8 hook entries with `name: arize-tracing`
+   - Resolve settings as `$QWEN_HOME/settings.json` when `QWEN_HOME` is set,
+     otherwise `~/.qwen/settings.json`
+   - Check that file for the 17 `arize-tracing` hook entries
    - Check `~/.arize/harness/config.json` for the `harnesses.qwen` block
    - If both are present -> Jump to [Validate](#validate) or [Troubleshoot](#troubleshoot)
 
@@ -151,7 +161,10 @@ If the user has a custom OTLP endpoint, set it in `harnesses.qwen.endpoint`.
 
 ### Activate Qwen Code hooks
 
-Qwen Code uses `~/.qwen/settings.json` for hook registration. Hooks are configured under `hooks.<EventName>` as an array of matcher/hook objects.
+Qwen Code reads `$QWEN_HOME/settings.json` when `QWEN_HOME` is set and
+`~/.qwen/settings.json` otherwise. Hooks are configured under
+`hooks.<EventName>` as arrays of matcher/hook objects. The installer accepts
+JSONC on read, preserves unrelated hooks, and atomically rewrites strict JSON.
 
 Install or reinstall via the installer:
 
@@ -165,16 +178,23 @@ To uninstall:
 ./install.sh uninstall qwen
 ```
 
-The installer registers all 8 hook events (`SessionStart`, `SessionEnd`, `BeforeAgent`, `AfterAgent`, `BeforeModel`, `AfterModel`, `BeforeTool`, `AfterTool`) in `~/.qwen/settings.json` with `name: arize-tracing` on each entry.
+The installer registers these 17 events with `name: arize-tracing`:
+`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`,
+`PreCompact`, `PostCompact`, `Notification`, `PermissionRequest`,
+`PermissionDenied`, `TodoCreated`, and `TodoCompleted`. Qwen 0.21.3 also exposes
+five events for which this harness currently has no handlers: `PostToolBatch`,
+`UserPromptExpansion`, `MessageDisplay`, `SessionDelete`, and
+`InstructionsLoaded`.
 
 ### Validate
 
-1. **Config exists**: Run `cat ~/.arize/harness/config.json` to verify the config file exists and has correct backend credentials under `harnesses.qwen`.
-2. **Phoenix** (if applicable): Run `curl -sf <endpoint>/v1/traces >/dev/null` to check connectivity.
-3. **Hooks active**: Verify `~/.qwen/settings.json` contains 8 hook entries with `name: arize-tracing`.
+1. **Config exists**: verify `~/.arize/harness/config.json` has the correct backend credentials under `harnesses.qwen`.
+2. **Phoenix** (if applicable): run `curl -sf <endpoint>/v1/traces >/dev/null`.
+3. **Hooks active**: inspect the resolved Qwen settings path and verify all 17 entries named `arize-tracing`.
 4. **Quick dry-run test** (optional):
    ```bash
-   echo '{"event":"BeforeModel"}' | ARIZE_DRY_RUN=true arize-hook-qwen-before-model
+   printf '%s\n' '{"session_id":"dry-run","hook_event_name":"UserPromptSubmit","submitted_prompt":"hello","prompt":"hello"}' | ARIZE_DRY_RUN=true arize-hook-qwen-user-prompt-submit
    ```
 
 ### Confirm
@@ -192,18 +212,17 @@ Tell the user:
 
 ## Hook Events
 
-Qwen Code fires 8 hook events. Each event is registered in `~/.qwen/settings.json` and maps to a dedicated CLI entry point.
+The harness registers 17 Claude-style Qwen hook events:
 
-| Event | Span Name | Kind | Description |
-|-------|-----------|------|-------------|
-| `SessionStart` | Session Start | CHAIN | Session initialization |
-| `SessionEnd` | Session End | CHAIN | Session termination |
-| `BeforeAgent` | Agent Turn | CHAIN | User prompt to agent |
-| `AfterAgent` | Agent Turn | CHAIN | Agent completion |
-| `BeforeModel` | LLM Call | LLM | Model invocation start with prompt |
-| `AfterModel` | LLM Call | LLM | Model response with tokens |
-| `BeforeTool` | Tool: {name} | TOOL | Tool invocation start |
-| `AfterTool` | Tool: {name} | TOOL | Tool result |
+| Events | Trace effect |
+|---|---|
+| `UserPromptSubmit`, `Stop`, `StopFailure` | Open/export one turn; failure marks the root error |
+| `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | Track tool timing, output, and errors |
+| `SubagentStart`, `SubagentStop` | Build `AGENT` spans and parse distinct child transcripts |
+| `SessionStart`, `SessionEnd` | Initialize/clean state and export any open turn on shutdown |
+| `TodoCreated`, `TodoCompleted` | Count durable `postWrite` todo transitions |
+| `PreCompact`, `PostCompact` | Log context compaction |
+| `Notification`, `PermissionRequest`, `PermissionDenied` | Log notification and permission activity |
 
 ## Troubleshoot
 
@@ -212,7 +231,7 @@ Common issues and fixes for Qwen Code:
 | Problem | Fix |
 |---------|-----|
 | Traces not appearing | Verify config exists: `cat ~/.arize/harness/config.json`. Check hook log: `tail -20 ~/.arize/harness/logs/qwen.log` |
-| Hooks not firing | Verify `~/.qwen/settings.json` contains the 8 hook entries with `name: arize-tracing` for all events |
+| Hooks not firing | Resolve `$QWEN_HOME/settings.json` or `~/.qwen/settings.json`; verify the 17 entries named `arize-tracing` |
 | Config missing | Run `./install.sh qwen` or create `~/.arize/harness/config.json` manually (include `harnesses.qwen` section) |
 | Phoenix unreachable | Verify Phoenix is running: `curl -sf <endpoint>/v1/traces` |
 | Want to test without sending | Set `ARIZE_DRY_RUN=true` env var before launching Qwen Code |

@@ -287,11 +287,16 @@ def _tool_result_failed(result: Any) -> bool:
 
 def _usage(raw: Any) -> Usage:
     data = raw if isinstance(raw, dict) else {}
+    cache_read = _nonnegative_int(data.get("cache_read_input_tokens"))
+    cache_write = _nonnegative_int(data.get("cache_creation_input_tokens"))
     return Usage(
-        input_tokens=_nonnegative_int(data.get("input_tokens")),
+        # Canonical Usage.input_tokens is the provider's complete prompt total.
+        # Anthropic reports uncached/cache-read/cache-write as disjoint buckets,
+        # unlike Gemini/Qwen where promptTokenCount already includes cache hits.
+        input_tokens=_nonnegative_int(data.get("input_tokens")) + cache_read + cache_write,
         output_tokens=_nonnegative_int(data.get("output_tokens")),
-        cache_read_tokens=_nonnegative_int(data.get("cache_read_input_tokens")),
-        cache_write_tokens=_nonnegative_int(data.get("cache_creation_input_tokens")),
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
         reported_total_tokens=_optional_nonnegative_int(data.get("total_tokens")),
     )
 

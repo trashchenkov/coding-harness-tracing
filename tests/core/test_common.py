@@ -3,6 +3,8 @@
 
 import io
 import json
+import os
+import stat
 import threading
 import time
 import urllib.error
@@ -171,6 +173,18 @@ class TestFileLock:
         with FileLock(lock_path, timeout=1.0):
             pass  # should not raise
 
+    def test_rejects_intermediate_directory_symlink(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+        lock_path = tmp_path / "link" / "qwen" / ".lock"
+
+        with pytest.raises(OSError):
+            with FileLock(lock_path, timeout=0.1):
+                pytest.fail("intermediate symlink lock must not be acquired")
+
+        assert not (outside / "qwen" / ".lock").exists()
+
     def test_blocks_second_thread(self, tmp_path):
         """FileLock blocks second acquisition from another thread."""
         lock_path = tmp_path / "test.lock"
@@ -199,30 +213,27 @@ class TestFileLock:
         assert acquired_order[0] == "A"
         assert "B" in acquired_order
 
-    def test_timeout_force_acquires(self, tmp_path):
-        """After timeout, FileLock force-acquires the lock."""
+    def test_symlink_lock_is_rejected_without_truncating_target(self, tmp_path):
+        """Descriptor-first lock acquisition must not follow a lock-path symlink."""
+        from core.common import _LOCK_IMPL
+
+        if _LOCK_IMPL != "fcntl":
+            pytest.skip("O_NOFOLLOW lock test is POSIX-specific")
+        victim = tmp_path / "victim"
+        victim.write_text("preserve me", encoding="utf-8")
         lock_path = tmp_path / "test.lock"
-        hold_event = threading.Event()
-        released_event = threading.Event()
+        lock_path.symlink_to(victim)
 
-        def hold_forever():
-            with FileLock(lock_path, timeout=5.0):
-                hold_event.set()
-                # Hold lock until test is done — never release voluntarily
-                released_event.wait(timeout=10)
+        with pytest.raises(OSError):
+            with FileLock(lock_path, timeout=0.1):
+                pytest.fail("symlink lock must not be acquired")
 
-        t = threading.Thread(target=hold_forever, daemon=True)
-        t.start()
-        hold_event.wait(timeout=5)
+        assert victim.read_text(encoding="utf-8") == "preserve me"
 
-        # Thread B with short timeout should force-acquire
-        start = time.monotonic()
-        with FileLock(lock_path, timeout=0.3):
-            elapsed = time.monotonic() - start
-            assert elapsed >= 0.2  # waited at least near the timeout
-
-        released_event.set()
-        t.join(timeout=5)
+    def test_lock_file_is_owner_only(self, tmp_path):
+        lock_path = tmp_path / "test.lock"
+        with FileLock(lock_path, timeout=1.0):
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
 
     def test_timeout_without_breaking_preserves_original_holder(self, tmp_path):
         """The opt-out mode times out without deleting another owner's lock."""
@@ -293,6 +304,43 @@ class TestStateManager:
         data = json.loads(sm.state_file.read_text())
         assert data == {}
 
+    def test_init_rejects_intermediate_directory_symlink(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+        state_dir = tmp_path / "link" / "qwen"
+        sm = StateManager(state_dir, state_dir / "state_session.json", state_dir / ".lock")
+
+        with pytest.raises(OSError):
+            sm.init_state()
+
+        assert not (outside / "qwen" / "state_session.json").exists()
+
+    def test_set_many_does_not_replace_state_after_transient_read_failure(self, tmp_path, monkeypatch):
+        sm = self._make_sm(tmp_path)
+        sm.init_state()
+        assert sm.state_file is not None
+        original = {
+            "current_trace_id": "trace-1",
+            "turn_exported": "0",
+            "export_delivery_state": "attempt:fingerprint:1234",
+        }
+        sm.state_file.write_text(json.dumps(original), encoding="utf-8")
+        before = sm.state_file.read_bytes()
+        monkeypatch.setattr(sm, "_read", mock.Mock(side_effect=OSError("transient read failure")))
+
+        assert sm.set_many({"subagent_ledger": "new"}) is False
+        assert sm.state_file.read_bytes() == before
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_init_creates_owner_only_state(self, tmp_path):
+        sm = self._make_sm(tmp_path)
+        sm.init_state()
+
+        assert sm.state_file is not None
+        assert stat.S_IMODE(sm.state_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(sm.state_file.stat().st_mode) == 0o600
+
     def test_init_recovers_corrupted(self, tmp_path):
         """init_state() recovers corrupted file."""
         sm = self._make_sm(tmp_path)
@@ -310,6 +358,45 @@ class TestStateManager:
         sm.init_state()
         data = json.loads(sm.state_file.read_text())
         assert data == {"key": "val"}
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_init_replaces_state_symlink_without_touching_target(self, tmp_path):
+        sm = self._make_sm(tmp_path)
+        sm.state_dir.mkdir(parents=True)
+        victim = tmp_path / "victim.json"
+        victim.write_text('{"session_id":"INJECTED"}', encoding="utf-8")
+        sm.state_file.symlink_to(victim)
+
+        sm.init_state()
+
+        assert victim.read_text(encoding="utf-8") == '{"session_id":"INJECTED"}'
+        assert not sm.state_file.is_symlink()
+        assert sm.get("session_id") is None
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_set_never_follows_predictable_temporary_symlink(self, tmp_path):
+        sm = self._make_sm(tmp_path)
+        sm.init_state()
+        victim = tmp_path / "victim.txt"
+        victim.write_text("VICTIM-SECRET", encoding="utf-8")
+        predictable_tmp = sm.state_file.with_suffix(f".tmp.{os.getpid()}")
+        predictable_tmp.symlink_to(victim)
+
+        assert sm.set("key", "value") is True
+
+        assert victim.read_text(encoding="utf-8") == "VICTIM-SECRET"
+        assert sm.get("key") == "value"
+
+    def test_set_reports_persistence_failure(self, tmp_path, monkeypatch):
+        sm = self._make_sm(tmp_path)
+        sm.init_state()
+
+        def fail_write(data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(sm, "_write", fail_write)
+
+        assert sm.set("key", "value") is False
 
     def test_set_then_get(self, tmp_path):
         """set("key", "val") then get("key") returns "val"."""
@@ -1879,21 +1966,20 @@ class TestFileLockMkdir:
 
         assert not lock_path.exists()
 
-    def test_mkdir_fallback_timeout_force_acquire(self, tmp_path, monkeypatch):
-        """mkdir lock force-acquires by removing pre-existing directory after timeout."""
+    def test_mkdir_fallback_timeout_preserves_existing_lock(self, tmp_path, monkeypatch):
+        """mkdir fallback must never remove a potentially live lock owner."""
         monkeypatch.setattr("core.common._LOCK_IMPL", "mkdir")
         lock_path = tmp_path / "test.lock"
-        # Pre-create the lock directory to simulate contention
         lock_path.mkdir()
 
         lock = FileLock(lock_path, timeout=0.0)
         lock._method = "mkdir"
 
-        with lock:
-            # Should have force-acquired despite pre-existing directory
-            assert lock_path.is_dir()
+        with pytest.raises(TimeoutError, match="timed out acquiring lock"):
+            with lock:
+                pytest.fail("contending lock must not enter the critical section")
 
-        assert not lock_path.exists()
+        assert lock_path.is_dir()
 
 
 # ── Custom attributes tests ──────────────────────────────────────────────

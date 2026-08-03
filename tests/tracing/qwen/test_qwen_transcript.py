@@ -48,6 +48,19 @@ def _assistant(uuid, *, parts, usage=None, model="qwen3.5", ts="2026-08-02T17:55
     return record
 
 
+def _request(uuid, *, parts, ts="2026-08-02T17:55:29.257Z"):
+    return {
+        "uuid": uuid,
+        "parentUuid": None,
+        "sessionId": "sess-1",
+        "type": "user",
+        "timestamp": ts,
+        "cwd": "/tmp/project",
+        "version": "0.21.3",
+        "message": {"role": "user", "parts": parts},
+    }
+
+
 def _tool_result(uuid, call_id, *, name, output, result=None, ts="2026-08-02T17:55:34.942Z"):
     return {
         "uuid": uuid,
@@ -62,6 +75,16 @@ def _tool_result(uuid, call_id, *, name, output, result=None, ts="2026-08-02T17:
     }
 
 
+def test_foreign_session_record_is_rejected(tmp_path):
+    record = _assistant("a1", parts=[{"text": "FOREIGN-NEEDLE"}])
+    record["sessionId"] = "sess-foreign"
+
+    graph = parse_qwen_transcript(_write(tmp_path, [record]), _root())
+
+    assert not [event for event in graph.events if isinstance(event, ModelCallEvent)]
+    assert any(d.code == "session_id_mismatch" for d in graph.diagnostics)
+
+
 def test_assistant_text_becomes_a_model_call(tmp_path):
     path = _write(tmp_path, [_assistant("a1", parts=[{"text": "hello"}])])
 
@@ -72,6 +95,57 @@ def test_assistant_text_becomes_a_model_call(tmp_path):
     assert calls[0].output == "hello"
     assert calls[0].model == "qwen3.5"
     assert calls[0].parent_event_id == "turn-1"
+
+
+def test_model_call_uses_linked_request_input_and_timing(tmp_path):
+    request = _request("u1", parts=[{"text": "inspect this"}], ts="2026-08-02T17:55:29.257Z")
+    response = _assistant("a1", parts=[{"text": "done"}], ts="2026-08-02T17:55:30.757Z")
+    response["parentUuid"] = "u1"
+    path = _write(tmp_path, [request, response])
+
+    call = [e for e in parse_qwen_transcript(path, _root()).events if isinstance(e, ModelCallEvent)][0]
+
+    assert call.input == {"role": "user", "parts": [{"text": "inspect this"}]}
+    assert call.started_at_ms is not None
+    assert call.ended_at_ms is not None
+    assert call.ended_at_ms - call.started_at_ms == 1_500
+
+
+def test_malformed_usage_is_diagnosed_instead_of_becoming_zero_usage(tmp_path):
+    record = _assistant("a1", parts=[{"text": "hello"}])
+    record["usageMetadata"] = "not-an-object"
+    graph = parse_qwen_transcript(_write(tmp_path, [record]), _root())
+
+    call = [e for e in graph.events if isinstance(e, ModelCallEvent)][0]
+
+    assert call.usage is None
+    assert any(d.code == "malformed_usage" for d in graph.diagnostics)
+
+
+def test_non_finite_usage_is_diagnosed_instead_of_crashing(tmp_path):
+    record = _assistant(
+        "a1",
+        parts=[{"text": "hello"}],
+        usage={"promptTokenCount": float("inf"), "candidatesTokenCount": "NaN"},
+    )
+
+    graph = parse_qwen_transcript(_write(tmp_path, [record]), _root())
+
+    call = [event for event in graph.events if isinstance(event, ModelCallEvent)][0]
+    assert call.usage is None
+    assert any(d.code == "malformed_usage" for d in graph.diagnostics)
+
+
+def test_unknown_record_type_is_diagnosed(tmp_path):
+    graph = parse_qwen_transcript(
+        _write(
+            tmp_path,
+            [{"uuid": "x1", "sessionId": "sess-1", "type": "future_record", "message": {"parts": []}}],
+        ),
+        _root(),
+    )
+
+    assert any(d.code == "unknown_record_type" for d in graph.diagnostics)
 
 
 def test_gemini_usage_names_map_onto_the_shared_usage_record(tmp_path):

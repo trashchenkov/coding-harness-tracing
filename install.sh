@@ -203,6 +203,7 @@ harness_dir() {
         cursor)  echo "tracing/cursor" ;;
         gemini)  echo "tracing/gemini" ;;
         kiro)    echo "tracing/kiro" ;;
+        qwen)    echo "tracing/qwen" ;;
         opencode) echo "tracing/opencode" ;;
         omp)     echo "tracing/omp" ;;
         *)       return 1 ;;
@@ -244,6 +245,7 @@ Commands:
   cursor      Install and configure tracing for Cursor IDE
   gemini      Install and configure tracing for Gemini CLI
   kiro        Install and configure tracing for Kiro CLI
+  qwen        Install and configure tracing for Qwen Code
   opencode    Install and configure tracing for opencode
   omp         Install and configure tracing for Oh My Pi (omp)
   update      Update the installed coding-harness-tracing and re-register all harnesses
@@ -276,7 +278,7 @@ main() {
     done
 
     case "$cmd" in
-        claude|codex|copilot|cursor|gemini|kiro|opencode|omp)
+        claude|codex|copilot|cursor|gemini|kiro|qwen|opencode|omp)
             install_harness "$cmd" "$with_skills"
             ;;
         uninstall)

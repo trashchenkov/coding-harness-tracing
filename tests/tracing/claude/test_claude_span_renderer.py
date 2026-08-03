@@ -87,6 +87,85 @@ def test_renders_per_call_usage_without_putting_aggregate_usage_on_root():
     assert first_model_attrs["llm.token_count.prompt_details.cache_write"] == 5
 
 
+def test_renderer_does_not_add_cache_breakdown_to_provider_input_total():
+    root = TurnEvent(
+        event_id="turn:usage",
+        session_id="session-usage",
+        turn_id="usage",
+        sequence=0,
+        started_at_ms=1000,
+        ended_at_ms=2000,
+        status=EventStatus.COMPLETED,
+    )
+    model = ModelCallEvent(
+        event_id="model:usage",
+        parent_event_id=root.event_id,
+        session_id=root.session_id,
+        turn_id=root.turn_id,
+        sequence=1,
+        started_at_ms=1100,
+        ended_at_ms=1900,
+        status=EventStatus.COMPLETED,
+        usage=Usage(
+            input_tokens=100,
+            output_tokens=7,
+            cache_read_tokens=20,
+            reported_total_tokens=107,
+        ),
+    )
+
+    spans = _spans(render_event_graph(EventGraph([root, model]), trace_id=TRACE_ID, span_id_factory=_factory()))
+    attrs = _attrs(spans[1])
+
+    assert attrs["llm.token_count.prompt"] == 100
+    assert attrs["llm.token_count.completion"] == 7
+    assert attrs["llm.token_count.total"] == 107
+    assert attrs["llm.token_count.prompt_details.cache_read"] == 20
+
+
+def test_model_input_respects_tool_content_privacy_independently(monkeypatch):
+    monkeypatch.setenv("ARIZE_LOG_PROMPTS", "true")
+    monkeypatch.setenv("ARIZE_LOG_TOOL_CONTENT", "false")
+    root = TurnEvent(
+        event_id="turn:privacy",
+        session_id="session-privacy",
+        turn_id="privacy",
+        sequence=0,
+        started_at_ms=1000,
+        ended_at_ms=2000,
+        status=EventStatus.COMPLETED,
+    )
+    model = ModelCallEvent(
+        event_id="model:privacy",
+        parent_event_id=root.event_id,
+        session_id=root.session_id,
+        turn_id=root.turn_id,
+        sequence=1,
+        started_at_ms=1100,
+        ended_at_ms=1900,
+        status=EventStatus.COMPLETED,
+        input={
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "id": "call-1",
+                        "name": "read_file",
+                        "response": {"output": "TOP-SECRET-TOOL-OUTPUT"},
+                    }
+                }
+            ],
+        },
+    )
+
+    attrs = _attrs(
+        _spans(render_event_graph(EventGraph([root, model]), trace_id=TRACE_ID, span_id_factory=_factory()))[1]
+    )
+
+    assert "TOP-SECRET-TOOL-OUTPUT" not in attrs["input.value"]
+    assert "[REDACTED]" in attrs["input.value"]
+
+
 def test_renders_failed_tool_with_error_status():
     root = TurnEvent(
         event_id="turn:1",
@@ -219,6 +298,22 @@ def test_renderer_breaks_parent_cycles_into_a_valid_tree():
 
     assert "parentSpanId" not in spans[0]
     assert spans[1]["parentSpanId"] == spans[0]["spanId"]
+
+
+def test_tool_input_and_output_use_independent_privacy_gates():
+    spans = _spans(
+        render_event_graph(
+            _main_graph(),
+            trace_id=TRACE_ID,
+            span_id_factory=_factory(),
+            privacy_policy={"prompts": True, "tool_details": False, "tool_content": True},
+        )
+    )
+    tool_attrs = next(_attrs(span) for span in spans if _attrs(span).get("openinference.span.kind") == "TOOL")
+
+    assert "/synthetic/project" not in str(tool_attrs.get("input.value"))
+    assert "<redacted (" in str(tool_attrs.get("input.value"))
+    assert "SYNTHETIC_TOOL_OK" in str(tool_attrs.get("output.value"))
 
 
 def test_capture_flags_redact_root_model_and_tool_content(monkeypatch):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Optional
 
 from core.common import build_multi_span, build_span, env, generate_span_id, redact_content
 from core.event_model import AgentEvent, BaseEvent, EventGraph, EventStatus, ModelCallEvent, ToolEvent, TurnEvent
@@ -18,8 +18,9 @@ def render_event_graph(
     service_name: str = "coding-harness-tracing",
     scope_name: str = "coding-harness-tracing",
     span_id_factory: Callable[[], str] = generate_span_id,
-    span_id_overrides: Mapping[str, str] | None = None,
-    extra_attributes: Mapping[str, Mapping[str, Any]] | None = None,
+    span_id_overrides: Optional[Mapping[str, str]] = None,
+    extra_attributes: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    privacy_policy: Optional[Mapping[str, bool]] = None,
 ) -> dict:
     """Render every event in graph order under one trace.
 
@@ -31,6 +32,13 @@ def render_event_graph(
 
     overrides = span_id_overrides or {}
     extras = extra_attributes or {}
+    privacy = {
+        "prompts": env.log_prompts,
+        "tool_details": env.log_tool_details,
+        "tool_content": env.log_tool_content,
+    }
+    if privacy_policy is not None:
+        privacy.update({key: bool(value) for key, value in privacy_policy.items() if key in privacy})
     event_span_ids: list[str] = []
     first_span_by_event_id: dict[str, str] = {}
     used_span_ids: set[str] = set()
@@ -53,14 +61,14 @@ def render_event_graph(
     for index, event in enumerate(graph.events):
         if isinstance(event, ModelCallEvent):
             model_call_number += 1
-        name, kind, attrs = _span_fields(event, model_call_number)
+        name, kind, attrs = _span_fields(event, model_call_number, privacy)
         attrs.update(extras.get(event.event_id, {}))
         parent_span_id = first_span_by_event_id.get(safe_parent_ids[index] or "", "")
         start_ms = _safe_timestamp(event.started_at_ms, graph_start)
         end_ms = _safe_timestamp(event.ended_at_ms, start_ms or graph_end)
         if end_ms < start_ms:
             end_ms = start_ms
-        status_code, status_message = _status(event)
+        status_code, status_message = _status(event, privacy)
         payloads.append(
             build_span(
                 name=name,
@@ -81,7 +89,9 @@ def render_event_graph(
     return build_multi_span(payloads, service_name, scope_name)
 
 
-def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, dict[str, Any]]:
+def _span_fields(
+    event: BaseEvent, model_call_number: int, privacy: Mapping[str, bool]
+) -> tuple[str, str, dict[str, Any]]:
     attrs: dict[str, Any] = {
         "session.id": event.session_id,
         "turn.id": event.turn_id,
@@ -89,8 +99,8 @@ def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, di
 
     if isinstance(event, TurnEvent):
         attrs["openinference.span.kind"] = "CHAIN"
-        _put_content(attrs, "input.value", event.input, env.log_prompts)
-        _put_content(attrs, "output.value", event.output, env.log_prompts)
+        _put_content(attrs, "input.value", event.input, privacy["prompts"])
+        _put_content(attrs, "output.value", event.output, privacy["prompts"])
         return f"Turn {event.turn_id}", "CHAIN", attrs
 
     if isinstance(event, AgentEvent):
@@ -101,8 +111,8 @@ def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, di
                 "subagent.type": event.source_id or "unknown",
             }
         )
-        _put_content(attrs, "input.value", event.input, env.log_prompts)
-        _put_content(attrs, "output.value", event.output, env.log_tool_content)
+        _put_content(attrs, "input.value", event.input, privacy["prompts"])
+        _put_content(attrs, "output.value", event.output, privacy["tool_content"])
         return f"Subagent: {event.source_id or event.agent_id or 'unknown'}", "AGENT", attrs
 
     if isinstance(event, ModelCallEvent):
@@ -114,21 +124,26 @@ def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, di
         if event.agent_id:
             attrs["subagent.id"] = event.agent_id
         if event.usage is not None:
-            prompt_tokens = event.usage.input_tokens + event.usage.cache_read_tokens + event.usage.cache_write_tokens
+            prompt_tokens = event.usage.input_tokens
             completion_tokens = event.usage.output_tokens
             attrs.update(
                 {
                     "llm.token_count.prompt": prompt_tokens,
                     "llm.token_count.completion": completion_tokens,
-                    "llm.token_count.total": prompt_tokens + completion_tokens,
+                    "llm.token_count.total": event.usage.total_tokens,
                 }
             )
             if event.usage.cache_read_tokens:
                 attrs["llm.token_count.prompt_details.cache_read"] = event.usage.cache_read_tokens
             if event.usage.cache_write_tokens:
                 attrs["llm.token_count.prompt_details.cache_write"] = event.usage.cache_write_tokens
-        _put_content(attrs, "input.value", event.input, env.log_prompts)
-        _put_content(attrs, "output.value", event.output, env.log_prompts)
+        _put_content(
+            attrs,
+            "input.value",
+            _redact_embedded_tool_content(event.input, privacy["tool_content"]),
+            privacy["prompts"],
+        )
+        _put_content(attrs, "output.value", event.output, privacy["prompts"])
         suffix = f": {event.model}" if event.model else ""
         return f"LLM call {model_call_number}{suffix}", "LLM", attrs
 
@@ -142,19 +157,19 @@ def _span_fields(event: BaseEvent, model_call_number: int) -> tuple[str, str, di
         )
         if event.agent_id:
             attrs["subagent.id"] = event.agent_id
-        _put_content(attrs, "input.value", event.input, env.log_tool_content)
-        _put_content(attrs, "output.value", event.output, env.log_tool_content)
-        _put_content(attrs, "error.message", event.error, env.log_tool_content)
-        _put_tool_details(attrs, event)
+        _put_content(attrs, "input.value", event.input, privacy["tool_details"])
+        _put_content(attrs, "output.value", event.output, privacy["tool_content"])
+        _put_content(attrs, "error.message", event.error, privacy["tool_content"])
+        _put_tool_details(attrs, event, privacy["tool_details"])
         return event.tool_name or "Tool", "TOOL", attrs
 
     attrs["openinference.span.kind"] = "CHAIN"
-    _put_content(attrs, "input.value", event.input, env.log_prompts)
-    _put_content(attrs, "output.value", event.output, env.log_prompts)
+    _put_content(attrs, "input.value", event.input, privacy["prompts"])
+    _put_content(attrs, "output.value", event.output, privacy["prompts"])
     return event.event_id, "CHAIN", attrs
 
 
-def _put_tool_details(attrs: dict[str, Any], event: ToolEvent) -> None:
+def _put_tool_details(attrs: dict[str, Any], event: ToolEvent, allowed: bool) -> None:
     tool_input = event.input if isinstance(event.input, dict) else {}
     details: dict[str, Any] = {}
     if event.tool_name == "Bash":
@@ -173,13 +188,35 @@ def _put_tool_details(attrs: dict[str, Any], event: ToolEvent) -> None:
 
     for key, value in details.items():
         if value is not None:
-            attrs[key] = redact_content(env.log_tool_details, _content_string(value))
+            attrs[key] = redact_content(allowed, _content_string(value))
 
 
 def _put_content(attrs: dict[str, Any], key: str, value: Any, allowed: bool) -> None:
     if value is None:
         return
     attrs[key] = redact_content(allowed, _content_string(value))
+
+
+def _redact_embedded_tool_content(value: Any, allowed: bool) -> Any:
+    """Honor tool-content privacy inside model request messages.
+
+    Qwen records tool responses as the request that triggers the next model
+    call. Prompt logging and tool-content logging are independent controls, so
+    enabling prompts must not re-export a disabled function response.
+    """
+    if allowed:
+        return value
+    if isinstance(value, list):
+        return [_redact_embedded_tool_content(item, allowed) for item in value]
+    if isinstance(value, Mapping):
+        cleaned = {key: _redact_embedded_tool_content(item, allowed) for key, item in value.items()}
+        function_response = cleaned.get("functionResponse")
+        if isinstance(function_response, Mapping) and "response" in function_response:
+            function_response = dict(function_response)
+            function_response["response"] = "[REDACTED]"
+            cleaned["functionResponse"] = function_response
+        return cleaned
+    return value
 
 
 def _content_string(value: Any) -> str:
@@ -191,8 +228,8 @@ def _content_string(value: Any) -> str:
         return str(value)
 
 
-def _status(event: BaseEvent) -> tuple[int, str]:
-    allowed = env.log_tool_content if isinstance(event, (AgentEvent, ToolEvent)) else env.log_prompts
+def _status(event: BaseEvent, privacy: Mapping[str, bool]) -> tuple[int, str]:
+    allowed = privacy["tool_content"] if isinstance(event, (AgentEvent, ToolEvent)) else privacy["prompts"]
     message = redact_content(allowed, event.error) if event.error else ""
     if event.status is EventStatus.FAILED:
         return 2, message or "Event failed"
@@ -255,9 +292,7 @@ def _safe_parent_event_ids(events: list[BaseEvent]) -> list[str | None]:
         (
             None
             if event.event_id in break_ids and first_by_id[event.event_id] is event
-            else event.parent_event_id
-            if event.parent_event_id in first_by_id
-            else None
+            else event.parent_event_id if event.parent_event_id in first_by_id else None
         )
         for event in events
     ]

@@ -45,7 +45,7 @@ arize-hook-copilot-pre-tool = "tracing.copilot.hooks.handlers:pre_tool_use"
 arize-hook-copilot-post-tool = "tracing.copilot.hooks.handlers:post_tool_use"
 arize-hook-copilot-stop = "tracing.copilot.hooks.handlers:stop"
 arize-hook-copilot-subagent-stop = "tracing.copilot.hooks.handlers:subagent_stop"
-# Gemini hooks
+# Qwen Code hooks
 arize-hook-qwen-session-start = "tracing.qwen.hooks.handlers:session_start"
 arize-hook-qwen-session-end = "tracing.qwen.hooks.handlers:session_end"
 arize-hook-qwen-user-prompt-submit = "tracing.qwen.hooks.handlers:user_prompt_submit"
@@ -131,7 +131,7 @@ check_untyped_defs = false
 disallow_untyped_defs = false
 warn_unused_ignores = true
 warn_redundant_casts = true
-files = ["core"]
+files = ["core", "tracing/qwen"]
 
 [build-system]
 requires = ["setuptools>=64"]

@@ -28,13 +28,14 @@ CHATS_SUBDIR = "chats"
 # Used by both install() (to write) and uninstall() (to identify our entries).
 HOOK_NAME = "arize-tracing"
 
-# Map of Qwen Code hook event name -> CLI entry-point script name.
-# Registered in tracing/qwen/pyproject.toml [project.scripts].
+# Map of the 17 Qwen Code hook events handled by this harness to CLI scripts.
+# Qwen Code 0.21.3 also exposes PostToolBatch, UserPromptExpansion,
+# MessageDisplay, SessionDelete, and InstructionsLoaded; those currently have no
+# harness handlers and are not registered. Entry points below are declared in
+# the repository pyproject.toml.
 #
-# Events absent before 0.21.x (TodoCreated, TodoCompleted, MessageDisplay,
-# PermissionDenied) are registered unconditionally: Qwen Code silently ignores
-# hook entries for events it does not know, so older CLIs simply never fire
-# them. Verified on 0.15.11, which knows only 14 of these.
+# Events absent before 0.21.x (TodoCreated, TodoCompleted, PermissionDenied) are
+# registered unconditionally: older Qwen versions ignore unknown event names.
 EVENTS: dict[str, str] = {
     "SessionStart": "arize-hook-qwen-session-start",
     "SessionEnd": "arize-hook-qwen-session-end",

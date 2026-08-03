@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from core.event_model import (
     AgentEvent,
@@ -54,6 +54,7 @@ def parse_qwen_transcript(
     root_event: BaseEvent,
     *,
     start_line: int = 0,
+    transcript_text: Optional[str] = None,
 ) -> EventGraph:
     """Return a typed event graph for one main-agent or subagent transcript.
 
@@ -66,20 +67,23 @@ def parse_qwen_transcript(
     session_id = root_event.session_id
     turn_id = root_event.turn_id
     tools_by_call_id: dict[str, ToolEvent] = {}
+    requests_by_uuid: dict[str, tuple[int | None, dict[str, Any]]] = {}
     agent_id = root_event.agent_id if isinstance(root_event, AgentEvent) else None
     sequence = root_event.sequence + 1
 
-    try:
-        lines = transcript.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        graph.diagnostics = [
-            GraphDiagnostic(
-                code="transcript_read_error",
-                message=str(exc),
-                event_id=root_event.event_id,
-            )
-        ]
-        return graph
+    if transcript_text is None:
+        try:
+            transcript_text = transcript.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            graph.diagnostics = [
+                GraphDiagnostic(
+                    code="transcript_read_error",
+                    message=str(exc),
+                    event_id=root_event.event_id,
+                )
+            ]
+            return graph
+    lines = transcript_text.splitlines()
 
     for line_index, raw_line in enumerate(lines):
         if line_index < max(0, start_line) or not raw_line.strip():
@@ -99,15 +103,56 @@ def parse_qwen_transcript(
         if not isinstance(entry, dict):
             continue
 
+        record_session_id = _string(entry.get("sessionId"))
+        if record_session_id != session_id:
+            diagnostics.append(
+                GraphDiagnostic(
+                    code="session_id_mismatch",
+                    message=f"line {line_index + 1}: transcript record belongs to another session",
+                    event_id=_string(entry.get("uuid")) or root_event.event_id,
+                    severity="warning",
+                )
+            )
+            continue
+
         record_type = entry.get("type")
+        if record_type == "system":
+            continue
+        if record_type not in {"user", "assistant", "tool_result"}:
+            diagnostics.append(
+                GraphDiagnostic(
+                    code="unknown_record_type",
+                    message=f"line {line_index + 1}: unsupported record type {record_type!r}",
+                    event_id=_string(entry.get("uuid")) or root_event.event_id,
+                    severity="warning",
+                )
+            )
+            continue
+
         message = entry.get("message")
-        parts = message.get("parts") if isinstance(message, dict) else None
+        if not isinstance(message, dict):
+            continue
+        parts = message.get("parts")
         if not isinstance(parts, list):
             continue
 
-        started_at = _timestamp_ms(entry.get("timestamp"))
+        timestamp = _timestamp_ms(entry.get("timestamp"))
+        record_id = _string(entry.get("uuid"))
 
-        if record_type == "assistant":
+        if record_type == "user":
+            if record_id:
+                requests_by_uuid[record_id] = (timestamp, message)
+        elif record_type == "assistant":
+            usage, malformed_usage = _usage(entry.get("usageMetadata"), present="usageMetadata" in entry)
+            if malformed_usage:
+                diagnostics.append(
+                    GraphDiagnostic(
+                        code="malformed_usage",
+                        message=f"line {line_index + 1}: invalid usageMetadata",
+                        event_id=record_id or root_event.event_id,
+                        severity="warning",
+                    )
+                )
             sequence = _absorb_assistant(
                 entry,
                 parts,
@@ -115,13 +160,17 @@ def parse_qwen_transcript(
                 tools_by_call_id=tools_by_call_id,
                 agent_id=agent_id,
                 sequence=sequence,
-                started_at=started_at,
+                ended_at=timestamp,
+                request=requests_by_uuid.get(_string(entry.get("parentUuid"))),
+                usage=usage,
                 parent_event_id=root_event.event_id,
                 session_id=session_id,
                 turn_id=turn_id,
             )
         elif record_type == "tool_result":
-            _absorb_tool_result(entry, parts, tools_by_call_id, ended_at=started_at)
+            _absorb_tool_result(entry, parts, tools_by_call_id, ended_at=timestamp)
+            if record_id:
+                requests_by_uuid[record_id] = (timestamp, message)
 
     graph.diagnostics = diagnostics + graph.validate()
     return graph
@@ -135,7 +184,9 @@ def _absorb_assistant(
     tools_by_call_id: dict[str, ToolEvent],
     agent_id: str | None,
     sequence: int,
-    started_at: int | None,
+    ended_at: int | None,
+    request: tuple[int | None, dict[str, Any]] | None,
+    usage: Usage | None,
     parent_event_id: str,
     session_id: str,
     turn_id: str,
@@ -144,6 +195,7 @@ def _absorb_assistant(
     event_id = _string(entry.get("uuid"))
     if not event_id:
         return sequence
+    request_started_at, request_message = request if request is not None else (ended_at, None)
 
     model_event = ModelCallEvent(
         event_id=event_id,
@@ -152,11 +204,12 @@ def _absorb_assistant(
         parent_event_id=parent_event_id,
         agent_id=agent_id,
         sequence=sequence,
-        started_at_ms=started_at,
-        ended_at_ms=started_at,
+        started_at_ms=request_started_at,
+        ended_at_ms=ended_at,
         model=_string(entry.get("model")),
+        input=request_message,
         output=_parts_text(parts),
-        usage=_usage(entry.get("usageMetadata")),
+        usage=usage,
         status=EventStatus.COMPLETED,
     )
     graph.events.append(model_event)
@@ -178,7 +231,7 @@ def _absorb_assistant(
             parent_event_id=event_id,
             agent_id=agent_id,
             sequence=sequence,
-            started_at_ms=started_at,
+            started_at_ms=ended_at,
             ended_at_ms=None,
             tool_call_id=call_id,
             tool_name=_string(call.get("name")),
@@ -275,15 +328,39 @@ def _response_output(parts: list[Any]) -> Any:
     return None
 
 
-def _usage(raw: Any) -> Usage:
-    """Map Gemini-style usageMetadata onto the harness-neutral Usage record."""
+def _usage(raw: Any, *, present: bool) -> tuple[Usage | None, bool]:
+    """Map Gemini usage and report whether any supplied value was malformed."""
+    if not present:
+        return None, False
     if not isinstance(raw, dict):
-        return Usage()
-    return Usage(
-        input_tokens=_nonnegative_int(raw.get("promptTokenCount")),
-        output_tokens=_nonnegative_int(raw.get("candidatesTokenCount")),
-        cache_read_tokens=_nonnegative_int(raw.get("cachedContentTokenCount")),
-        reported_total_tokens=_optional_nonnegative_int(raw.get("totalTokenCount")),
+        return None, True
+
+    malformed = False
+
+    def counter(name: str, *, optional: bool = False) -> int | None:
+        nonlocal malformed
+        if name not in raw:
+            return None if optional else 0
+        value = _optional_nonnegative_int(raw.get(name))
+        if value is None:
+            malformed = True
+            return None if optional else 0
+        return value
+
+    input_tokens = counter("promptTokenCount")
+    output_tokens = counter("candidatesTokenCount")
+    cache_read_tokens = counter("cachedContentTokenCount")
+    reported_total_tokens = counter("totalTokenCount", optional=True)
+    if malformed:
+        return None, True
+    return (
+        Usage(
+            input_tokens=input_tokens or 0,
+            output_tokens=output_tokens or 0,
+            cache_read_tokens=cache_read_tokens or 0,
+            reported_total_tokens=reported_total_tokens,
+        ),
+        malformed,
     )
 
 
@@ -295,7 +372,7 @@ def _usage(raw: Any) -> Usage:
 def _nonnegative_int(value: Any) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return number if number >= 0 else 0
 
@@ -305,7 +382,7 @@ def _optional_nonnegative_int(value: Any) -> int | None:
         return None
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if number >= 0 else None
 

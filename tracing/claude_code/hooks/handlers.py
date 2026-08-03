@@ -23,6 +23,7 @@ from core.common import (
     send_span,
 )
 from core.event_model import AgentEvent, EventStatus, GraphDiagnostic, ModelCallEvent, ToolEvent, TurnEvent
+from core.span_renderer import render_event_graph
 
 from .adapter import (
     SCOPE_NAME,
@@ -33,7 +34,6 @@ from .adapter import (
     resolve_session,
     resolve_transcript_path,
 )
-from core.span_renderer import render_event_graph
 from .tool_buffer import ToolBuffer, ToolObservation
 from .transcript import parse_claude_transcript
 

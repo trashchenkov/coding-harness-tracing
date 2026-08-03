@@ -153,9 +153,9 @@ class TestPyprojectEntryPointsUpdated:
         expected_count = (
             len(EXPECTED_HARNESS_ENTRY_POINTS) + len(EXPECTED_SETUP_ENTRY_POINTS) + 1
         )  # +1 for arize-config
-        assert len(self.scripts) == expected_count, (
-            f"Expected {expected_count} entry points, got {len(self.scripts)}: {sorted(self.scripts.keys())}"
-        )
+        assert (
+            len(self.scripts) == expected_count
+        ), f"Expected {expected_count} entry points, got {len(self.scripts)}: {sorted(self.scripts.keys())}"
 
 
 # ---------------------------------------------------------------------------
