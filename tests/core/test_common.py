@@ -268,6 +268,40 @@ class TestFileLock:
         with FileLock(lock_path, timeout=1.0):
             assert lock_path.parent.exists()
 
+    def test_concurrent_first_acquisition_creates_the_lock_exactly_once(self, tmp_path):
+        """Racing acquirers must not see a spurious ENOENT for the lock file.
+
+        The lock file is opened with O_CREAT, so ENOENT can never be a truthful
+        answer about it. APFS nevertheless returns one when several threads
+        create the same name at once, which crashed concurrent first-time
+        installs roughly a third of the time. Barrier-synchronised so the
+        threads genuinely collide on the create, and repeated because a single
+        collision only loses the race some of the time.
+        """
+        errors: list[BaseException] = []
+
+        for trial in range(10):
+            lock_path = tmp_path / f"settings home {trial}" / "settings.json.arize.lock"
+            assert not lock_path.parent.exists()
+            started = threading.Barrier(4)
+
+            def acquire() -> None:
+                started.wait(timeout=5)
+                try:
+                    with FileLock(lock_path, timeout=10.0):
+                        pass
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=acquire) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=15)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert not errors, f"trial {trial}: {errors}"
+
     def test_cleanup_on_exit(self, tmp_path):
         """FileLock cleans up lock file/dir on __exit__."""
         from core.common import _LOCK_IMPL

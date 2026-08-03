@@ -805,6 +805,15 @@ except ImportError:
     except ImportError:
         _LOCK_IMPL = "mkdir"
 
+# Opening the lock file passes O_CREAT, so ENOENT is never a truthful answer
+# about the lock file itself. It means either the parent directory went away, or
+# the filesystem returned a transient miss while a concurrent creator of the same
+# name was still in flight — APFS does the latter when several installs race to
+# create the settings directory for the first time. Retry a bounded number of
+# times before believing it.
+_LOCK_OPEN_ATTEMPTS = 8
+_LOCK_OPEN_BACKOFF_SECONDS = 0.005
+
 
 def _open_directory_no_symlinks(path: Path, *, create: bool, mode: int = 0o700) -> int:
     """Open a directory after a descriptor-relative no-symlink component walk."""
@@ -832,7 +841,12 @@ def _open_directory_no_symlinks(path: Path, *, create: bool, mode: int = 0o700) 
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(component, mode=mode, dir_fd=descriptor)
+                try:
+                    os.mkdir(component, mode=mode, dir_fd=descriptor)
+                except FileExistsError:
+                    # A concurrent installer created it between our open and our
+                    # mkdir; open what they made rather than failing the walk.
+                    pass
                 child = os.open(component, flags, dir_fd=descriptor)
             metadata = os.fstat(child)
             if not stat.S_ISDIR(metadata.st_mode):
@@ -890,24 +904,35 @@ class FileLock:
             self._release_mkdir()
 
     def _open_posix_lock_file(self) -> IO[str]:
-        """Open an owner-only regular lock file without following symlinks."""
+        """Open an owner-only regular lock file without following symlinks.
+
+        Retries on ENOENT: see _LOCK_OPEN_ATTEMPTS. The parent is re-resolved on
+        each pass, so a directory that really was replaced is picked up too.
+        """
         flags = os.O_RDWR | os.O_CREAT
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = _open_directory_no_symlinks(self.lock_path.parent, create=True)
-        try:
-            fd = os.open(self.lock_path.name, flags, 0o600, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
-        try:
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise OSError(f"lock path is not a regular file: {self.lock_path}")
-            os.fchmod(fd, 0o600)
-            return os.fdopen(fd, "a+", encoding="utf-8")
-        except Exception:
-            os.close(fd)
-            raise
+        for attempt in range(_LOCK_OPEN_ATTEMPTS):
+            parent_fd = _open_directory_no_symlinks(self.lock_path.parent, create=True)
+            try:
+                fd = os.open(self.lock_path.name, flags, 0o600, dir_fd=parent_fd)
+            except FileNotFoundError:
+                if attempt == _LOCK_OPEN_ATTEMPTS - 1:
+                    raise
+                time.sleep(_LOCK_OPEN_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            finally:
+                os.close(parent_fd)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError(f"lock path is not a regular file: {self.lock_path}")
+                os.fchmod(fd, 0o600)
+                return os.fdopen(fd, "a+", encoding="utf-8")
+            except Exception:
+                os.close(fd)
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _acquire_fcntl(self) -> None:
         self._fd = self._open_posix_lock_file()
