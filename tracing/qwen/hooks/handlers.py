@@ -436,11 +436,18 @@ def _handle_user_prompt_submit(input_json: dict) -> None:
                     log("Fail-safe: a concurrent newer turn owns the session state")
                     return
 
-        transcript = resolve_transcript_path(input_json)
+        # Qwen writes the transcript only once it records the first entry, which
+        # is after this event. Requiring the file here rejects the canonical path
+        # on every opening turn — and in one-shot mode that is the only turn, so
+        # the session would produce no spans at all. Confinement is still
+        # enforced; only the existence check is deferred to Stop.
+        transcript = resolve_transcript_path(input_json, must_exist=False)
         if input_json.get("transcript_path") and transcript is None:
             log("UserPromptSubmit: authoritative transcript path is invalid; turn not opened")
             return
-        line_count = _count_complete_transcript_lines(transcript) if transcript is not None else 0
+        line_count = (
+            _count_complete_transcript_lines(transcript) if transcript is not None and transcript.is_file() else 0
+        )
         if line_count is None:
             log("UserPromptSubmit: transcript boundary is unknown; turn not opened")
             return

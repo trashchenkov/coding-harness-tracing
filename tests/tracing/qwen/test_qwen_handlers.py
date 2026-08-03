@@ -23,9 +23,9 @@ def state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("tracing.qwen.hooks.adapter.STATE_DIR", tmp_path)
     monkeypatch.setattr("tracing.qwen.hooks.adapter.PROJECTS_DIR", tmp_path)
 
-    def test_transcript(payload, _session_id=None):
+    def test_transcript(payload, _session_id=None, *, must_exist=True):
         raw = payload.get("transcript_path") or ""
-        return adapter.validate_transcript_path(Path(raw), root=tmp_path) if raw else None
+        return adapter.validate_transcript_path(Path(raw), root=tmp_path, must_exist=must_exist) if raw else None
 
     def test_agent_transcript(payload, _session_id=None, _agent_id=None):
         raw = payload.get("agent_transcript_path") or ""
@@ -363,6 +363,38 @@ def test_blocking_stop_continuation_updates_same_turn(state_dir, tmp_path):
     closed = _state(payload)
     assert closed.get("current_trace_id") is None
     assert closed.get("session_closed") == "1"
+
+
+def test_turn_opens_before_qwen_creates_the_transcript(state_dir, tmp_path):
+    """Regression: the opening turn was lost because the file did not exist yet.
+
+    Qwen writes the session transcript only when it records the first entry,
+    which happens after UserPromptSubmit. Requiring the file at turn-open time
+    rejected the canonical path exactly as it would reject a substituted one, so
+    no turn opened — and in one-shot mode that is the only turn, leaving the
+    whole session untraced. Confinement still applies; existence is checked at
+    Stop, by which point Qwen has written the file.
+    """
+    not_yet_written = tmp_path / "chat.jsonl"
+    assert not not_yet_written.exists()
+
+    payload = _payload(prompt="build the thing", transcript_path=str(not_yet_written))
+    handlers._handle_user_prompt_submit(payload)
+
+    state = _state(payload)
+    assert state.get("current_trace_id")
+    assert state.get("trace_start_line") == "0"
+
+
+def test_turn_is_refused_when_the_path_escapes_the_transcript_root(state_dir, tmp_path):
+    """Confinement must survive the existence check being deferred."""
+    outside = tmp_path.parent / "elsewhere.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+
+    payload = _payload(prompt="build the thing", transcript_path=str(outside))
+    handlers._handle_user_prompt_submit(payload)
+
+    assert _state(payload).get("current_trace_id") is None
 
 
 def test_continuation_event_does_not_open_a_second_turn(state_dir):

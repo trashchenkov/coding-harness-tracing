@@ -257,8 +257,27 @@ def _has_symlink_below(anchor: Path, candidate: Path) -> bool:
     return False
 
 
-def validate_transcript_path(path: Path, root: Optional[Path] = None, anchor: Optional[Path] = None) -> Optional[Path]:
-    """Return a real Qwen JSONL path confined beneath the requested root."""
+def validate_transcript_path(
+    path: Path,
+    root: Optional[Path] = None,
+    anchor: Optional[Path] = None,
+    *,
+    must_exist: bool = True,
+) -> Optional[Path]:
+    """Return a Qwen JSONL path confined beneath the requested root.
+
+    Confinement and existence are separate questions. Qwen creates a session
+    transcript only when it writes the first record, which happens *after*
+    ``UserPromptSubmit`` fires, so on the opening turn the canonical path is
+    legitimate but absent. Requiring existence there rejects it exactly as it
+    would reject a substituted path, and the turn is never opened — in one-shot
+    mode that means the whole session produces no spans.
+
+    Callers that need a readable file keep ``must_exist=True``; the turn-opening
+    path passes ``must_exist=False`` and defers the existence check to ``Stop``,
+    by which time Qwen has written the transcript. Symlink, root-containment and
+    suffix checks apply either way.
+    """
     try:
         lexical_root = (root or PROJECTS_DIR).expanduser()
         lexical_anchor = (anchor or lexical_root).expanduser()
@@ -266,12 +285,18 @@ def validate_transcript_path(path: Path, root: Optional[Path] = None, anchor: Op
             return None
         if _has_symlink_below(lexical_anchor, path):
             return None
+        # Non-strict resolution still collapses symlinks in the existing
+        # prefix, so containment holds for a path whose leaf is not there yet.
         allowed_root = lexical_root.resolve()
-        candidate = path.expanduser().resolve(strict=True)
+        candidate = path.expanduser().resolve(strict=must_exist)
         candidate.relative_to(allowed_root)
     except (OSError, RuntimeError, ValueError):
         return None
-    if candidate.suffix != ".jsonl" or not candidate.is_file():
+    if candidate.suffix != ".jsonl":
+        return None
+    if must_exist and not candidate.is_file():
+        return None
+    if not must_exist and candidate.exists() and not candidate.is_file():
         return None
     return candidate
 
@@ -459,8 +484,17 @@ def _qwen_filename_component(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", value)
 
 
-def resolve_transcript_path(input_json: dict, session_id: Optional[str] = None) -> Optional[Path]:
-    """Return only the canonical transcript bound to this session and cwd."""
+def resolve_transcript_path(
+    input_json: dict,
+    session_id: Optional[str] = None,
+    *,
+    must_exist: bool = True,
+) -> Optional[Path]:
+    """Return only the canonical transcript bound to this session and cwd.
+
+    ``must_exist=False`` accepts the canonical path before Qwen has created the
+    file. Use it when opening a turn; see ``validate_transcript_path``.
+    """
     sid = session_id or input_json.get("session_id") or ""
     cwd = input_json.get("cwd") or ""
     if not isinstance(sid, str) or not isinstance(cwd, str) or not sid or not cwd:
@@ -468,14 +502,16 @@ def resolve_transcript_path(input_json: dict, session_id: Optional[str] = None) 
     runtime_base = _runtime_base_dir(cwd)
     project_dir = runtime_base / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", cwd.lower() if os.name == "nt" else cwd)
     chats_root = project_dir / CHATS_SUBDIR
-    expected = validate_transcript_path(chats_root / f"{sid}.jsonl", root=chats_root, anchor=runtime_base)
+    expected = validate_transcript_path(
+        chats_root / f"{sid}.jsonl", root=chats_root, anchor=runtime_base, must_exist=must_exist
+    )
     if expected is None:
         return None
 
     raw = input_json.get("transcript_path") or ""
     if not raw:
         return expected
-    supplied = validate_transcript_path(Path(str(raw)), root=chats_root, anchor=runtime_base)
+    supplied = validate_transcript_path(Path(str(raw)), root=chats_root, anchor=runtime_base, must_exist=must_exist)
     return expected if supplied == expected else None
 
 

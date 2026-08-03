@@ -41,7 +41,7 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(adapter, "STATE_DIR", tmp_path)
     monkeypatch.setattr(adapter, "PROJECTS_DIR", tmp_path)
 
-    def transcript(payload, _session_id=None):
+    def transcript(payload, _session_id=None, *, must_exist=True):
         raw = payload.get("transcript_path") or ""
         return Path(raw) if raw else None
 
@@ -160,7 +160,7 @@ def test_prompt_start_never_follows_replacement_symlink(isolated, tmp_path, monk
     transcript.write_text("", encoding="utf-8")
     outside.write_text("{}\n" * 7, encoding="utf-8")
 
-    def swapped(_payload, _session_id=None):
+    def swapped(_payload, _session_id=None, *, must_exist=True):
         transcript.unlink()
         transcript.symlink_to(outside)
         return transcript
